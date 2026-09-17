@@ -1,0 +1,10 @@
+{
+  "os": "ubuntu-22.04",
+  "cuda": "12.4",
+  "python": "3.11",
+  "sglang": "0.4.x",
+  "wheelhouse": "/opt/tai-talea/wheelhouse",
+  "virtualenv": "/opt/tai-talea/venv",
+  "bootstrap_version": "tai-talea-bootstrap/1",
+  "model_id": "model-a"
+}

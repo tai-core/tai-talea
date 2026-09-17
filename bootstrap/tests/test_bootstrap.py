@@ -1,0 +1,428 @@
+"""Unit tests for the bootstrap process: roles, profile, service and HTTP surface."""
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from http.client import HTTPConnection
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tai_talea_bootstrap import BOOTSTRAP_VERSION, exitcodes, __main__ as bootstrap_cli  # noqa: E402
+from tai_talea_bootstrap.profile import (  # noqa: E402
+    EnvironmentReport,
+    ImageProfile,
+    ProfileError,
+    _matches,
+    detect_environment,
+    require_compatible,
+    virtualenv_python,
+)
+from tai_talea_bootstrap.roles import (  # noqa: E402
+    ConfigurationError,
+    build_sglang_command,
+    validate_extra_args,
+)
+from tai_talea_bootstrap.server import BootstrapServer  # noqa: E402
+from tai_talea_bootstrap.service import (  # noqa: E402
+    PHASE_FAILED,
+    PHASE_IDLE,
+    PHASE_RUNNING,
+    PHASE_STOPPED,
+    SGLangService,
+)
+
+
+def profile(**overrides):
+    values = {
+        "os_version": "ubuntu-22.04",
+        "cuda": "12.4",
+        "python": "%d.%d" % (sys.version_info.major, sys.version_info.minor),
+        "sglang": "0.4.x",
+        "wheelhouse": "/opt/tai-talea/wheelhouse",
+        "virtualenv": "/opt/tai-talea/venv",
+        "bootstrap_version": BOOTSTRAP_VERSION,
+    }
+    values.update(overrides)
+    return ImageProfile(**values)
+
+
+class FakeProcess:
+    """Minimal stand-in for a supervised child process."""
+
+    def __init__(self, exit_code=None, pid=4321):
+        self.pid = pid
+        self._exit_code = exit_code
+        self.terminated = False
+        self.killed = False
+        self.returncode = 0 if exit_code is None else exit_code
+
+    def poll(self):
+        if self.terminated or self.killed:
+            return self._exit_code if self._exit_code is not None else 0
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+
+class FakeInstaller:
+    def __init__(self, failure=None):
+        self.failure = failure
+        self.prepared = 0
+
+    def prepare(self):
+        self.prepared += 1
+        if self.failure:
+            raise self.failure
+        return "/opt/tai-talea/venv/bin/python"
+
+
+class RoleTests(unittest.TestCase):
+    def test_prefill_and_decode_use_the_disaggregation_mode(self):
+        prefill = build_sglang_command("prefill", "model-a", port=31000)
+        decode = build_sglang_command("decode", "model-a", port=32000)
+        self.assertIn("--disaggregation-mode", prefill)
+        self.assertEqual(prefill[prefill.index("--disaggregation-mode") + 1], "prefill")
+        self.assertEqual(decode[decode.index("--disaggregation-mode") + 1], "decode")
+        self.assertEqual(prefill[0], "python3")
+        self.assertEqual(prefill[1:3], ["-m", "sglang.launch_server"])
+
+    def test_unknown_role_is_rejected(self):
+        with self.assertRaises(ConfigurationError):
+            build_sglang_command("router", "model-a")
+
+    def test_model_id_is_required(self):
+        with self.assertRaises(ConfigurationError):
+            build_sglang_command("prefill", "   ")
+
+    def test_port_range_is_enforced(self):
+        for bad_port in (0, 70000, "abc"):
+            with self.assertRaises(ConfigurationError):
+                build_sglang_command("prefill", "model-a", port=bad_port)
+
+    def test_control_characters_are_rejected(self):
+        with self.assertRaises(ConfigurationError):
+            build_sglang_command("prefill", "model-a\nrm -rf /")
+        with self.assertRaises(ConfigurationError):
+            build_sglang_command("prefill", "model-a", model_path="a\x00b")
+
+    def test_extra_args_are_allowlisted(self):
+        command = build_sglang_command(
+            "decode", "model-a", extra_args=["--mem-fraction-static=0.8", "--tp-size=2"]
+        )
+        self.assertIn("--mem-fraction-static=0.8", command)
+
+        for hostile in ("--model-path=/etc/passwd", "--host=evil", "--port=1", "; rm -rf /", "--api-key=x"):
+            with self.assertRaises(ConfigurationError):
+                validate_extra_args([hostile])
+
+
+class ProfileTests(unittest.TestCase):
+    def test_matching_environment_is_compatible(self):
+        required = profile()
+        report = detect_environment(required, sglang_version_probe=lambda _: "0.4.6")
+        # The os and wheelhouse checks depend on the host, so only assert the
+        # parts the probe controls.
+        self.assertEqual(report.python, "%d.%d" % (sys.version_info.major, sys.version_info.minor))
+        self.assertEqual(report.sglang, "0.4.6")
+
+    def test_version_matching_rules(self):
+        # A wildcard requirement accepts the whole minor line.
+        self.assertTrue(_matches("0.4.x", "0.4.6"))
+        self.assertTrue(_matches("0.4.x", "0.4.0"))
+        self.assertFalse(_matches("0.4.x", "0.5.0"))
+        # An exact requirement does not.
+        self.assertTrue(_matches("0.4.6", "0.4.6"))
+        self.assertFalse(_matches("0.4.6", "0.4.7"))
+        # An empty requirement accepts anything.
+        self.assertTrue(_matches("", "0.4.6"))
+
+    def test_sglang_minor_mismatch_is_reported(self):
+        required = profile(sglang="0.4.x")
+        report = detect_environment(required, sglang_version_probe=lambda _: "0.5.0")
+        self.assertIn("sglang=0.5.0 does not match profile 0.4.x", report.mismatches)
+        self.assertFalse(report.compatible)
+
+    def test_matching_sglang_is_not_reported_as_a_mismatch(self):
+        report = detect_environment(profile(sglang="0.4.x"), sglang_version_probe=lambda _: "0.4.6")
+        self.assertFalse(any("sglang" in mismatch for mismatch in report.mismatches))
+
+    def test_missing_wheelhouse_is_reported(self):
+        report = detect_environment(
+            profile(wheelhouse="/definitely/not/here"), sglang_version_probe=lambda _: "0.4.6"
+        )
+        self.assertTrue(any("wheelhouse" in mismatch for mismatch in report.mismatches))
+
+    def test_incomplete_profile_is_rejected(self):
+        with self.assertRaises(ProfileError):
+            profile(cuda="").validate()
+
+    def test_require_compatible_raises_with_mismatches(self):
+        required = profile(sglang="9.9.x")
+        with self.assertRaises(ProfileError) as context:
+            require_compatible(required, sglang_version_probe=lambda _: "0.4.6")
+        self.assertTrue(context.exception.mismatches)
+
+
+class DefaultProbeTests(unittest.TestCase):
+    """The un-injected probe path is what production actually runs.
+
+    Regression: ``_detect_sglang`` was handed an ``ImageProfile`` but read
+    ``python_executable``, a field only ``EnvironmentInstaller`` has. Every unit
+    test injected a probe, so ``check`` and ``serve`` crashed with exit code 70
+    on a real container while the suite stayed green.
+    """
+
+    def test_virtualenv_python_resolves_the_managed_interpreter(self):
+        venv = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, venv, True)
+        os.makedirs(os.path.join(venv, "bin"))
+        interpreter = os.path.join(venv, "bin", "python")
+        with open(interpreter, "w", encoding="utf-8") as handle:
+            handle.write("")
+        self.assertEqual(virtualenv_python(profile(virtualenv=venv)), interpreter)
+        self.assertEqual(virtualenv_python(profile(virtualenv="/definitely/not/here")), "")
+
+    def test_detect_environment_without_a_probe_does_not_raise(self):
+        report = detect_environment(profile(wheelhouse="/definitely/not/here",
+                                            virtualenv="/definitely/not/here"))
+        # No interpreter, so no version can be read: it must degrade to "" and be
+        # reported as a mismatch rather than exploding.
+        self.assertEqual(report.sglang, "")
+        self.assertTrue(any("sglang" in mismatch for mismatch in report.mismatches))
+
+    def test_check_subcommand_reports_incompatibility_not_a_crash(self):
+        payload = {
+            "os": "nowhere-1.0", "cuda": "12.4", "python": "3.11", "sglang": "0.4.x",
+            "wheelhouse": "/definitely/not/here", "virtualenv": "/definitely/not/here",
+        }
+        path = os.path.join(tempfile.mkdtemp(), "profile.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = bootstrap_cli.main(["check", "--profile", path])
+        self.assertEqual(code, exitcodes.EXIT_ENV_INCOMPATIBLE,
+                         "check must report a mismatch (65), not an internal error (70)")
+        report = json.loads(buffer.getvalue())
+        self.assertFalse(report["compatible"])
+        self.assertTrue(report["mismatches"])
+
+    def test_check_subcommand_rejects_a_missing_profile_file(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = bootstrap_cli.main(["check", "--profile", "/definitely/not/here.json"])
+        self.assertEqual(code, exitcodes.EXIT_ENV_INCOMPATIBLE)
+        self.assertIn("does not exist", stderr.getvalue())
+
+    def test_version_banner_is_not_redundant(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            with self.assertRaises(SystemExit):
+                bootstrap_cli.main(["--version"])
+        self.assertEqual(buffer.getvalue().strip(), BOOTSTRAP_VERSION)
+
+
+class ServiceTests(unittest.TestCase):
+    def make_service(self, process=None, installer=None, command_factory=None, health_probe=None):
+        return SGLangService(
+            profile(),
+            installer=installer or FakeInstaller(),
+            runner=lambda _command: process or FakeProcess(),
+            command_factory=command_factory or build_sglang_command,
+            health_probe=health_probe or (lambda _port: True),
+        )
+
+    def test_start_moves_to_running_and_reports_health(self):
+        service = self.make_service()
+        result = service.start("prefill", "model-a", port=31000)
+        self.assertTrue(result.accepted)
+        self.assertEqual(service.status()["phase"], PHASE_RUNNING)
+        self.assertEqual(service.status()["role"], "prefill")
+        health = service.health()
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["phase"], PHASE_RUNNING)
+        self.assertTrue(any(entry["phase"] == "STARTING" for entry in service.status()["history"]))
+
+    def test_start_rejects_a_second_service(self):
+        service = self.make_service()
+        self.assertTrue(service.start("prefill", "model-a").accepted)
+        second = service.start("decode", "model-a")
+        self.assertFalse(second.accepted)
+        self.assertIn("already", second.detail)
+
+    def test_invalid_role_fails_with_bad_request(self):
+        service = self.make_service()
+        result = service.start("router", "model-a")
+        self.assertFalse(result.accepted)
+        self.assertEqual(service.status()["phase"], PHASE_FAILED)
+        self.assertEqual(service.status()["exit_code"], exitcodes.EXIT_BAD_REQUEST)
+
+    def test_environment_failure_maps_to_its_exit_code(self):
+        installer = FakeInstaller(failure=RuntimeError("wheelhouse is empty"))
+        service = self.make_service(installer=installer)
+        result = service.start("prefill", "model-a")
+        self.assertFalse(result.accepted)
+        self.assertEqual(service.status()["exit_code"], exitcodes.EXIT_ENV_INSTALL_FAILED)
+
+    def test_stop_reports_a_clean_exit_code(self):
+        service = self.make_service()
+        service.start("decode", "model-a")
+        result = service.stop(timeout=1.0)
+        self.assertEqual(result.exit_code, exitcodes.EXIT_OK)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(service.status()["phase"], PHASE_STOPPED)
+
+    def test_stop_timeout_is_reported(self):
+        stubborn = FakeProcess()
+        stubborn.terminate = lambda: None  # ignores SIGTERM
+        service = SGLangService(
+            profile(),
+            installer=FakeInstaller(),
+            runner=lambda _command: stubborn,
+            health_probe=lambda _port: True,
+            now=lambda: time.time(),
+        )
+        service.start("prefill", "model-a")
+        service._terminate = lambda process: None  # simulate a process that ignores SIGTERM
+        result = service.stop(timeout=0.05)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.exit_code, exitcodes.EXIT_STOP_TIMEOUT)
+        self.assertTrue(stubborn.killed)
+
+    def test_immediate_crash_is_reported(self):
+        dead = FakeProcess(exit_code=1)
+        dead.terminated = True
+        service = self.make_service(process=dead)
+        result = service.start("prefill", "model-a")
+        self.assertFalse(result.accepted)
+        self.assertEqual(service.status()["exit_code"], exitcodes.EXIT_SERVICE_CRASHED)
+
+    def test_health_reports_degraded_when_sglang_does_not_answer(self):
+        service = self.make_service(health_probe=lambda _port: False)
+        service.start("prefill", "model-a")
+        self.assertEqual(service.health()["status"], "degraded")
+
+    def test_health_before_start_is_idle(self):
+        service = self.make_service()
+        self.assertEqual(service.status()["phase"], PHASE_IDLE)
+        self.assertEqual(service.health()["status"], "ok")
+
+    def test_note_environment_is_published(self):
+        service = self.make_service()
+        service.note_environment(EnvironmentReport(os="ubuntu-22.04", cuda="12.4"))
+        self.assertEqual(service.status()["environment"]["cuda"], "12.4")
+
+
+class HttpSurfaceTests(unittest.TestCase):
+    def setUp(self):
+        self.process = FakeProcess()
+        self.service = SGLangService(
+            profile(),
+            installer=FakeInstaller(),
+            runner=lambda _command: self.process,
+            health_probe=lambda _port: True,
+        )
+        self.server = BootstrapServer(("127.0.0.1", 0), self.service)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def request(self, method, path, payload=None):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if body else {}
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        raw = response.read()
+        connection.close()
+        return response.status, json.loads(raw.decode("utf-8"))
+
+    def test_health_reports_the_bootstrap_version(self):
+        status, payload = self.request("GET", "/bootstrap/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["version"], BOOTSTRAP_VERSION)
+
+    def test_status_starts_idle(self):
+        status, payload = self.request("GET", "/bootstrap/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["phase"], PHASE_IDLE)
+
+    def test_start_then_status_then_stop(self):
+        status, payload = self.request("POST", "/bootstrap/start", {
+            "role": "prefill", "model_id": "model-a", "port": 31000, "prepare_environment": False,
+        })
+        self.assertEqual(status, 202)
+        self.assertTrue(payload["accepted"])
+
+        status, payload = self.request("GET", "/bootstrap/status")
+        self.assertEqual(payload["phase"], PHASE_RUNNING)
+        self.assertEqual(payload["role"], "prefill")
+
+        status, payload = self.request("POST", "/bootstrap/stop", {"timeout": 1})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["exit_code"], exitcodes.EXIT_OK)
+
+    def test_start_with_a_bad_role_is_rejected(self):
+        status, payload = self.request("POST", "/bootstrap/start", {
+            "role": "router", "model_id": "model-a", "prepare_environment": False,
+        })
+        self.assertEqual(status, 422)
+        self.assertFalse(payload["accepted"])
+
+    def test_hostile_extra_args_are_rejected(self):
+        status, payload = self.request("POST", "/bootstrap/start", {
+            "role": "prefill", "model_id": "model-a", "prepare_environment": False,
+            "extra_args": ["--model-path=/etc/shadow"],
+        })
+        self.assertEqual(status, 422)
+        self.assertFalse(payload["accepted"])
+
+    def test_invalid_json_is_rejected(self):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("POST", "/bootstrap/start", body=b"not json",
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 400)
+        response.read()
+        connection.close()
+
+    def test_unknown_path_is_not_found(self):
+        status, _ = self.request("GET", "/bootstrap/exec")
+        self.assertEqual(status, 404)
+
+
+class ExitCodeTests(unittest.TestCase):
+    def test_every_code_is_documented(self):
+        for code in (
+            exitcodes.EXIT_OK,
+            exitcodes.EXIT_BAD_REQUEST,
+            exitcodes.EXIT_ENV_INCOMPATIBLE,
+            exitcodes.EXIT_ENV_INSTALL_FAILED,
+            exitcodes.EXIT_START_FAILED,
+            exitcodes.EXIT_SERVICE_CRASHED,
+            exitcodes.EXIT_STOP_TIMEOUT,
+            exitcodes.EXIT_INTERNAL,
+        ):
+            self.assertNotEqual(exitcodes.describe(code), "unknown exit code")
+
+    def test_describe_handles_unknown_codes(self):
+        self.assertEqual(exitcodes.describe(200), "unknown exit code")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

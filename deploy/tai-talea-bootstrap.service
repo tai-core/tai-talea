@@ -1,0 +1,24 @@
+[Unit]
+Description=Capacity bootstrap (SGLang runtime launcher)
+After=network-online.target
+
+[Service]
+Type=simple
+# The bootstrap is the only process the control plane talks to inside the
+# container. It exposes /bootstrap/health, /status, /start and /stop.
+ExecStart=/opt/tai-talea/venv/bin/python -m tai_talea_bootstrap serve \
+    --profile /etc/tai-talea/profile.json \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --stop-timeout 60
+WorkingDirectory=/opt/tai-talea
+# Kernel level SIGTERM: the bootstrap forwards it to SGLang and then exits with
+# one of the documented exit codes.
+KillSignal=SIGTERM
+TimeoutStopSec=120s
+Restart=no
+StateDirectory=tai-talea
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

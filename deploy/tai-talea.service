@@ -1,0 +1,31 @@
+[Unit]
+Description=SGLang capacity control plane
+Documentation=file:///opt/tai-talea/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=capacity
+Group=capacity
+ExecStart=/usr/local/bin/tai-talea --config /etc/tai-talea/config.yaml
+# The control plane must keep running through transient Router outages: it
+# repairs itself through reconcile instead of exiting.
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# §15: the control plane only needs its own state directory plus loopback access
+# to the Router control plane.
+StateDirectory=tai-talea
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tai-talea
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

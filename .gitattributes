@@ -1,0 +1,10 @@
+# The control plane and the container bootstrap both run on Linux (containers
+# and systemd units). Pinning the working tree to LF keeps the diff clean and
+# stops a Windows checkout from rewriting every file.
+* text=auto eol=lf
+
+# Binary or generated artefacts must never be normalised.
+*.exe binary
+*.png binary
+*.jpg binary
+*.zip binary

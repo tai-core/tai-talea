@@ -1,0 +1,101 @@
+# SGLang containerised instance capacity control plane.
+#
+# This file is the complete milestone 1 surface. Every field is validated on
+# startup; `tai-talea --check-config` verifies it without serving.
+
+server:
+  # The Push API and the admin API share one listener. Bind the admin surface to
+  # a private interface in production.
+  listen: 127.0.0.1:8787
+  # Operator bearer token for /v1/capacity/*. Must be at least 16 characters.
+  admin_token: change-me-admin-token
+  # §6.1 request body limit for the partner Push API.
+  max_push_body_bytes: 1048576
+  read_timeout: 15s
+  write_timeout: 30s
+  shutdown_timeout: 10s
+
+storage:
+  sqlite_path: /var/lib/tai-talea/tai-talea.db
+
+controller:
+  # §13 default reconcile cadence.
+  reconcile_interval: 10s
+  # §7.1 retry budget before a container moves to LOST.
+  prepare_max_attempts: 3
+  # §7.2 retry budget before a service is left FAILED.
+  start_max_attempts: 3
+  release_max_attempts: 3
+  # §5 default grace period when a revoke event carries no grace_seconds.
+  drain_grace: 300s
+  operation_retry: 15s
+  call_timeout: 10s
+  # §10 controlled image route: the model every container must advertise.
+  model_id: model-a
+  model_path: ""
+  extra_sglang_args: []
+  # Alert when a lease observation is older than this.
+  lease_warning: 120s
+  # Alert when the share of LOST instances exceeds this.
+  lost_rate_threshold: 0.2
+
+router:
+  # Milestone 1 runs a single Router (§17 M1 "单 Router").
+  name: primary
+  url: http://127.0.0.1:30001
+  mode: readiness-v1
+  timeout: 10s
+
+planner:
+  # §11 manual gear. Supported: 1:1, 2:1, 1:2.
+  gear: "1:1"
+  max_change_per_round: 1
+  min_hold: 120s
+  cooldown: 60s
+  # 0 means "use every available instance": we never invent capacity the partner
+  # did not offer.
+  max_serving: 0
+
+# Milestone 2 turns Pull reconciliation into the authoritative capacity source.
+# The mechanism already ships, so enabling it is a configuration change.
+pull:
+  enabled: false
+  interval: 30s
+  failure_threshold: 3
+
+alerts:
+  webhook_url: ""
+  cooldown: 5m
+  # Allowed distance between the observed and the target Prefill share.
+  ratio_tolerance: 0.15
+
+# §10 M1 controlled baseline image contract.
+image_profile:
+  os: ubuntu-22.04
+  cuda: "12.4"
+  python: "3.11"
+  sglang: "0.4.x"
+  wheelhouse: /opt/tai-talea/wheelhouse
+  virtualenv: /opt/tai-talea/venv
+
+partners:
+  - id: partner-a
+    # static: capacity comes from this file (M1 local harness and partners
+    # without a live API). http: a generic JSON partner API.
+    adapter: static
+    # §6.1 partner credential presented as `Authorization: Bearer <push_token>`.
+    push_token: partner-a-push-token
+    # HMAC-SHA256 secret used to sign `<timestamp>.<body>`.
+    push_secret: partner-a-push-secret-0123456789
+    # Accepted clock skew of the request timestamp.
+    hmac_tolerance: 5m
+    replay_cache_size: 4096
+    instances:
+      - id: container-123
+        endpoint: http://127.0.0.1:8080
+        lease_id: lease-456
+        spec:
+          gpu: H100
+          gpu_count: 1
+          model_support:
+            - model-a
