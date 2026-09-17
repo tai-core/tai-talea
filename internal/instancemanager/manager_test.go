@@ -34,11 +34,15 @@ func goodEnvironment() launcher.Environment {
 }
 
 type bootstrapStub struct {
-	health launcher.Health
-	status launcher.Status
-	fail   int
-	server *httptest.Server
+	health   launcher.Health
+	status   launcher.Status
+	fail     int
+	rejected int
+	server   *httptest.Server
 }
+
+// stubToken is the shared secret the stub bootstrap demands, mirroring §9.
+const stubToken = "bootstrap-token-0123456789"
 
 func newBootstrapStub(t *testing.T) *bootstrapStub {
 	t.Helper()
@@ -61,7 +65,15 @@ func newBootstrapStub(t *testing.T) *bootstrapStub {
 		}
 		writeJSON(writer, stub.status)
 	})
-	stub.server = httptest.NewServer(mux)
+	stub.server = httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, request *http.Request) {
+			if request.Header.Get(launcher.HeaderToken) != stubToken {
+				stub.rejected++
+				writer.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			mux.ServeHTTP(writer, request)
+		}))
 	t.Cleanup(stub.server.Close)
 	return stub
 }
@@ -74,7 +86,7 @@ func writeJSON(writer http.ResponseWriter, payload any) {
 
 func newManager(t *testing.T, profile instancemanager.Profile) *instancemanager.Manager {
 	t.Helper()
-	client, err := launcher.New(3 * time.Second)
+	client, err := launcher.New(3*time.Second, stubToken)
 	if err != nil {
 		t.Fatalf("launcher: %v", err)
 	}

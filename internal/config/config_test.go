@@ -50,6 +50,7 @@ func TestDefaultsAreValid(t *testing.T) {
 	cfg.Server.AdminToken = "admin-token-0123456789"
 	cfg.Router.URL = "http://127.0.0.1:30001"
 	cfg.Controller.ModelID = "model-a"
+	cfg.Controller.BootstrapToken = "bootstrap-token-0123456789"
 	cfg.Partners = []config.PartnerConfig{{
 		ID: "partner-a", Adapter: "static", PushToken: "token-12345678",
 		PushSecret: "secret-0123456789", HMACTolerance: config.Duration(5 * time.Minute),
@@ -69,6 +70,7 @@ func TestValidationRejectsIncompleteConfiguration(t *testing.T) {
 		cfg.Server.AdminToken = "admin-token-0123456789"
 		cfg.Router.URL = "http://127.0.0.1:30001"
 		cfg.Controller.ModelID = "model-a"
+		cfg.Controller.BootstrapToken = "bootstrap-token-0123456789"
 		cfg.Partners = []config.PartnerConfig{{
 			ID: "partner-a", Adapter: "static", PushToken: "token-12345678",
 			PushSecret: "secret-0123456789", HMACTolerance: config.Duration(5 * time.Minute),
@@ -90,6 +92,10 @@ func TestValidationRejectsIncompleteConfiguration(t *testing.T) {
 		"no sqlite path":           func(c *config.Config) { c.Storage.SQLitePath = "" },
 		"incomplete profile":       func(c *config.Config) { c.ImageProfile.Wheelhouse = "" },
 		"duplicate partner":        func(c *config.Config) { c.Partners = append(c.Partners, c.Partners[0]) },
+		// The bootstrap interface has no unauthenticated mode, so a control
+		// plane without a secret could not drive a single instance.
+		"missing bootstrap token": func(c *config.Config) { c.Controller.BootstrapToken = "" },
+		"short bootstrap token":   func(c *config.Config) { c.Controller.BootstrapToken = "short" },
 	}
 	for name, mutate := range cases {
 		cfg := base()

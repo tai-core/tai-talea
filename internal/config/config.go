@@ -60,12 +60,21 @@ type ControllerConfig struct {
 	DrainGrace         Duration `yaml:"drain_grace" json:"drain_grace"`
 	OperationRetry     Duration `yaml:"operation_retry" json:"operation_retry"`
 	CallTimeout        Duration `yaml:"call_timeout" json:"call_timeout"`
-	SandboxDirs        []string `yaml:"sandbox_dirs" json:"sandbox_dirs"`
-	ModelID            string   `yaml:"model_id" json:"model_id"`
-	ModelPath          string   `yaml:"model_path" json:"model_path"`
-	ExtraSGLangArgs    []string `yaml:"extra_sglang_args" json:"extra_sglang_args"`
-	LeaseWarning       Duration `yaml:"lease_warning" json:"lease_warning"`
-	LostRateThreshold  float64  `yaml:"lost_rate_threshold" json:"lost_rate_threshold"`
+	// BootstrapToken is the shared secret the container bootstrap requires on
+	// every /bootstrap call. Required: an empty value would mean talking to an
+	// interface that anyone able to reach the port could drive.
+	//
+	// One secret covers the whole deployment because partner consoles create the
+	// containers, so the value has to be provisioned on both sides by hand. Per
+	// partner or per instance secrets would need programmatic instance creation,
+	// which the M1 partner platform does not expose.
+	BootstrapToken    string   `yaml:"bootstrap_token" json:"bootstrap_token"`
+	SandboxDirs       []string `yaml:"sandbox_dirs" json:"sandbox_dirs"`
+	ModelID           string   `yaml:"model_id" json:"model_id"`
+	ModelPath         string   `yaml:"model_path" json:"model_path"`
+	ExtraSGLangArgs   []string `yaml:"extra_sglang_args" json:"extra_sglang_args"`
+	LeaseWarning      Duration `yaml:"lease_warning" json:"lease_warning"`
+	LostRateThreshold float64  `yaml:"lost_rate_threshold" json:"lost_rate_threshold"`
 }
 
 // RouterConfig wraps the Router adapter configuration.
@@ -280,6 +289,12 @@ func (c Config) Validate() error {
 	}
 	if c.Controller.CallTimeout.Duration() <= 0 {
 		return errors.New("controller.call_timeout must be positive")
+	}
+	if len(strings.TrimSpace(c.Controller.BootstrapToken)) < 16 {
+		// Required, not optional: the container bootstrap refuses to serve
+		// without a secret, so a control plane without one could never drive a
+		// single instance.
+		return errors.New("controller.bootstrap_token must be at least 16 characters")
 	}
 	if c.Controller.DrainGrace.Duration() < 0 {
 		return errors.New("controller.drain_grace must not be negative")

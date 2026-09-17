@@ -5,7 +5,13 @@ After=network-online.target
 [Service]
 Type=simple
 # The bootstrap is the only process the control plane talks to inside the
-# container. It exposes /bootstrap/health, /status, /start and /stop.
+# container. It exposes /bootstrap/health, /status, /start and /stop, all of
+# which require the shared secret in X-Bootstrap-Token.
+#
+# --host 0.0.0.0 is required because the control plane calls in from outside the
+# container, and partner platforms routinely publish container ports to the
+# internet. The shared secret is therefore the only barrier - never leave it
+# unset. The bootstrap refuses to start without it (exit code 71).
 ExecStart=/opt/tai-talea/venv/bin/python -m tai_talea_bootstrap serve \
     --profile /etc/tai-talea/profile.json \
     --host 0.0.0.0 \
@@ -19,6 +25,10 @@ TimeoutStopSec=120s
 Restart=no
 StateDirectory=tai-talea
 Environment=PYTHONUNBUFFERED=1
+# The shared secret. Inject it when the instance is created - on 九章智算云 set
+# TAI_TALEA_BOOTSTRAP_TOKEN in the instance's environment variables - or drop it
+# in this file. It must match controller.bootstrap_token in the control plane.
+EnvironmentFile=-/etc/tai-talea/bootstrap.env
 
 [Install]
 WantedBy=multi-user.target

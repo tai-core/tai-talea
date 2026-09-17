@@ -60,9 +60,16 @@ make test
 容器内（受控镜像路线）：
 
 ```bash
+# /bootstrap/* 需要共享密钥，容器与控制面两侧必须一致（controller.bootstrap_token）
+export TAI_TALEA_BOOTSTRAP_TOKEN=...        # 或在九章创建实例时注入环境变量
+
 python -m tai_talea_bootstrap check --profile deploy/container/profile.json
-python -m tai_talea_bootstrap serve --profile /etc/tai-talea/profile.json --port 8080
+python -m tai_talea_bootstrap serve --profile /etc/tai-talea/profile.json \
+    --host 0.0.0.0 --port 8080
 ```
+
+**没有密钥就拒绝启动**（退出码 71），而不是退化成无鉴权接口。`--host` 默认是回环地址，
+要接受控制面的调用必须显式写 `0.0.0.0`——暴露这个端口是一个需要手写的决定。
 
 ## 3. 状态模型（§4）
 
@@ -175,6 +182,18 @@ Router 注册失败、readiness 摘流失败、drain 超时、P/D 比例长期�
 4. Pull 对账机制已完整实现并测试，但 M1 默认 `pull.enabled=false`；文档把"Pull 成为权威
    来源"排在 M2，因此这里只保留配置开关。
 5. `ROLLBACK`/升级/签名业务包等 M3 内容未实现。
+6. **`controller.bootstrap_token`（必填，≥16 字符）**：`/bootstrap/*` 的共享密钥。
+   文档没有规定 bootstrap 接口的鉴权，只写了一句"容器内只运行一个受控的 bootstrap 进程"。
+   但真实合作商平台（九章智算云）**默认就把容器端口发布到公网**，那样
+   `/bootstrap/stop`、`/bootstrap/start`（含任意 `model_path`）会对互联网敞开。
+   因此这里补上共享密钥，并让两侧都 fail-closed：
+
+   - 容器侧：密钥为空则拒绝启动（退出码 `71`），默认绑定回环地址；
+   - 控制面侧：`controller.bootstrap_token` 少于 16 字符直接拒绝加载配置。
+
+   关于粒度：一个密钥覆盖整个部署，而不是按合作商/实例分发。原因是合作商平台
+   只允许在控制台创建实例，密钥必须由人在两侧手工对齐；按实例分发需要程序化创建实例，
+   而平台没有开放这个接口。代价是单个密钥泄露的影响面是全部容器，这条权衡记录在此。
 
 ## 8. 里程碑状态
 

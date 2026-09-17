@@ -20,6 +20,8 @@ EXIT_SERVICE_CRASHED = 68
 EXIT_STOP_TIMEOUT = 69
 # An internal invariant was violated.
 EXIT_INTERNAL = 70
+# The shared secret of the bootstrap interface is not configured.
+EXIT_AUTH_NOT_CONFIGURED = 71
 
 EXIT_DESCRIPTIONS = {
     EXIT_OK: "service stopped cleanly",
@@ -30,6 +32,7 @@ EXIT_DESCRIPTIONS = {
     EXIT_SERVICE_CRASHED: "sglang exited unexpectedly",
     EXIT_STOP_TIMEOUT: "sglang did not stop before the deadline",
     EXIT_INTERNAL: "internal bootstrap error",
+    EXIT_AUTH_NOT_CONFIGURED: "the bootstrap shared secret is not configured",
 }
 
 

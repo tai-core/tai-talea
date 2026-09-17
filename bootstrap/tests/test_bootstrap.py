@@ -1,5 +1,6 @@
 """Unit tests for the bootstrap process: roles, profile, service and HTTP surface."""
 
+import argparse
 import contextlib
 import io
 import json
@@ -29,7 +30,7 @@ from tai_talea_bootstrap.roles import (  # noqa: E402
     build_sglang_command,
     validate_extra_args,
 )
-from tai_talea_bootstrap.server import BootstrapServer  # noqa: E402
+from tai_talea_bootstrap.server import ENV_TOKEN, HEADER_TOKEN, BootstrapServer  # noqa: E402
 from tai_talea_bootstrap.service import (  # noqa: E402
     PHASE_FAILED,
     PHASE_IDLE,
@@ -37,6 +38,10 @@ from tai_talea_bootstrap.service import (  # noqa: E402
     PHASE_STOPPED,
     SGLangService,
 )
+
+
+# The shared secret every request in these tests must present.
+TOKEN = "bootstrap-token-0123456789"
 
 
 def profile(**overrides):
@@ -333,7 +338,7 @@ class HttpSurfaceTests(unittest.TestCase):
             runner=lambda _command: self.process,
             health_probe=lambda _port: True,
         )
-        self.server = BootstrapServer(("127.0.0.1", 0), self.service)
+        self.server = BootstrapServer(("127.0.0.1", 0), self.service, TOKEN)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -342,10 +347,12 @@ class HttpSurfaceTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
-    def request(self, method, path, payload=None):
+    def request(self, method, path, payload=None, token=TOKEN):
         connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {"Content-Type": "application/json"} if body else {}
+        if token is not None:
+            headers[HEADER_TOKEN] = token
         connection.request(method, path, body=body, headers=headers)
         response = connection.getresponse()
         raw = response.read()
@@ -395,7 +402,7 @@ class HttpSurfaceTests(unittest.TestCase):
     def test_invalid_json_is_rejected(self):
         connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
         connection.request("POST", "/bootstrap/start", body=b"not json",
-                           headers={"Content-Type": "application/json"})
+                           headers={"Content-Type": "application/json", HEADER_TOKEN: TOKEN})
         response = connection.getresponse()
         self.assertEqual(response.status, 400)
         response.read()
@@ -404,6 +411,171 @@ class HttpSurfaceTests(unittest.TestCase):
     def test_unknown_path_is_not_found(self):
         status, _ = self.request("GET", "/bootstrap/exec")
         self.assertEqual(status, 404)
+
+
+class BootstrapAuthTests(unittest.TestCase):
+    """The bootstrap interface has no unauthenticated mode.
+
+    Partner platforms routinely publish container ports to the internet, so the
+    shared secret - not the network boundary - is what protects /bootstrap/start
+    and /bootstrap/stop.
+    """
+
+    def setUp(self):
+        self.process = FakeProcess()
+        # Recording the launch commands is what proves a rejected request never
+        # reached the service: FakeProcess.pid is a constant, not a real state.
+        self.launches = []
+
+        def runner(command):
+            self.launches.append(command)
+            return self.process
+
+        self.service = SGLangService(
+            profile(),
+            installer=FakeInstaller(),
+            runner=runner,
+            health_probe=lambda _port: True,
+        )
+        self.server = BootstrapServer(("127.0.0.1", 0), self.service, TOKEN)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def call(self, method, path, payload=None, token=None):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if body else {}
+        if token is not None:
+            headers[HEADER_TOKEN] = token
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        raw = response.read()
+        connection.close()
+        return response.status, json.loads(raw.decode("utf-8"))
+
+    def test_every_endpoint_refuses_a_missing_or_wrong_secret(self):
+        endpoints = (
+            ("GET", "/bootstrap/health", None),
+            ("GET", "/bootstrap/status", None),
+            ("POST", "/bootstrap/start", {"role": "prefill", "model_id": "model-a"}),
+            ("POST", "/bootstrap/stop", {"timeout": 1}),
+        )
+        for method, path, payload in endpoints:
+            for token in (None, "", "wrong-token", TOKEN + "x", TOKEN[:-1]):
+                status, body = self.call(method, path, payload, token=token)
+                self.assertEqual(
+                    status, 401, "%s %s accepted token=%r" % (method, path, token))
+                self.assertEqual(body["error"], "unauthorized")
+
+    def test_a_rejected_start_leaves_the_service_untouched(self):
+        status, _ = self.call("POST", "/bootstrap/start",
+                              {"role": "prefill", "model_id": "model-a"}, token="wrong-token")
+        self.assertEqual(status, 401)
+        # Nothing may have happened: no SGLang process was launched and the
+        # service is still idle.
+        self.assertEqual(self.launches, [])
+        self.assertEqual(self.service.status()["phase"], PHASE_IDLE)
+
+    def test_the_correct_secret_is_accepted(self):
+        status, payload = self.call("GET", "/bootstrap/health", token=TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "ok")
+
+    def test_authorization_precedes_routing(self):
+        # An unknown path must not reveal itself to an unauthenticated caller.
+        status, _ = self.call("GET", "/bootstrap/exec")
+        self.assertEqual(status, 401)
+        status, _ = self.call("GET", "/bootstrap/exec", token=TOKEN)
+        self.assertEqual(status, 404)
+
+    def test_server_refuses_to_start_without_a_secret(self):
+        for token in ("", "   ", None):
+            with self.assertRaises(ValueError):
+                BootstrapServer(("127.0.0.1", 0), self.service, token)
+
+
+class BootstrapSecretSourceTests(unittest.TestCase):
+    """Where the secret comes from, and the fact that there is always a source."""
+
+    def test_token_file_wins_over_the_environment(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "bootstrap.token")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("from-the-file\n")
+
+        saved = os.environ.get(ENV_TOKEN)
+        os.environ[ENV_TOKEN] = "from-the-environment"
+        try:
+            args = argparse.Namespace(token_file=path)
+            self.assertEqual(bootstrap_cli.resolve_token(args), "from-the-file")
+            args.token_file = ""
+            self.assertEqual(bootstrap_cli.resolve_token(args), "from-the-environment")
+            args.token_file = "/definitely/not/here"
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(bootstrap_cli.resolve_token(args), "")
+        finally:
+            if saved is None:
+                os.environ.pop(ENV_TOKEN, None)
+            else:
+                os.environ[ENV_TOKEN] = saved
+
+    def test_serve_fails_closed_without_a_secret(self):
+        saved = os.environ.pop(ENV_TOKEN, None)
+        try:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = bootstrap_cli.main(["serve", "--profile", "/definitely/not/here.json"])
+            self.assertEqual(code, exitcodes.EXIT_AUTH_NOT_CONFIGURED)
+            self.assertIn("auth_not_configured", stderr.getvalue())
+        finally:
+            if saved is not None:
+                os.environ[ENV_TOKEN] = saved
+
+    def test_status_command_authenticates(self):
+        server = BootstrapServer(("127.0.0.1", 0), _idle_service(), TOKEN)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        saved = os.environ.get(ENV_TOKEN)
+        try:
+            os.environ[ENV_TOKEN] = TOKEN
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = bootstrap_cli.main(["status", "--host", "127.0.0.1", "--port", str(port)])
+            self.assertEqual(code, exitcodes.EXIT_OK)
+            self.assertEqual(json.loads(stdout.getvalue())["phase"], PHASE_IDLE)
+
+            os.environ[ENV_TOKEN] = "wrong-token"
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = bootstrap_cli.main(["status", "--host", "127.0.0.1", "--port", str(port)])
+            self.assertEqual(code, exitcodes.EXIT_AUTH_NOT_CONFIGURED)
+
+            os.environ.pop(ENV_TOKEN, None)
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = bootstrap_cli.main(["status", "--host", "127.0.0.1", "--port", str(port)])
+            self.assertEqual(code, exitcodes.EXIT_AUTH_NOT_CONFIGURED)
+        finally:
+            if saved is None:
+                os.environ.pop(ENV_TOKEN, None)
+            else:
+                os.environ[ENV_TOKEN] = saved
+
+
+def _idle_service():
+    return SGLangService(
+        profile(),
+        installer=FakeInstaller(),
+        runner=lambda _command: FakeProcess(),
+        health_probe=lambda _port: True,
+    )
 
 
 class ExitCodeTests(unittest.TestCase):
@@ -417,6 +589,7 @@ class ExitCodeTests(unittest.TestCase):
             exitcodes.EXIT_SERVICE_CRASHED,
             exitcodes.EXIT_STOP_TIMEOUT,
             exitcodes.EXIT_INTERNAL,
+            exitcodes.EXIT_AUTH_NOT_CONFIGURED,
         ):
             self.assertNotEqual(exitcodes.describe(code), "unknown exit code")
 

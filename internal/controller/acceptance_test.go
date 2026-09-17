@@ -28,22 +28,24 @@ import (
 const (
 	testBootstrapVersion = "tai-talea-bootstrap/1"
 	testModelID          = "model-a"
+	testBootstrapToken   = "bootstrap-token-0123456789"
 )
 
 // ---------------------------------------------------------------- fakes
 
 type bootstrapFake struct {
-	mu          sync.Mutex
-	phase       string
-	role        string
-	servicePID  int
-	startCalls  int
-	stopCalls   int
-	statusCalls int
-	failStart   bool
-	down        bool
-	env         launcher.Environment
-	server      *httptest.Server
+	mu           sync.Mutex
+	phase        string
+	role         string
+	servicePID   int
+	startCalls   int
+	stopCalls    int
+	statusCalls  int
+	unauthorized int
+	failStart    bool
+	down         bool
+	env          launcher.Environment
+	server       *httptest.Server
 }
 
 func newBootstrapFake(env launcher.Environment) *bootstrapFake {
@@ -53,8 +55,33 @@ func newBootstrapFake(env launcher.Environment) *bootstrapFake {
 	mux.HandleFunc(launcher.PathStatus, fake.status)
 	mux.HandleFunc(launcher.PathStart, fake.start)
 	mux.HandleFunc(launcher.PathStop, fake.stop)
-	fake.server = httptest.NewServer(mux)
+	// The real bootstrap refuses every request that does not carry the shared
+	// secret, so the fake does too. That is what makes these tests prove the
+	// control plane actually sends the header instead of merely tolerating it.
+	fake.server = httptest.NewServer(fake.requireToken(mux))
 	return fake
+}
+
+// requireToken mimics §9's fail-closed interface: no valid secret, no service.
+func (f *bootstrapFake) requireToken(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get(launcher.HeaderToken) != testBootstrapToken {
+			f.mu.Lock()
+			f.unauthorized++
+			f.mu.Unlock()
+			writeTestJSON(writer, http.StatusUnauthorized,
+				map[string]string{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
+// rejected counts requests the fake turned away for a missing secret.
+func (f *bootstrapFake) rejected() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.unauthorized
 }
 
 func (f *bootstrapFake) Close() { f.server.Close() }
@@ -487,6 +514,7 @@ func newHarness(t *testing.T, instances ...partner.CapacityInstance) *harness {
 	cfg.Router.Timeout = config.Duration(5 * time.Second)
 	cfg.Controller.ModelID = testModelID
 	cfg.Controller.CallTimeout = config.Duration(3 * time.Second)
+	cfg.Controller.BootstrapToken = testBootstrapToken
 	cfg.Controller.ReconcileInterval = config.Duration(10 * time.Millisecond)
 	cfg.Controller.DrainGrace = config.Duration(60 * time.Second)
 	cfg.Controller.OperationRetry = config.Duration(0)
@@ -580,7 +608,7 @@ func buildController(
 	launcherClient, err := launcher.NewWithHTTPClient(&http.Client{
 		Timeout:   cfg.Controller.CallTimeout.Duration(),
 		Transport: &routingTransport{target: target, base: http.DefaultTransport},
-	})
+	}, cfg.Controller.BootstrapToken)
 	if err != nil {
 		t.Fatalf("launcher: %v", err)
 	}
@@ -1114,5 +1142,38 @@ func assertAuditContains(t *testing.T, entries []store.AuditEntry, actions ...st
 		if !seen[action] {
 			t.Fatalf("audit is missing %q, got %v", action, seen)
 		}
+	}
+}
+
+// The bootstrap interface is the control plane's only way to touch a container,
+// and partner platforms publish container ports to the internet. The fake
+// container below refuses every request without the shared secret, so these two
+// tests are what keeps the interface from silently becoming open.
+func TestBootstrapCallsCarryTheSharedSecret(t *testing.T) {
+	h := newHarness(t)
+	h.handle(h.addedEvent("container-1", "http://10.0.0.1:8080", "lease-1", h.clock.Now()))
+
+	instance := h.instance("container-1")
+	if instance.InstanceState != domain.InstanceIdle {
+		t.Fatalf("the instance must reach IDLE, got %s/%s",
+			instance.InstanceState, instance.ServiceState)
+	}
+	if rejected := h.bootstrap.rejected(); rejected != 0 {
+		t.Fatalf("the control plane made %d calls without the shared secret", rejected)
+	}
+}
+
+func TestBootstrapClientRefusesToStartWithoutASecret(t *testing.T) {
+	if _, err := launcher.New(time.Second, ""); err == nil {
+		t.Fatal("launcher.New must refuse an empty shared secret")
+	}
+	if _, err := launcher.New(time.Second, "   "); err == nil {
+		t.Fatal("launcher.New must refuse a blank shared secret")
+	}
+	if _, err := launcher.New(time.Second, testBootstrapToken); err != nil {
+		t.Fatalf("launcher.New with a secret: %v", err)
+	}
+	if _, err := launcher.NewWithHTTPClient(http.DefaultClient, ""); err == nil {
+		t.Fatal("launcher.NewWithHTTPClient must refuse an empty shared secret")
 	}
 }

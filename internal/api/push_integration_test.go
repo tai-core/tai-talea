@@ -34,9 +34,13 @@ const (
 	partnerSecret = "partner-a-push-secret-0123456789"
 	adminToken    = "admin-token-0123456789"
 	modelID       = "model-a"
+	// bootstrapTokenTest is the shared secret of the stub container.
+	bootstrapTokenTest = "bootstrap-token-0123456789"
 )
 
-// stubBootstrap answers the four /bootstrap endpoints for one container.
+// stubBootstrap answers the four /bootstrap endpoints for one container. It
+// demands the shared secret exactly like the real bootstrap does, so the whole
+// Push pipeline below only completes when the control plane sends it.
 func stubBootstrap(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -56,7 +60,14 @@ func stubBootstrap(t *testing.T) *httptest.Server {
 	mux.HandleFunc(launcher.PathStop, func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]any{"phase": launcher.PhaseStopped, "exit_code": 0, "timed_out": false})
 	})
-	server := httptest.NewServer(mux)
+	server := httptest.NewServer(http.HandlerFunc(
+		func(writer http.ResponseWriter, request *http.Request) {
+			if request.Header.Get(launcher.HeaderToken) != bootstrapTokenTest {
+				writer.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			mux.ServeHTTP(writer, request)
+		}))
 	t.Cleanup(server.Close)
 	return server
 }
@@ -152,6 +163,7 @@ func newServer(t *testing.T) (*httptest.Server, *store.SQLiteStore, string) {
 	cfg.Router.URL = router.server.URL
 	cfg.Router.Mode = routeradapter.ModeReadinessV1
 	cfg.Controller.ModelID = modelID
+	cfg.Controller.BootstrapToken = bootstrapTokenTest
 	cfg.ImageProfile = config.ImageProfile{
 		OS: "ubuntu-22.04", CUDA: "12.4", Python: "3.11", SGLang: "0.4.6",
 		Wheelhouse: "/opt/tai-talea/wheelhouse", Virtualenv: "/opt/tai-talea/venv",
@@ -180,7 +192,8 @@ func newServer(t *testing.T) (*httptest.Server, *store.SQLiteStore, string) {
 	if err != nil {
 		t.Fatalf("router adapter: %v", err)
 	}
-	launcherClient, err := launcher.New(cfg.Controller.CallTimeout.Duration())
+	launcherClient, err := launcher.New(
+		cfg.Controller.CallTimeout.Duration(), cfg.Controller.BootstrapToken)
 	if err != nil {
 		t.Fatalf("launcher: %v", err)
 	}

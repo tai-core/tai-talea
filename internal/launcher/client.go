@@ -1,6 +1,10 @@
 // Package launcher speaks to the container-local bootstrap process
 // (development document §9). The control plane never runs arbitrary commands
 // inside a container: it only calls the four fixed bootstrap endpoints.
+//
+// Every call carries the shared secret in the X-Bootstrap-Token header. The
+// bootstrap refuses to serve without one, and this client refuses to be built
+// without one, so there is no configuration in which the interface is open.
 package launcher
 
 import (
@@ -24,6 +28,10 @@ const (
 	PathStart  = "/bootstrap/start"
 	PathStop   = "/bootstrap/stop"
 )
+
+// HeaderToken carries the bootstrap shared secret. The container must be
+// provisioned with the same value before the control plane can drive it.
+const HeaderToken = "X-Bootstrap-Token"
 
 // Bootstrap phases reported by GET /bootstrap/status.
 const (
@@ -97,27 +105,35 @@ type StopResult struct {
 }
 
 // Client is a stateless bootstrap client. The endpoint is supplied per call so
-// one client serves every container.
+// one client serves every container; the shared secret is fixed for the whole
+// deployment, because partner consoles create the containers and the value has
+// to be provisioned on both sides by hand.
 type Client struct {
-	http *http.Client
+	http  *http.Client
+	token string
 }
 
 // New builds a client with a bounded timeout.
-func New(timeout time.Duration) (*Client, error) {
+func New(timeout time.Duration, token string) (*Client, error) {
 	if timeout <= 0 || timeout > 60*time.Second {
 		return nil, errors.New("bootstrap timeout must be between zero and 60 seconds")
 	}
-	return &Client{http: &http.Client{Timeout: timeout}}, nil
+	return NewWithHTTPClient(&http.Client{Timeout: timeout}, token)
 }
 
 // NewWithHTTPClient builds a client around a caller supplied HTTP client. It
 // exists so tests and constrained deployments can route bootstrap calls through
 // a custom transport.
-func NewWithHTTPClient(client *http.Client) (*Client, error) {
+func NewWithHTTPClient(client *http.Client, token string) (*Client, error) {
 	if client == nil {
 		return nil, errors.New("bootstrap client is required")
 	}
-	return &Client{http: client}, nil
+	if strings.TrimSpace(token) == "" {
+		// Fail closed: a client without a secret could only talk to an
+		// unauthenticated bootstrap, which must never exist.
+		return nil, errors.New("bootstrap shared secret is required")
+	}
+	return &Client{http: client, token: strings.TrimSpace(token)}, nil
 }
 
 // Health probes GET /bootstrap/health.
@@ -184,6 +200,7 @@ func (c *Client) call(ctx context.Context, endpoint, method, path string, body a
 		return err
 	}
 	request.Header.Set("Accept", "application/json")
+	request.Header.Set(HeaderToken, c.token)
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

@@ -5,8 +5,14 @@
     python -m tai_talea_bootstrap status
 
 ``serve`` is the mode a container runs: it validates the compatibility matrix,
-exposes the four /bootstrap endpoints and forwards termination signals. It exits
-with one of the documented exit codes after the service stopped (§9).
+exposes the four /bootstrap endpoints behind a shared secret, and forwards
+termination signals. It exits with one of the documented exit codes after the
+service stopped (§9).
+
+The shared secret is read from ``TAI_TALEA_BOOTSTRAP_TOKEN`` or from
+``--token-file``. There is no fallback: without it ``serve`` refuses to start,
+because the alternative is an interface that anyone who can reach the port may
+drive.
 """
 
 from __future__ import annotations
@@ -21,9 +27,30 @@ import threading
 from . import BOOTSTRAP_VERSION, exitcodes
 from .profile import ImageProfile, ProfileError, detect_environment
 from .service import SGLangService
-from .server import serve
+from .server import DEFAULT_HOST, ENV_TOKEN, HEADER_TOKEN, serve
 
 DEFAULT_PROFILE_PATH = "/etc/tai-talea/profile.json"
+
+# Loopback names that do not expose the interface beyond the container.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def resolve_token(args):
+    """Read the bootstrap shared secret from --token-file or the environment.
+
+    A file takes precedence so a deployment can override the environment without
+    editing the unit, and so the secret never has to appear in a command line,
+    where `ps` would show it to every process in the container.
+    """
+    path = getattr(args, "token_file", "") or ""
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError as error:
+            print("cannot read token file %s: %s" % (path, error), file=sys.stderr)
+            return ""
+    return os.environ.get(ENV_TOKEN, "").strip()
 
 
 def load_profile(path):
@@ -71,18 +98,43 @@ def command_status(args):
     import urllib.error
     import urllib.request
 
+    token = resolve_token(args)
+    if not token:
+        print(json.dumps({
+            "error": "auth_not_configured",
+            "message": "reading the status requires the shared secret; set %s" % ENV_TOKEN,
+        }), file=sys.stderr)
+        return exitcodes.EXIT_AUTH_NOT_CONFIGURED
+
     url = "http://%s:%d/bootstrap/status" % (args.host, args.port)
+    request = urllib.request.Request(url, headers={HEADER_TOKEN: token})
     try:
-        with urllib.request.urlopen(url, timeout=args.timeout) as response:  # noqa: S310
+        with urllib.request.urlopen(request, timeout=args.timeout) as response:  # noqa: S310
             print(response.read().decode("utf-8"))
             return exitcodes.EXIT_OK
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            print("bootstrap at %s rejected the shared secret" % url, file=sys.stderr)
+            return exitcodes.EXIT_AUTH_NOT_CONFIGURED
+        print("bootstrap at %s returned HTTP %s" % (url, error.code), file=sys.stderr)
+        return exitcodes.EXIT_INTERNAL
     except (urllib.error.URLError, OSError) as error:
         print("bootstrap is not reachable at %s: %s" % (url, error), file=sys.stderr)
         return exitcodes.EXIT_INTERNAL
 
 
 def command_serve(args):
-    profile = load_profile(args.profile)
+    token = resolve_token(args)
+    if not token:
+        # Fail closed: never expose an unauthenticated control interface.
+        print(json.dumps({
+            "error": "auth_not_configured",
+            "message": "the bootstrap interface requires a shared secret; set %s or pass "
+                       "--token-file" % ENV_TOKEN,
+        }), file=sys.stderr)
+        return exitcodes.EXIT_AUTH_NOT_CONFIGURED
+
+    profile = load_profile(args)
     report = detect_environment(profile)
     service = SGLangService(profile)
     service.note_environment(report)
@@ -111,11 +163,20 @@ def command_serve(args):
             except (ValueError, OSError):
                 pass
 
-    logging.getLogger("tai_talea_bootstrap").info(
-        "serving bootstrap %s on %s:%d", BOOTSTRAP_VERSION, args.host, args.port
+    logger = logging.getLogger("tai_talea_bootstrap")
+    logger.info(
+        "serving bootstrap %s on %s:%d (shared secret required)",
+        BOOTSTRAP_VERSION, args.host, args.port,
     )
+    if args.host not in LOOPBACK_HOSTS:
+        # Partner platforms commonly publish container ports to the internet, so
+        # make the exposure decision visible in the log rather than implicit.
+        logger.warning(
+            "bootstrap interface listens on %s, beyond the container loopback; "
+            "the shared secret is the only barrier", args.host,
+        )
     try:
-        serve(service, host=args.host, port=args.port, stop_event=stop_event)
+        serve(service, host=args.host, port=args.port, token=token, stop_event=stop_event)
     finally:
         if service.state.phase not in ("STOPPED", "FAILED"):
             service.stop(timeout=args.stop_timeout)
@@ -137,8 +198,12 @@ def build_parser():
 
     serve_parser = subparsers.add_parser("serve", help="run the bootstrap control interface")
     serve_parser.add_argument("--profile", default=DEFAULT_PROFILE_PATH)
-    serve_parser.add_argument("--host", default="0.0.0.0")
+    serve_parser.add_argument("--host", default=DEFAULT_HOST,
+                              help="bind address; the default is loopback, pass 0.0.0.0 to "
+                                   "accept calls from the control plane (default: %(default)s)")
     serve_parser.add_argument("--port", type=int, default=8080)
+    serve_parser.add_argument("--token-file", default="",
+                              help="file holding the shared secret (overrides %s)" % ENV_TOKEN)
     serve_parser.add_argument("--stop-timeout", type=float, default=60.0)
     serve_parser.set_defaults(func=command_serve)
 
@@ -149,6 +214,7 @@ def build_parser():
     status_parser = subparsers.add_parser("status", help="read the status of a running bootstrap")
     status_parser.add_argument("--host", default="127.0.0.1")
     status_parser.add_argument("--port", type=int, default=8080)
+    status_parser.add_argument("--token-file", default="")
     status_parser.add_argument("--timeout", type=float, default=5.0)
     status_parser.set_defaults(func=command_status)
     return parser

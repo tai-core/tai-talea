@@ -30,6 +30,11 @@ controller:
   drain_grace: 300s
   operation_retry: 15s
   call_timeout: 10s
+  # Shared secret the container bootstrap requires on every /bootstrap call.
+  # The same value must be provisioned inside the container via
+  # TAI_TALEA_BOOTSTRAP_TOKEN. Required: the bootstrap has no unauthenticated
+  # mode, so there is no configuration in which this can be left empty.
+  bootstrap_token: change-me-bootstrap-token
   # §10 controlled image route: the model every container must advertise.
   model_id: model-a
   model_path: ""

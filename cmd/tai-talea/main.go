@@ -94,7 +94,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("router adapter: %w", err)
 	}
-	launcherClient, err := launcher.New(cfg.Controller.CallTimeout.Duration())
+	launcherClient, err := launcher.New(
+		cfg.Controller.CallTimeout.Duration(), cfg.Controller.BootstrapToken)
 	if err != nil {
 		return fmt.Errorf("bootstrap client: %w", err)
 	}
