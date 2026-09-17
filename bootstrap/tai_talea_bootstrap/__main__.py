@@ -134,7 +134,7 @@ def command_serve(args):
         }), file=sys.stderr)
         return exitcodes.EXIT_AUTH_NOT_CONFIGURED
 
-    profile = load_profile(args)
+    profile = load_profile(args.profile)
     report = detect_environment(profile)
     service = SGLangService(profile)
     service.note_environment(report)

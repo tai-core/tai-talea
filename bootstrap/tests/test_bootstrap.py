@@ -578,6 +578,60 @@ def _idle_service():
     )
 
 
+class ServeCommandTests(unittest.TestCase):
+    """`serve` is only reachable through the CLI entry point.
+
+    Every other suite builds BootstrapServer / SGLangService directly, so a
+    broken command_serve stays invisible to them. That is exactly how a
+    regression shipped: commit 454f1c3 rewrote command_serve to add the shared
+    secret and passed the whole argparse Namespace to load_profile, so every
+    real `serve` start died with {"error": "internal"} and exit code 70 while
+    `check` kept passing.
+    """
+
+    def setUp(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        self.path = os.path.join(directory, "profile.json")
+        # Deliberately incompatible, so serve returns before it would listen.
+        payload = {
+            "os": "nowhere-1.0", "cuda": "12.4", "python": "3.10", "sglang": "0.3.0",
+            "wheelhouse": "/definitely/not/here", "virtualenv": "/definitely/not/here",
+        }
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        self.addCleanup(os.environ.pop, ENV_TOKEN, None)
+        os.environ[ENV_TOKEN] = "s" * 32
+
+    def run_serve(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = bootstrap_cli.main(["serve", "--profile", self.path])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_serve_reads_the_profile_file_not_the_argument_namespace(self):
+        code, _, stderr = self.run_serve()
+        self.assertEqual(
+            code, exitcodes.EXIT_ENV_INCOMPATIBLE,
+            "serve must report an incompatible environment (65), not crash with an "
+            "internal error (70): %s" % stderr)
+        self.assertIn("environment_incompatible", stderr)
+
+    def test_serve_refuses_to_start_without_a_shared_secret(self):
+        os.environ.pop(ENV_TOKEN, None)
+        code, _, stderr = self.run_serve()
+        self.assertEqual(code, exitcodes.EXIT_AUTH_NOT_CONFIGURED)
+        self.assertIn("auth_not_configured", stderr)
+
+    def test_serve_rejects_a_missing_profile_file(self):
+        missing = os.path.join(os.path.dirname(self.path), "nope.json")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = bootstrap_cli.main(["serve", "--profile", missing])
+        self.assertEqual(code, exitcodes.EXIT_ENV_INCOMPATIBLE)
+        self.assertIn("profile_invalid", stderr.getvalue())
+
+
 class ExitCodeTests(unittest.TestCase):
     def test_every_code_is_documented(self):
         for code in (
