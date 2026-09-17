@@ -94,6 +94,11 @@ func TestValidationRejectsIncompleteConfiguration(t *testing.T) {
 		"duplicate partner":        func(c *config.Config) { c.Partners = append(c.Partners, c.Partners[0]) },
 		// The bootstrap interface has no unauthenticated mode, so a control
 		// plane without a secret could not drive a single instance.
+		// An instance address that would only fail at dial time must be caught
+		// by --check-config instead.
+		"bad service endpoint": func(c *config.Config) {
+			c.Partners[0].Instances[0].ServiceEndpoint = "not-a-url"
+		},
 		"missing bootstrap token": func(c *config.Config) { c.Controller.BootstrapToken = "" },
 		"short bootstrap token":   func(c *config.Config) { c.Controller.BootstrapToken = "short" },
 	}

@@ -1,0 +1,122 @@
+# tai-talea deployment for 九章智算云 (Alaya NeW Cloud) CCI.
+#
+# This is a concrete instance of the generic example, filled in with the values
+# that were measured on a real H100 CCI container on 2026-09-17. The generic
+# example (deploy/tai-talea.example.yaml) stays as the controlled-baseline
+# reference and is still what `make check-config` points at by default.
+#
+# Platform notes that shaped this file (see docs/alayanew-cci.md):
+#
+#   * A CCI instance publishes container ports 9001 and 9002 by default, each
+#     mapped to an unrelated public port. On the instance measured here:
+#         9001 -> 120.220.102.21:30086   (bootstrap control interface)
+#         9002 -> 120.220.102.21:30093   (SGLang service)
+#     That is why every instance needs both `endpoint` and `service_endpoint`:
+#     the service address cannot be derived from the control address.
+#
+#   * The measured baseline is Ubuntu 22.04.5, CUDA 12.8, Python 3.11.13,
+#     driver 580. `image_profile` below matches it, not the document's generic
+#     example.
+#
+#   * Creating instances is console-only; the OpenAPI lifecycle covers
+#     start/stop/release but not create. So the capacity source is `static`
+#     until an Alaya-specific adapter exists - the generic `http` adapter
+#     cannot talk to the CCI API because that one requires its own
+#     `alayanew-HMAC-SHA256` request signature.
+
+server:
+  listen: 127.0.0.1:8787
+  # Operator bearer token for /v1/capacity/*. Must be at least 16 characters.
+  admin_token: change-me-admin-token
+  max_push_body_bytes: 1048576
+  read_timeout: 15s
+  write_timeout: 30s
+  shutdown_timeout: 10s
+
+storage:
+  sqlite_path: /var/lib/tai-talea/tai-talea.db
+
+controller:
+  reconcile_interval: 10s
+  prepare_max_attempts: 3
+  start_max_attempts: 3
+  release_max_attempts: 3
+  # A revoke event may ask for a shorter grace period; this is the default.
+  drain_grace: 300s
+  operation_retry: 15s
+  call_timeout: 10s
+  # Shared secret of the bootstrap interface. The container must carry the same
+  # value in TAI_TALEA_BOOTSTRAP_TOKEN; 九章 CCI lets you set environment
+  # variables when creating the instance. The bootstrap refuses to start
+  # without it, and this control plane refuses to load without it.
+  bootstrap_token: change-me-bootstrap-token
+  # The model every container must advertise. The path is the read-only model
+  # mount shared by the platform.
+  model_id: Qwen/Qwen2.5-3B-Instruct
+  model_path: /root/public/models/Qwen/Qwen2.5-3B-Instruct
+  extra_sglang_args: []
+  lease_warning: 120s
+  lost_rate_threshold: 0.2
+
+router:
+  name: primary
+  # The Router must be able to reach the service endpoints above, which are
+  # public addresses on 九章's gateway. It can run anywhere that can: a CCI
+  # instance, or an operator workstation on the same network.
+  url: http://127.0.0.1:30001
+  mode: readiness-v1
+  timeout: 10s
+
+planner:
+  # §11 manual gear. Supported: 1:1, 2:1, 1:2.
+  gear: "1:1"
+  max_change_per_round: 1
+  min_hold: 120s
+  cooldown: 60s
+  # 0 means "use every available instance".
+  max_serving: 0
+
+pull:
+  enabled: false
+  interval: 30s
+  failure_threshold: 3
+
+alerts:
+  webhook_url: ""
+  cooldown: 5m
+  ratio_tolerance: 0.15
+
+# Measured on the H100 CCI container, not copied from the generic example.
+image_profile:
+  os: ubuntu-22.04
+  cuda: "12.8"
+  python: "3.11"
+  sglang: "0.5.x"
+  wheelhouse: /opt/tai-talea/wheelhouse
+  virtualenv: /opt/tai-talea/venv
+
+partners:
+  - id: alayanew
+    # static: the instance inventory lives in this file. Switch to a dedicated
+    # adapter once one exists for the CCI OpenAPI.
+    adapter: static
+    # Credentials the partner platform would use to push capacity events. The
+    # real deployment receives these events from our own provisioning tooling
+    # rather than from 九章, so rotate them per deployment.
+    push_token: alayanew-push-token
+    push_secret: alayanew-push-secret-0123456789
+    hmac_tolerance: 5m
+    replay_cache_size: 4096
+    instances:
+      # instance id is the CCI instance UUID
+      - id: 77c219dc-d336-4f89-90e9-c848a8f70253
+        # bootstrap control interface: container 9001 -> public :30086
+        endpoint: http://120.220.102.21:30086
+        # SGLang service: container 9002 -> public :30093
+        service_endpoint: http://120.220.102.21:30093
+        lease_id: cci-77c219dc-d336-4f89-90e9-c848a8f70253
+        spec:
+          gpu: NVIDIA-H100-80G
+          gpu_count: 8
+          model_support:
+            - Qwen/Qwen2.5-3B-Instruct

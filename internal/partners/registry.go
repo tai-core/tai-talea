@@ -35,12 +35,15 @@ func buildAdapter(cfg config.PartnerConfig) (partner.PartnerAdapter, error) {
 	case "static":
 		instances := make([]partner.CapacityInstance, 0, len(cfg.Instances))
 		for _, item := range cfg.Instances {
+			// One mapping lives in the config package; reusing it here is what
+			// keeps validation and wiring from drifting apart.
+			event := item.ToEventInstance()
 			instances = append(instances, partner.CapacityInstance{
-				ID:              item.ID,
-				Endpoint:        item.Endpoint,
-				ServiceEndpoint: item.ServiceEndpoint,
-				LeaseID:         item.LeaseID,
-				Spec:            item.Spec,
+				ID:              event.ID,
+				Endpoint:        event.Endpoint,
+				ServiceEndpoint: event.ServiceEndpoint,
+				LeaseID:         event.LeaseID,
+				Spec:            *event.Spec,
 			})
 		}
 		return partner.NewStaticAdapter(cfg.ID, instances)

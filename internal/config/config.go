@@ -386,8 +386,25 @@ func (p PartnerConfig) Validate() error {
 }
 
 // Validate checks one static instance configuration.
+// ToEventInstance is the single mapping from a configured container to the
+// partner event shape. Validation and the adapter builder both go through it,
+// so a new field cannot be honoured in one place and forgotten in the other.
+// (It already happened once: ServiceEndpoint was added to the adapter mapping
+// but not to the hand-built payload in Validate, so a malformed value passed
+// --check-config and only failed at start-up.)
+func (i StaticInstanceConfig) ToEventInstance() domain.EventInstance {
+	spec := i.Spec
+	return domain.EventInstance{
+		ID:              i.ID,
+		Endpoint:        i.Endpoint,
+		ServiceEndpoint: i.ServiceEndpoint,
+		LeaseID:         i.LeaseID,
+		Spec:            &spec,
+	}
+}
+
 func (i StaticInstanceConfig) Validate() error {
-	payload := domain.EventInstance{ID: i.ID, Endpoint: i.Endpoint, LeaseID: i.LeaseID, Spec: &i.Spec}
+	payload := i.ToEventInstance()
 	if err := payload.Validate(); err != nil {
 		return err
 	}
