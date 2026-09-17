@@ -83,6 +83,12 @@ type RouterConfig struct {
 	URL     string   `yaml:"url" json:"url"`
 	Mode    string   `yaml:"mode" json:"mode"`
 	Timeout Duration `yaml:"timeout" json:"timeout"`
+	// PrefillBootstrapPort is the port of the disaggregation bootstrap server
+	// running on every prefill worker (sglang default 8998). The Router hands
+	// this address to the decode side so it can pull KV. Zero omits the field
+	// from the registration, which leaves the Router nothing to inject and
+	// breaks PD routing - so a PD deployment must set it.
+	PrefillBootstrapPort int `yaml:"prefill_bootstrap_port" json:"prefill_bootstrap_port"`
 }
 
 // ToAdapter converts the configuration into an adapter configuration.
@@ -92,6 +98,8 @@ func (c RouterConfig) ToAdapter() routeradapter.Config {
 		URL:     c.URL,
 		Mode:    c.Mode,
 		Timeout: c.Timeout.Duration(),
+
+		PrefillBootstrapPort: c.PrefillBootstrapPort,
 	}
 }
 

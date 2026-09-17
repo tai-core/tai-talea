@@ -69,6 +69,9 @@ type Config struct {
 	URL     string        `json:"url" yaml:"url"`
 	Mode    string        `json:"mode,omitempty" yaml:"mode,omitempty"`
 	Timeout time.Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	// PrefillBootstrapPort is the disaggregation bootstrap port of prefill
+	// workers (sglang default 8998). Zero means "do not send the field".
+	PrefillBootstrapPort int `json:"prefill_bootstrap_port,omitempty" yaml:"prefill_bootstrap_port,omitempty"`
 }
 
 // EffectiveMode returns the mode with the safe default applied.
@@ -95,6 +98,10 @@ func (c Config) Validate() error {
 	if c.Timeout < 0 || c.Timeout > 30*time.Second {
 		return errors.New("router timeout must be between zero and 30 seconds")
 	}
+	if c.PrefillBootstrapPort != 0 &&
+		(c.PrefillBootstrapPort < 1 || c.PrefillBootstrapPort > 65535) {
+		return errors.New("router prefill_bootstrap_port must be a valid port when set")
+	}
 	return nil
 }
 
@@ -104,6 +111,11 @@ type RegisterRequest struct {
 	WorkerType domain.Role
 	ModelID    string
 	APIKey     string
+	// BootstrapPort is the disaggregation bootstrap port of a prefill worker
+	// (sglang default 8998). The Router injects this address into routed
+	// requests so the decode side knows where to pull KV from; omitting it
+	// leaves the Router with nothing to inject. Zero omits the field.
+	BootstrapPort int
 }
 
 // Registration is the accepted worker identity.
@@ -188,13 +200,16 @@ func (c *Client) RegisterWorker(ctx context.Context, request RegisterRequest) (R
 		return Registration{}, errors.New("model id is invalid")
 	}
 
-	body := map[string]string{
+	body := map[string]any{
 		"url":         request.WorkerURL,
 		"worker_type": string(request.WorkerType),
 		"model_id":    request.ModelID,
 	}
 	if request.APIKey != "" {
 		body["api_key"] = request.APIKey
+	}
+	if request.BootstrapPort != 0 {
+		body["bootstrap_port"] = request.BootstrapPort
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {

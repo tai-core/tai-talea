@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
 import logging
 import signal
 import threading
@@ -93,6 +94,20 @@ class BootstrapHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ConfigurationError("request body must be a json object")
         return payload
+
+    def default_log_file(self, role):
+        """Output capture for a start request that names no file.
+
+        A service started by the control plane never carries a log_file: the
+        field exists for operators driving the API by hand. Without this
+        fallback the child's streams go to DEVNULL and a crash during model
+        load leaves nothing behind to read.
+        """
+        base = getattr(self.server, "log_dir", "")
+        if not base:
+            return ""
+        safe = "".join(c for c in str(role) if c.isalnum() or c in "-_") or "service"
+        return os.path.join(base, "sglang-%s.log" % safe)
 
     @property
     def service(self):
@@ -169,7 +184,8 @@ class BootstrapHandler(BaseHTTPRequestHandler):
             model_path=payload.get("model_path", ""),
             port=port,
             extra_args=payload.get("extra_args") or (),
-            log_file=payload.get("log_file", ""),
+            log_file=payload.get("log_file", "") or self.default_log_file(
+                payload.get("role", "service")),
             prepare_environment=bool(payload.get("prepare_environment", True)),
         )
         if result.accepted:
@@ -211,7 +227,8 @@ class BootstrapServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, service, token):
+    def __init__(self, address, service, token, log_dir=""):
+        self.log_dir = str(log_dir or "").strip()
         if not token or not str(token).strip():
             raise ValueError(
                 "bootstrap shared secret is required: set %s or pass --token-file" % ENV_TOKEN
@@ -221,9 +238,9 @@ class BootstrapServer(ThreadingHTTPServer):
         self.token = str(token)
 
 
-def serve(service, host=DEFAULT_HOST, port=8080, token="", stop_event=None):
+def serve(service, host=DEFAULT_HOST, port=8080, token="", stop_event=None, log_dir=""):
     """Run the bootstrap control interface until ``stop_event`` is set."""
-    server = BootstrapServer((host, int(port)), service, token)
+    server = BootstrapServer((host, int(port)), service, token, log_dir=log_dir)
     stop_event = stop_event or threading.Event()
 
     def _shutdown(_signum=None, _frame=None):

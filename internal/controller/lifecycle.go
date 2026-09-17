@@ -318,9 +318,10 @@ func (c *Controller) register(ctx context.Context, instance domain.Instance, rol
 	// to every request; on a partner platform the two are different ports.
 	serviceURL := instance.ServiceURL()
 	registration, err := c.router.RegisterWorker(callCtx, routeradapter.RegisterRequest{
-		WorkerURL:  serviceURL,
-		WorkerType: role,
-		ModelID:    c.cfg.Controller.ModelID,
+		WorkerURL:     serviceURL,
+		WorkerType:    role,
+		ModelID:       c.cfg.Controller.ModelID,
+		BootstrapPort: c.cfg.Router.PrefillBootstrapPort,
 	})
 	cancel()
 	if err == nil {

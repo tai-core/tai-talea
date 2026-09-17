@@ -20,6 +20,7 @@ import (
 type routerStub struct {
 	workers    map[string]string // worker id -> url
 	types      map[string]string
+	bootstrap  map[string]int // worker id -> bootstrap port (0 = none sent)
 	readiness  map[string]string
 	generation uint64
 	deletes    int
@@ -30,7 +31,7 @@ type routerStub struct {
 func newRouterStub() *routerStub {
 	stub := &routerStub{
 		workers: map[string]string{}, types: map[string]string{},
-		readiness: map[string]string{}, generation: 1,
+		bootstrap: map[string]int{}, readiness: map[string]string{}, generation: 1,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/workers", stub.workersHandler)
@@ -62,13 +63,20 @@ func (s *routerStub) workersHandler(writer http.ResponseWriter, request *http.Re
 			writeStubJSON(writer, http.StatusConflict, map[string]string{"error": "worker_exists", "message": "already exists"})
 			return
 		}
-		var payload map[string]string
-		_ = json.NewDecoder(request.Body).Decode(&payload)
-		id := "w-" + payload["url"]
-		s.workers[id] = payload["url"]
-		s.types[id] = payload["worker_type"]
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			writeStubJSON(writer, http.StatusBadRequest, map[string]string{"error": "bad_json"})
+			return
+		}
+		url, _ := payload["url"].(string)
+		workerType, _ := payload["worker_type"].(string)
+		port, _ := payload["bootstrap_port"].(float64)
+		id := "w-" + url
+		s.workers[id] = url
+		s.types[id] = workerType
+		s.bootstrap[id] = int(port)
 		s.readiness[id] = "ready"
-		writeStubJSON(writer, http.StatusAccepted, map[string]string{"worker_id": id, "url": payload["url"]})
+		writeStubJSON(writer, http.StatusAccepted, map[string]string{"worker_id": id, "url": url})
 	case http.MethodGet:
 		list := make([]map[string]any, 0, len(s.workers))
 		for id, url := range s.workers {
@@ -165,9 +173,15 @@ func TestAdapterRegistersReadsAndDrainsThroughReadiness(t *testing.T) {
 
 	registration, err := client.RegisterWorker(ctx, routeradapter.RegisterRequest{
 		WorkerURL: "http://prefill-a:31000", WorkerType: domain.RolePrefill, ModelID: "model-a",
+		BootstrapPort: 8998,
 	})
 	if err != nil {
 		t.Fatalf("register: %v", err)
+	}
+	// PD routing needs the prefill's bootstrap port: the Router injects it into
+	// every routed request so the decode side knows where to pull KV from.
+	if got := stub.bootstrap["w-http://prefill-a:31000"]; got != 8998 {
+		t.Fatalf("bootstrap_port=%d, want 8998", got)
 	}
 	if registration.WorkerID == "" || registration.WorkerURL != "http://prefill-a:31000" {
 		t.Fatalf("unexpected registration: %+v", registration)
