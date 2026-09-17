@@ -71,12 +71,15 @@ type Environment struct {
 
 // Status is the response of GET /bootstrap/status.
 type Status struct {
-	Phase       string      `json:"phase"`
-	Role        string      `json:"role,omitempty"`
-	ModelID     string      `json:"model_id,omitempty"`
-	ServicePID  int         `json:"service_pid,omitempty"`
-	StartedAt   time.Time   `json:"started_at,omitempty"`
-	StoppedAt   time.Time   `json:"stopped_at,omitempty"`
+	Phase      string `json:"phase"`
+	Role       string `json:"role,omitempty"`
+	ModelID    string `json:"model_id,omitempty"`
+	ServicePID int    `json:"service_pid,omitempty"`
+	// The bootstrap publishes epoch seconds as a JSON number (0.0 when
+	// unset); declaring these as time.Time made every /bootstrap/status call
+	// fail to unmarshal on a real container.
+	StartedAt   float64     `json:"started_at"`
+	StoppedAt   float64     `json:"stopped_at"`
 	ExitCode    int         `json:"exit_code,omitempty"`
 	LastError   string      `json:"last_error,omitempty"`
 	Environment Environment `json:"environment"`

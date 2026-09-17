@@ -176,7 +176,8 @@ def command_serve(args):
             "the shared secret is the only barrier", args.host,
         )
     try:
-        serve(service, host=args.host, port=args.port, token=token, stop_event=stop_event)
+        serve(service, host=args.host, port=args.port, token=token, stop_event=stop_event,
+              log_dir=args.log_dir)
     finally:
         if service.state.phase not in ("STOPPED", "FAILED"):
             service.stop(timeout=args.stop_timeout)
@@ -204,6 +205,9 @@ def build_parser():
     serve_parser.add_argument("--port", type=int, default=8080)
     serve_parser.add_argument("--token-file", default="",
                               help="file holding the shared secret (overrides %s)" % ENV_TOKEN)
+    serve_parser.add_argument("--log-dir", default="",
+                              help="directory that captures a service's output when its "
+                                   "start request names no log file")
     serve_parser.add_argument("--stop-timeout", type=float, default=60.0)
     serve_parser.set_defaults(func=command_serve)
 
