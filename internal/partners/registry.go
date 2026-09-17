@@ -36,10 +36,11 @@ func buildAdapter(cfg config.PartnerConfig) (partner.PartnerAdapter, error) {
 		instances := make([]partner.CapacityInstance, 0, len(cfg.Instances))
 		for _, item := range cfg.Instances {
 			instances = append(instances, partner.CapacityInstance{
-				ID:       item.ID,
-				Endpoint: item.Endpoint,
-				LeaseID:  item.LeaseID,
-				Spec:     item.Spec,
+				ID:              item.ID,
+				Endpoint:        item.Endpoint,
+				ServiceEndpoint: item.ServiceEndpoint,
+				LeaseID:         item.LeaseID,
+				Spec:            item.Spec,
 			})
 		}
 		return partner.NewStaticAdapter(cfg.ID, instances)

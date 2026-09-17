@@ -145,15 +145,16 @@ func (c *Controller) handleCapacityAdded(ctx context.Context, event domain.Capac
 
 	now := c.now()
 	instance := domain.Instance{
-		ID:             event.Instance.ID,
-		PartnerID:      event.PartnerID,
-		Endpoint:       domain.NormalizeEndpoint(event.Instance.Endpoint),
-		LeaseID:        event.Instance.LeaseID,
-		InstanceState:  domain.InstanceAllocating,
-		ServiceState:   domain.ServiceNone,
-		LeaseUpdatedAt: event.OccurredAt,
-		LastSeenAt:     now,
-		CreatedAt:      now,
+		ID:              event.Instance.ID,
+		PartnerID:       event.PartnerID,
+		Endpoint:        domain.NormalizeEndpoint(event.Instance.Endpoint),
+		ServiceEndpoint: domain.NormalizeEndpoint(event.Instance.ServiceEndpoint),
+		LeaseID:         event.Instance.LeaseID,
+		InstanceState:   domain.InstanceAllocating,
+		ServiceState:    domain.ServiceNone,
+		LeaseUpdatedAt:  event.OccurredAt,
+		LastSeenAt:      now,
+		CreatedAt:       now,
 	}
 	if event.Instance.Spec != nil {
 		instance.Spec = *event.Instance.Spec
@@ -234,6 +235,11 @@ func (c *Controller) handleCapacityUpdated(ctx context.Context, event domain.Cap
 	if endpoint := domain.NormalizeEndpoint(event.Instance.Endpoint); endpoint != "" && endpoint != instance.Endpoint {
 		updated.Endpoint = endpoint
 		changed = append(changed, "endpoint")
+	}
+	if service := domain.NormalizeEndpoint(event.Instance.ServiceEndpoint); service != "" &&
+		service != instance.ServiceEndpoint {
+		updated.ServiceEndpoint = service
+		changed = append(changed, "service_endpoint")
 	}
 	if event.Instance.LeaseID != "" && event.Instance.LeaseID != instance.LeaseID {
 		updated.LeaseID = event.Instance.LeaseID

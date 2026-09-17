@@ -19,21 +19,26 @@ import (
 
 // CapacityInstance is one container as reported by a partner.
 type CapacityInstance struct {
-	ID             string              `json:"id"`
-	Endpoint       string              `json:"endpoint"`
-	LeaseID        string              `json:"lease_id"`
-	LeaseUpdatedAt time.Time           `json:"lease_updated_at,omitempty"`
-	Spec           domain.InstanceSpec `json:"spec"`
+	ID       string `json:"id"`
+	Endpoint string `json:"endpoint"`
+	// ServiceEndpoint is where the Router reaches SGLang. Partners that publish
+	// the control interface and the service on different ports set it; leaving
+	// it empty means Endpoint serves both roles.
+	ServiceEndpoint string              `json:"service_endpoint,omitempty"`
+	LeaseID         string              `json:"lease_id"`
+	LeaseUpdatedAt  time.Time           `json:"lease_updated_at,omitempty"`
+	Spec            domain.InstanceSpec `json:"spec"`
 }
 
 // ToEventInstance converts the partner view into the event payload shape.
 func (c CapacityInstance) ToEventInstance() domain.EventInstance {
 	spec := c.Spec
 	return domain.EventInstance{
-		ID:       c.ID,
-		Endpoint: c.Endpoint,
-		LeaseID:  c.LeaseID,
-		Spec:     &spec,
+		ID:              c.ID,
+		Endpoint:        c.Endpoint,
+		ServiceEndpoint: c.ServiceEndpoint,
+		LeaseID:         c.LeaseID,
+		Spec:            &spec,
 	}
 }
 
@@ -176,6 +181,9 @@ func mergeInstance(available, lease CapacityInstance) CapacityInstance {
 	merged := lease
 	if available.Endpoint != "" {
 		merged.Endpoint = available.Endpoint
+	}
+	if available.ServiceEndpoint != "" {
+		merged.ServiceEndpoint = available.ServiceEndpoint
 	}
 	if available.LeaseID != "" {
 		merged.LeaseID = available.LeaseID

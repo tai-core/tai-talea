@@ -52,6 +52,18 @@ ALT_PREFIX = "/api/v1"
 
 USER_AGENT = "tai-talea-cci-probe/1"
 
+# Some workstations export HTTP_PROXY for a local tunnel that is not always
+# running, which turns every API call into "connection refused" even though the
+# service is reachable directly. --no-proxy builds an opener with an empty proxy
+# map so the request goes straight out.
+_NO_PROXY = False
+
+
+def _opener():
+    if _NO_PROXY:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
+
 
 class Credentials:
     """AccessKey pair, kept out of every log line."""
@@ -134,7 +146,7 @@ def call(
 
     request = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _opener().open(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as error:
@@ -289,8 +301,27 @@ def cmd_ssh(credentials: Credentials, args: argparse.Namespace) -> int:
 
 
 def cmd_ports(credentials: Credentials, args: argparse.Namespace) -> int:
-    payload = unwrap(call(credentials, "GET", "/v1/cci/instance/%s/get-open-port-list" % args.instance_id))
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    """Show the port mappings, which is how a container port becomes reachable.
+
+    Response shape: data.ports[] holds the system ports (9001/9002, exposed with
+    no protocol attached) and data.customPorts[] holds what was opened by hand.
+    """
+    payload = unwrap(call(credentials, "GET",
+                          "/v1/cci/instance/%s/open-port/list" % args.instance_id))
+    if not isinstance(payload, dict):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    for group in ("ports", "customPorts"):
+        entries = payload.get(group) or []
+        print("%s (%d):" % (group, len(entries)))
+        for entry in entries:
+            host = entry.get("externalHost") or "?"
+            external = entry.get("externalPort")
+            internal = entry.get("port")
+            print("   %-22s -> %s:%s   (internal %s)" % (
+                entry.get("protocol") or "tcp", host, external, internal))
+        if not entries:
+            print("   (none)")
     return 0
 
 
@@ -311,6 +342,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--prefix", default=DEFAULT_PREFIX,
                         help="API path prefix (default: %(default)s)")
+    parser.add_argument("--no-proxy", action="store_true",
+                        help="ignore HTTP_PROXY/HTTPS_PROXY and connect directly")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor", help="verify the API prefix and credentials").set_defaults(func=cmd_doctor)
@@ -345,7 +378,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _NO_PROXY
     args = build_parser().parse_args(argv)
+    _NO_PROXY = bool(getattr(args, "no_proxy", False))
     credentials = Credentials.from_env()
     try:
         return args.func(credentials, args)

@@ -174,10 +174,14 @@ type PartnerConfig struct {
 
 // StaticInstanceConfig is one container of the static adapter.
 type StaticInstanceConfig struct {
-	ID       string              `yaml:"id" json:"id"`
-	Endpoint string              `yaml:"endpoint" json:"endpoint"`
-	LeaseID  string              `yaml:"lease_id" json:"lease_id"`
-	Spec     domain.InstanceSpec `yaml:"spec" json:"spec"`
+	ID       string `yaml:"id" json:"id"`
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+	// ServiceEndpoint is optional. Set it when the Router must reach SGLang on a
+	// different address than the bootstrap control interface, which is the case
+	// on partner platforms that publish one container port per purpose.
+	ServiceEndpoint string              `yaml:"service_endpoint" json:"service_endpoint"`
+	LeaseID         string              `yaml:"lease_id" json:"lease_id"`
+	Spec            domain.InstanceSpec `yaml:"spec" json:"spec"`
 }
 
 // Config is the whole control plane configuration.

@@ -83,17 +83,41 @@ func (s InstanceSpec) SupportsModel(model string) bool {
 	return false
 }
 
+// ServiceURL is the address the Router must route to. Everything that talks to
+// SGLang goes through here; everything that talks to the bootstrap keeps using
+// Endpoint. Falling back to Endpoint when no service address was advertised
+// keeps single-endpoint deployments working.
+func (i Instance) ServiceURL() string {
+	if service := strings.TrimSpace(i.ServiceEndpoint); service != "" {
+		return service
+	}
+	return i.Endpoint
+}
+
 // Instance is the control plane's view of one container. InstanceState and
 // ServiceState change independently; see CheckCombination.
 type Instance struct {
-	ID            string        `json:"id"`
-	PartnerID     string        `json:"partner_id"`
-	Endpoint      string        `json:"endpoint"`
-	LeaseID       string        `json:"lease_id,omitempty"`
-	Spec          InstanceSpec  `json:"spec"`
-	InstanceState InstanceState `json:"instance_state"`
-	ServiceState  ServiceState  `json:"service_state"`
-	Role          Role          `json:"role,omitempty"`
+	ID        string `json:"id"`
+	PartnerID string `json:"partner_id"`
+	// Endpoint is the bootstrap control interface of the container: the control
+	// plane calls /bootstrap/health, /status, /start and /stop there.
+	Endpoint string `json:"endpoint"`
+	// ServiceEndpoint is where the Router reaches the SGLang HTTP API. It
+	// differs from Endpoint whenever the bootstrap and the service sit behind
+	// separate port mappings, which is the normal case on a partner platform:
+	// 九章智算云 publishes one container port for the control interface and
+	// another for the service, and the two internal ports map to unrelated
+	// external ones (9001 -> :30086 and 9002 -> :30093 in the first deployment).
+	// Only the partner knows that mapping, so the value travels with the
+	// capacity event instead of being derived here. Empty means "same as
+	// Endpoint", which keeps single-port deployments and the local harness
+	// working unchanged.
+	ServiceEndpoint string        `json:"service_endpoint,omitempty"`
+	LeaseID         string        `json:"lease_id,omitempty"`
+	Spec            InstanceSpec  `json:"spec"`
+	InstanceState   InstanceState `json:"instance_state"`
+	ServiceState    ServiceState  `json:"service_state"`
+	Role            Role          `json:"role,omitempty"`
 	// RoleAssignedAt records when the current PD role was assigned. The planner
 	// uses it to honour min_hold_seconds.
 	RoleAssignedAt      time.Time `json:"role_assigned_at,omitempty"`

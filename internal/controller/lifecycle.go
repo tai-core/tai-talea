@@ -313,8 +313,12 @@ func (c *Controller) waitHealthy(ctx context.Context, instance domain.Instance) 
 // already tracks the URL from a previous control plane lifetime.
 func (c *Controller) register(ctx context.Context, instance domain.Instance, role domain.Role) (routeradapter.Registration, error) {
 	callCtx, cancel := c.callContext(ctx)
+	// The Router routes inference traffic, so it needs the service address.
+	// Using the bootstrap endpoint here would register a URL that answers 404
+	// to every request; on a partner platform the two are different ports.
+	serviceURL := instance.ServiceURL()
 	registration, err := c.router.RegisterWorker(callCtx, routeradapter.RegisterRequest{
-		WorkerURL:  instance.Endpoint,
+		WorkerURL:  serviceURL,
 		WorkerType: role,
 		ModelID:    c.cfg.Controller.ModelID,
 	})
@@ -327,7 +331,7 @@ func (c *Controller) register(ctx context.Context, instance domain.Instance, rol
 	}
 	lookupCtx, lookupCancel := c.callContext(ctx)
 	defer lookupCancel()
-	existing, found, lookupErr := c.router.FindWorkerByURL(lookupCtx, instance.Endpoint)
+	existing, found, lookupErr := c.router.FindWorkerByURL(lookupCtx, serviceURL)
 	if lookupErr != nil {
 		return routeradapter.Registration{}, lookupErr
 	}
@@ -335,7 +339,7 @@ func (c *Controller) register(ctx context.Context, instance domain.Instance, rol
 		return routeradapter.Registration{}, err
 	}
 	c.log().Warn("router already tracked the worker url; reusing the existing membership",
-		"instance_id", instance.ID, "worker_id", existing.ID, "endpoint", instance.Endpoint)
+		"instance_id", instance.ID, "worker_id", existing.ID, "endpoint", serviceURL)
 	return routeradapter.Registration{WorkerID: existing.ID, WorkerURL: existing.URL}, nil
 }
 
@@ -669,7 +673,11 @@ func (c *Controller) workerLoad(ctx context.Context, instance domain.Instance) (
 	if err != nil {
 		return 0, false, err
 	}
-	target := domain.NormalizeEndpoint(instance.Endpoint)
+	// The Router reports the service URL it was registered with, so the load
+	// match must use the same address. Comparing against the bootstrap endpoint
+	// made every worker look absent, which reported zero in-flight traffic and
+	// let draining finish without waiting.
+	target := domain.NormalizeEndpoint(instance.ServiceURL())
 	for _, load := range loads {
 		if domain.NormalizeEndpoint(load.Worker) != target {
 			continue

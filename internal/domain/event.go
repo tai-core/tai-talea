@@ -62,10 +62,14 @@ const (
 // EventInstance is the instance payload carried by a capacity event. Fields are
 // optional so that a revoke event can carry only the id.
 type EventInstance struct {
-	ID       string        `json:"id"`
-	Endpoint string        `json:"endpoint,omitempty"`
-	LeaseID  string        `json:"lease_id,omitempty"`
-	Spec     *InstanceSpec `json:"spec,omitempty"`
+	ID       string `json:"id"`
+	Endpoint string `json:"endpoint,omitempty"`
+	// ServiceEndpoint is the address the Router should route to, for partners
+	// that publish the SGLang service on a different port than the bootstrap
+	// control interface. Optional; omitted means "same as Endpoint".
+	ServiceEndpoint string        `json:"service_endpoint,omitempty"`
+	LeaseID         string        `json:"lease_id,omitempty"`
+	Spec            *InstanceSpec `json:"spec,omitempty"`
 }
 
 // Snapshot is the payload of CAPACITY_SNAPSHOT_CONFIRMED and the normalized
@@ -137,6 +141,25 @@ func (e CapacityEvent) Validate() error {
 }
 
 // Validate checks the instance payload shared by events.
+// validateEventEndpoint applies the same rules to the bootstrap endpoint and
+// to the service endpoint: both become URLs the control plane dials, so a
+// malformed one must be refused at the edge rather than at dial time.
+func validateEventEndpoint(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > MaxEndpointLength {
+		return fmt.Errorf("%s exceeds %d characters", field, MaxEndpointLength)
+	}
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return fmt.Errorf("%s contains control characters", field)
+	}
+	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
+		return fmt.Errorf("%s must be an http(s) origin", field)
+	}
+	return nil
+}
+
 func (i EventInstance) Validate() error {
 	if strings.TrimSpace(i.ID) != i.ID || i.ID == "" {
 		return fmt.Errorf("instance.id is required and must not be padded")
@@ -147,16 +170,11 @@ func (i EventInstance) Validate() error {
 	if strings.ContainsAny(i.ID, "\x00\r\n") {
 		return fmt.Errorf("instance.id contains control characters")
 	}
-	if i.Endpoint != "" {
-		if len(i.Endpoint) > MaxEndpointLength {
-			return fmt.Errorf("instance.endpoint exceeds %d characters", MaxEndpointLength)
-		}
-		if strings.ContainsAny(i.Endpoint, "\x00\r\n") {
-			return fmt.Errorf("instance.endpoint contains control characters")
-		}
-		if !strings.HasPrefix(i.Endpoint, "http://") && !strings.HasPrefix(i.Endpoint, "https://") {
-			return fmt.Errorf("instance.endpoint must be an http(s) origin")
-		}
+	if err := validateEventEndpoint("instance.endpoint", i.Endpoint); err != nil {
+		return err
+	}
+	if err := validateEventEndpoint("instance.service_endpoint", i.ServiceEndpoint); err != nil {
+		return err
 	}
 	if i.LeaseID != "" {
 		if len(i.LeaseID) > MaxLeaseIDLength || strings.ContainsAny(i.LeaseID, "\x00\r\n") {

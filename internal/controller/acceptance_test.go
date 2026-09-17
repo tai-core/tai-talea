@@ -211,6 +211,20 @@ func (f *routerFake) Close() { f.server.Close() }
 
 func (f *routerFake) URL() string { return f.server.URL }
 
+// setLoad makes the Router report in-flight requests for one worker url. It
+// returns false when no such worker is registered.
+func (f *routerFake) setLoad(url string, load int64) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, worker := range f.workers {
+		if domain.NormalizeEndpoint(worker.URL) == domain.NormalizeEndpoint(url) {
+			worker.Load = load
+			return true
+		}
+	}
+	return false
+}
+
 // Reset empties the worker pool, which is what a Router restart looks like.
 func (f *routerFake) Reset() {
 	f.mu.Lock()
@@ -1175,5 +1189,71 @@ func TestBootstrapClientRefusesToStartWithoutASecret(t *testing.T) {
 	}
 	if _, err := launcher.NewWithHTTPClient(http.DefaultClient, ""); err == nil {
 		t.Fatal("launcher.NewWithHTTPClient must refuse an empty shared secret")
+	}
+}
+
+// A partner platform publishes the bootstrap control interface and the SGLang
+// service on different ports - 九章智算云 exposes container port 9001 as
+// :30086 for the control interface and 9002 as :30093 for the service. The
+// Router routes inference traffic, so it has to be handed the service address.
+// Registering the bootstrap address sent every request to a process that
+// answers 404, and it broke draining as well (see the test below).
+func TestRouterRegistersTheServiceEndpointNotTheBootstrap(t *testing.T) {
+	h := newHarness(t)
+	const service = "http://10.9.9.9:9002"
+
+	event := h.addedEvent("container-1", h.bootstrap.Endpoint(), "lease-1", h.clock.Now())
+	event.Instance.ServiceEndpoint = service
+	h.handle(event)
+
+	if err := h.ctrl.StartService(context.Background(), "container-1", domain.RolePrefill); err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+
+	if _, ok := h.router.workerByURL(service); !ok {
+		t.Fatalf("the router must be given the service address %s", service)
+	}
+	if _, ok := h.router.workerByURL(h.bootstrap.Endpoint()); ok {
+		t.Fatalf("the router must never be given the bootstrap address %s", h.bootstrap.Endpoint())
+	}
+	// The control interface is still the bootstrap: /bootstrap/start went there.
+	if startCalls, _, _ := h.bootstrap.counts(); startCalls != 1 {
+		t.Fatalf("bootstrap start calls=%d, want 1", startCalls)
+	}
+}
+
+// Draining waits for in-flight requests to reach zero, and the wait only works
+// when the address used to find the worker in /get_loads is the one it was
+// registered with. Matching against the bootstrap endpoint made every worker
+// look absent, which the control plane reads as "no traffic can arrive" - so a
+// drain would finish immediately and stop a service that still had requests.
+func TestDrainWaitsOnInFlightLoadReportedForTheServiceEndpoint(t *testing.T) {
+	h := newHarness(t)
+	const service = "http://10.9.9.9:9002"
+
+	event := h.addedEvent("container-1", h.bootstrap.Endpoint(), "lease-1", h.clock.Now())
+	event.Instance.ServiceEndpoint = service
+	h.handle(event)
+	if err := h.ctrl.StartService(context.Background(), "container-1", domain.RolePrefill); err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+	if !h.router.setLoad(service, 4) {
+		t.Fatal("the router must know the service address it was given")
+	}
+
+	// A long grace period: the drain may only finish because traffic reached
+	// zero, never because the deadline expired.
+	outcome := h.handle(h.revokedEvent("container-1", 3600, h.clock.Now()))
+	if outcome.Result != domain.ResultApplied {
+		t.Fatalf("revoke result=%s reason=%q", outcome.Result, outcome.Reason)
+	}
+
+	instance := h.instance("container-1")
+	if instance.ServiceState != domain.ServiceDraining {
+		t.Fatalf("with 4 requests in flight the instance must stay DRAINING, got %s",
+			instance.ServiceState)
+	}
+	if _, stopCalls, _ := h.bootstrap.counts(); stopCalls != 0 {
+		t.Fatalf("bootstrap stop calls=%d, want 0 while requests are in flight", stopCalls)
 	}
 }

@@ -71,6 +71,57 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
+// addedColumn describes a column introduced after the initial schema.
+type addedColumn struct {
+	table      string
+	name       string
+	definition string
+}
+
+// addedColumns lists every column added to the schema after version 1, oldest
+// first. Adding one is a schemaVersion bump plus an entry here.
+var addedColumns = []addedColumn{
+	{table: "capacity_instances", name: "service_endpoint", definition: "TEXT"},
+}
+
+// ensureColumn adds a column when it is missing, leaving existing data intact.
+func ensureColumn(ctx context.Context, tx *sql.Tx, column addedColumn) error {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", column.table))
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", column.table, err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("read columns of %s: %w", column.table, err)
+		}
+		if name == column.name {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read columns of %s: %w", column.table, err)
+	}
+	if found {
+		return nil
+	}
+	statement := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", column.table, column.name, column.definition)
+	if _, err := tx.ExecContext(ctx, statement); err != nil {
+		return fmt.Errorf("add column %s.%s: %w", column.table, column.name, err)
+	}
+	return nil
+}
+
 func (s *SQLiteStore) migrate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -89,6 +140,15 @@ func (s *SQLiteStore) migrate() error {
 	}
 	if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
+	}
+	// CREATE TABLE IF NOT EXISTS never alters a table that already exists, so
+	// columns added after the first release are applied explicitly. Each one is
+	// checked first, which keeps this idempotent on both fresh and existing
+	// databases.
+	for _, column := range addedColumns {
+		if err := ensureColumn(ctx, tx, column); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("bump user_version: %w", err)
@@ -242,7 +302,8 @@ func scanEvent(row rowScanner) (EventRecord, error) {
 
 // ------------------------------------------------------------- instances
 
-const instanceColumns = `id, partner_id, endpoint, lease_id, spec_json, instance_state, service_state,
+const instanceColumns = `id, partner_id, endpoint, service_endpoint, lease_id, spec_json,
+	instance_state, service_state,
 	role, role_assigned_at, router_worker_id, readiness_generation, prepare_attempts, start_attempts,
 	drain_deadline_at, pending_release, lease_updated_at, last_error, last_seen_at, created_at, updated_at`
 
@@ -321,24 +382,25 @@ GROUP BY COALESCE(role, ''), service_state`, string(domain.ServiceNone))
 
 func scanInstance(row rowScanner) (domain.Instance, error) {
 	var (
-		instance       domain.Instance
-		specJSON       string
-		instanceState  string
-		serviceState   string
-		role           sql.NullString
-		roleAssignedAt sql.NullString
-		leaseID        sql.NullString
-		routerWorkerID sql.NullString
-		drainDeadline  sql.NullString
-		pendingRelease int
-		leaseUpdated   sql.NullString
-		lastError      sql.NullString
-		lastSeen       sql.NullString
-		createdAt      string
-		updatedAt      string
+		instance        domain.Instance
+		specJSON        string
+		instanceState   string
+		serviceState    string
+		role            sql.NullString
+		roleAssignedAt  sql.NullString
+		serviceEndpoint sql.NullString
+		leaseID         sql.NullString
+		routerWorkerID  sql.NullString
+		drainDeadline   sql.NullString
+		pendingRelease  int
+		leaseUpdated    sql.NullString
+		lastError       sql.NullString
+		lastSeen        sql.NullString
+		createdAt       string
+		updatedAt       string
 	)
 	if err := row.Scan(
-		&instance.ID, &instance.PartnerID, &instance.Endpoint, &leaseID, &specJSON,
+		&instance.ID, &instance.PartnerID, &instance.Endpoint, &serviceEndpoint, &leaseID, &specJSON,
 		&instanceState, &serviceState, &role, &roleAssignedAt, &routerWorkerID, &instance.ReadinessGeneration,
 		&instance.PrepareAttempts, &instance.StartAttempts, &drainDeadline, &pendingRelease, &leaseUpdated,
 		&lastError, &lastSeen, &createdAt, &updatedAt,
@@ -346,6 +408,7 @@ func scanInstance(row rowScanner) (domain.Instance, error) {
 		return domain.Instance{}, err
 	}
 	instance.LeaseID = leaseID.String
+	instance.ServiceEndpoint = serviceEndpoint.String
 	instance.Role = domain.Role(role.String)
 	instance.RouterWorkerID = routerWorkerID.String
 	instance.InstanceState = domain.InstanceState(instanceState)
@@ -466,11 +529,12 @@ func insertInstanceTx(ctx context.Context, tx *sql.Tx, instance domain.Instance)
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO capacity_instances (
-    id, partner_id, endpoint, lease_id, spec_json, instance_state, service_state, role, role_assigned_at,
-    router_worker_id, readiness_generation, prepare_attempts, start_attempts,
+    id, partner_id, endpoint, service_endpoint, lease_id, spec_json, instance_state, service_state, role,
+    role_assigned_at, router_worker_id, readiness_generation, prepare_attempts, start_attempts,
     drain_deadline_at, pending_release, lease_updated_at, last_error, last_seen_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		instance.ID, instance.PartnerID, instance.Endpoint, nullString(instance.LeaseID), string(specJSON),
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		instance.ID, instance.PartnerID, instance.Endpoint, nullString(instance.ServiceEndpoint),
+		nullString(instance.LeaseID), string(specJSON),
 		string(instance.InstanceState), string(instance.ServiceState), nullString(string(instance.Role)),
 		nullTime(instance.RoleAssignedAt), nullString(instance.RouterWorkerID), instance.ReadinessGeneration,
 		instance.PrepareAttempts, instance.StartAttempts, nullTime(instance.DrainDeadlineAt),
@@ -493,12 +557,12 @@ func updateInstanceTx(ctx context.Context, tx *sql.Tx, current, next domain.Inst
 	}
 	_, err = tx.ExecContext(ctx, `
 UPDATE capacity_instances SET
-    partner_id = ?, endpoint = ?, lease_id = ?, spec_json = ?, instance_state = ?, service_state = ?,
-    role = ?, role_assigned_at = ?, router_worker_id = ?, readiness_generation = ?, prepare_attempts = ?,
-    start_attempts = ?, drain_deadline_at = ?, pending_release = ?, lease_updated_at = ?, last_error = ?,
-    last_seen_at = ?, updated_at = ?
+    partner_id = ?, endpoint = ?, service_endpoint = ?, lease_id = ?, spec_json = ?,
+    instance_state = ?, service_state = ?, role = ?, role_assigned_at = ?, router_worker_id = ?,
+    readiness_generation = ?, prepare_attempts = ?, start_attempts = ?, drain_deadline_at = ?,
+    pending_release = ?, lease_updated_at = ?, last_error = ?, last_seen_at = ?, updated_at = ?
 WHERE id = ?`,
-		next.PartnerID, next.Endpoint, nullString(next.LeaseID), string(specJSON),
+		next.PartnerID, next.Endpoint, nullString(next.ServiceEndpoint), nullString(next.LeaseID), string(specJSON),
 		string(next.InstanceState), string(next.ServiceState), nullString(string(next.Role)),
 		nullTime(next.RoleAssignedAt), nullString(next.RouterWorkerID), next.ReadinessGeneration,
 		next.PrepareAttempts, next.StartAttempts, nullTime(next.DrainDeadlineAt),
