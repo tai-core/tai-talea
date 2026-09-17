@@ -72,7 +72,7 @@ def validate_extra_args(extra_args):
 
 
 def build_sglang_command(role, model_id, *, model_path="", host="0.0.0.0", port=31000,
-                         python_executable="python3", extra_args=(), log_file=""):
+                         python_executable="python3", extra_args=()):
     """Build the SGLang argument vector for one role.
 
     Prefill and Decode workers are started with ``--disaggregation-mode`` so the
@@ -86,7 +86,6 @@ def build_sglang_command(role, model_id, *, model_path="", host="0.0.0.0", port=
     model_path = _clean(model_path or model_id, "model_path")
     host = _clean(host, "host", max_length=255)
     python_executable = _clean(python_executable, "python_executable", max_length=1024)
-    log_file = _clean(log_file, "log_file", max_length=1024)
 
     try:
         port = int(port)
@@ -108,9 +107,11 @@ def build_sglang_command(role, model_id, *, model_path="", host="0.0.0.0", port=
         "--disaggregation-mode",
         role,
     ]
-    if log_file:
-        command += ["--log-file", log_file]
     command += validate_extra_args(extra_args)
+    # Note: there is deliberately no --log-file here. SGLang 0.5.x does not
+    # accept one, and passing it made the child die inside argparse - before it
+    # produced a single line of output. Capturing the service's output is the
+    # bootstrap's job, done by redirecting the child's streams in _spawn.
     return command
 
 

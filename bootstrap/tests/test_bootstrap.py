@@ -80,10 +80,32 @@ class FakeProcess:
         self.killed = True
 
 
+class DyingProcess(FakeProcess):
+    """A child that is still alive when first checked and gone shortly after.
+
+    `poll()` returns no exit code until `dies_after` seconds have elapsed. That
+    ordering is what makes it a regression test for the startup grace window: a
+    check that runs immediately sees a live process and wrongly calls it
+    RUNNING.
+    """
+
+    def __init__(self, exit_code=1, dies_after=0.05):
+        super().__init__(exit_code=exit_code)
+        self._born = time.monotonic()
+        self._dies_after = dies_after
+
+    def poll(self):
+        if time.monotonic() - self._born < self._dies_after:
+            return None
+        return self._exit_code
+
+
 class FakeInstaller:
     def __init__(self, failure=None):
         self.failure = failure
         self.prepared = 0
+        # Mirrors EnvironmentInstaller.python_executable.
+        self.python_executable = "/opt/tai-talea/venv/bin/python"
 
     def prepare(self):
         self.prepared += 1
@@ -280,6 +302,38 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertEqual(service.status()["exit_code"], exitcodes.EXIT_ENV_INSTALL_FAILED)
 
+    def test_sglang_command_does_not_carry_a_log_file_flag(self):
+        """SGLang 0.5.x rejects --log-file inside argparse.
+
+        Passing it made the child exit before producing any output, and the
+        bootstrap went on reporting RUNNING. The service's output is captured
+        by the bootstrap itself, not by an SGLang flag.
+        """
+        command = build_sglang_command("prefill", "model-a", extra_args=["--tp-size=1"])
+        self.assertIn("--tp-size=1", command, "extra args must still reach the command")
+        self.assertNotIn("--log-file", command)
+
+    def test_spawn_captures_the_child_output_into_the_log_file(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "sglang.log")
+        # A real Popen is required here: a runner stub would bypass the
+        # redirection this test is about.
+        service = SGLangService(
+            profile(),
+            installer=FakeInstaller(),
+            runner=None,
+            command_factory=build_sglang_command,
+            health_probe=lambda _port: True,
+        )
+        process = service._spawn(
+            [sys.executable, "-c", "print('bootstrap-captured-output')"],
+            log_file=path,
+        )
+        self.assertTrue(process.wait(timeout=20) == 0)
+        with open(path, encoding="utf-8") as handle:
+            self.assertIn("bootstrap-captured-output", handle.read())
+
     def test_stop_reports_a_clean_exit_code(self):
         service = self.make_service()
         service.start("decode", "model-a")
@@ -304,6 +358,38 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertEqual(result.exit_code, exitcodes.EXIT_STOP_TIMEOUT)
         self.assertTrue(stubborn.killed)
+
+    def test_start_without_preparing_still_uses_the_managed_interpreter(self):
+        """The interpreter comes from the profile, not from `python3`.
+
+        Regression: with prepare_environment=False the command was built with a
+        bare "python3", so a real start launched the system interpreter, which
+        has no sglang, and the child died before it ever listened.
+        """
+        installer = FakeInstaller()
+        service = self.make_service(installer=installer)
+        result = service.start("prefill", "model-a", prepare_environment=False)
+        self.assertTrue(result.accepted)
+        self.assertEqual(installer.prepared, 0, "no preparation was requested")
+        # The command an operator sees in the history must name the venv.
+        started = [e for e in service.status()["history"] if e["phase"] == "STARTING"]
+        self.assertEqual(len(started), 1)
+        self.assertIn("/opt/tai-talea/venv/bin/python", started[0]["detail"])
+        self.assertNotIn("python3 ", started[0]["detail"])
+
+    def test_a_process_that_dies_just_after_spawn_is_not_reported_running(self):
+        """The immediate-exit check needs to outlive the spawn by a moment.
+
+        A real `python3 -m <missing module>` is still alive at the instant of
+        the first poll and gone a few milliseconds later, so a check that runs
+        immediately reported RUNNING with exit_code 0. This fake reproduces
+        that ordering instead of reporting the exit code on the first call.
+        """
+        service = self.make_service(process=DyingProcess(exit_code=1, dies_after=0.05))
+        result = service.start("prefill", "model-a")
+        self.assertFalse(result.accepted, "a service that died must not be accepted")
+        self.assertEqual(service.status()["phase"], PHASE_FAILED)
+        self.assertEqual(service.status()["exit_code"], exitcodes.EXIT_SERVICE_CRASHED)
 
     def test_immediate_crash_is_reported(self):
         dead = FakeProcess(exit_code=1)

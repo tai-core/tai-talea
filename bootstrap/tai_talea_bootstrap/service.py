@@ -98,6 +98,14 @@ class BootstrapState:
         }
 
 
+# How long to watch a freshly spawned service before declaring it RUNNING.
+# It only catches failures that happen while the interpreter is still coming up
+# - a missing module, a rejected flag, a busy port. Anything slower is the
+# control plane's job to find with the SGLang health check (§7.2), because the
+# bootstrap must not hold the caller for long.
+STARTUP_GRACE_SECONDS = 0.25
+
+
 class SGLangService:
     """Owns the SGLang child process, the health probe and the exit code."""
 
@@ -157,7 +165,12 @@ class SGLangService:
             self.state.exit_code = 0
             self.state.stopped_at = 0.0
 
-        python_executable = "python3"
+        # The interpreter always comes from the managed virtualenv, which the
+        # profile names. Preparing the environment only decides whether the
+        # requirements are (re)installed. Defaulting to a bare "python3" meant
+        # that a start with prepare_environment=False launched the *system*
+        # interpreter - which has no sglang - so the child died instantly.
+        python_executable = self.installer.python_executable
         try:
             if prepare_environment:
                 with self._lock:
@@ -165,7 +178,7 @@ class SGLangService:
                 python_executable = self.installer.prepare()
             command = self._command_factory(
                 role, model_id, model_path=model_path, port=port,
-                python_executable=python_executable, extra_args=extra_args, log_file=log_file,
+                python_executable=python_executable, extra_args=extra_args,
             )
         except ConfigurationError as error:
             return self._fail(str(error), exitcodes.EXIT_BAD_REQUEST)
@@ -179,7 +192,7 @@ class SGLangService:
             self.state.record(PHASE_STARTING, self.state.command)
 
         try:
-            process = self._spawn(command)
+            process = self._spawn(command, log_file=log_file)
         except Exception as error:
             return self._fail("could not spawn sglang: %s" % error, exitcodes.EXIT_START_FAILED)
 
@@ -190,7 +203,10 @@ class SGLangService:
             self.state.phase = PHASE_RUNNING
 
         # A service that dies immediately must not be reported as RUNNING.
-        time.sleep(0)
+        # sleep(0) was not enough: the child had not finished failing yet when
+        # it was checked, so a dead service was reported as RUNNING with
+        # exit_code 0.
+        time.sleep(STARTUP_GRACE_SECONDS)
         if process.poll() is not None:
             code = getattr(process, "returncode", None)
             if code is None:
@@ -199,9 +215,26 @@ class SGLangService:
                               exitcodes.EXIT_SERVICE_CRASHED)
         return StartResult(True, PHASE_RUNNING, self.state.command)
 
-    def _spawn(self, command):
+    def _spawn(self, command, log_file=""):
+        """Start the service, capturing its output when a log file is given.
+
+        The child's own output is the only diagnostic available when it fails
+        during startup; sending it to DEVNULL made every early crash invisible
+        and left the operator with nothing to read.
+        """
         if self._runner is not None:
             return self._runner(command)
+        if log_file:
+            # Append, so repeated starts keep their history. The parent's copy
+            # of the handle is closed below; the child keeps its own.
+            output = open(log_file, "ab")  # noqa: SIM115 - closed after Popen
+            try:
+                return subprocess.Popen(  # noqa: S603 - the vector is allowlisted
+                    command, stdout=output, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            finally:
+                output.close()
         return subprocess.Popen(  # noqa: S603 - the vector is built from an allowlist
             command,
             stdout=subprocess.DEVNULL,
