@@ -91,6 +91,11 @@ type StartRequest struct {
 	ModelID   string      `json:"model_id"`
 	ModelPath string      `json:"model_path,omitempty"`
 	ExtraArgs []string    `json:"extra_args,omitempty"`
+	// Port is where SGLang must listen. The control plane derives it from the
+	// instance's service endpoint, so the port the container binds and the
+	// port registered with the Router can never disagree. Zero lets the
+	// bootstrap pick its default.
+	Port int `json:"port,omitempty"`
 }
 
 // StopRequest asks the bootstrap to stop SGLang and return an exit code.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/tai-core/tai-talea/internal/domain"
@@ -200,6 +202,7 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 		ModelID:   c.cfg.Controller.ModelID,
 		ModelPath: c.cfg.Controller.ModelPath,
 		ExtraArgs: c.cfg.Controller.ExtraSGLangArgs,
+		Port:      servicePort(instance),
 	}
 	callCtx, cancel := c.callContext(ctx)
 	startErr := c.launcher.Start(callCtx, instance.Endpoint, request)
@@ -367,6 +370,29 @@ func (c *Controller) ensureReadiness(ctx context.Context, workerID string) (int6
 		return 0, false, err
 	}
 	return int64(transition.Record.Generation), transition.Record.Ready(), nil
+}
+
+// servicePort is the port SGLang must bind for this instance: the one its
+// service endpoint advertises. Starting the service on any other port leaves
+// the Router health-checking an address nothing listens on, which evicts the
+// worker seconds after registration - and with it the whole readiness step.
+func servicePort(instance domain.Instance) int {
+	parsed, err := url.Parse(instance.ServiceURL())
+	if err != nil {
+		return 0
+	}
+	port := parsed.Port()
+	if port == "" {
+		if parsed.Scheme == "https" {
+			return 443
+		}
+		return 80
+	}
+	value, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return value
 }
 
 func (c *Controller) failStart(ctx context.Context, instance domain.Instance, operation *store.Operation, message string, cause error) error {
