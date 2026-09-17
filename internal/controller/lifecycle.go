@@ -208,7 +208,15 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 	startErr := c.launcher.Start(callCtx, instance.Endpoint, request)
 	cancel()
 	if startErr != nil {
-		return c.failStart(ctx, instance, operation, "bootstrap start failed", startErr)
+		// A control-plane restart leaves a healthy service behind. Starting
+		// must be idempotent: adopt the running service and let the health
+		// wait decide, instead of failing the attempt (a retry would only hit
+		// the same 422 and the instance would never recover).
+		if !errors.Is(startErr, launcher.ErrAlreadyRunning) {
+			return c.failStart(ctx, instance, operation, "bootstrap start failed", startErr)
+		}
+		c.log().Info("adopting the service the bootstrap already supervises",
+			"instance_id", instanceID, "role", string(role))
 	}
 
 	if err := c.waitHealthy(ctx, instance); err != nil {

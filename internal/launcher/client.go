@@ -21,6 +21,24 @@ import (
 	"github.com/tai-core/tai-talea/internal/domain"
 )
 
+// HTTPStatusError is a non-2xx bootstrap response. Callers that need to
+// distinguish outcomes (the start path treats "already running" as adoptable)
+// match on StatusCode instead of parsing the message.
+type HTTPStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("bootstrap returned HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+// ErrAlreadyRunning reports that the bootstrap already supervises a service in
+// its RUNNING phase. The control plane adopts that service instead of failing:
+// the start path has to be idempotent, because a control-plane restart leaves a
+// healthy service behind that still needs health checks and registration.
+var ErrAlreadyRunning = errors.New("bootstrap already runs a service")
+
 // Bootstrap paths.
 const (
 	PathHealth = "/bootstrap/health"
@@ -178,7 +196,18 @@ func (c *Client) Start(ctx context.Context, endpoint string, request StartReques
 			return errors.New("bootstrap extra argument contains control characters")
 		}
 	}
-	return c.call(ctx, endpoint, http.MethodPost, PathStart, request, nil)
+	if err := c.call(ctx, endpoint, http.MethodPost, PathStart, request, nil); err != nil {
+		var statusErr *HTTPStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnprocessableEntity {
+			// Confirm against the status surface: a RUNNING phase means the
+			// service this request asked for is already being supervised.
+			if status, statusErr2 := c.Status(ctx, endpoint); statusErr2 == nil && status.Phase == PhaseRunning {
+				return fmt.Errorf("%w: %s", ErrAlreadyRunning, endpoint)
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // Stop asks the bootstrap to stop SGLang and report the final exit code.
@@ -225,7 +254,10 @@ func (c *Client) call(ctx context.Context, endpoint, method, path string, body a
 		return fmt.Errorf("%s %s: bootstrap response is too large", method, path)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("%s %s returned HTTP %d: %s", method, path, response.StatusCode, strings.TrimSpace(string(payload)))
+		return &HTTPStatusError{
+			StatusCode: response.StatusCode,
+			Body:       strings.TrimSpace(string(payload)),
+		}
 	}
 	if destination == nil || len(payload) == 0 {
 		return nil
