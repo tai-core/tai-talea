@@ -514,6 +514,14 @@ func (c *Controller) beginDrain(ctx context.Context, instanceID, reason string, 
 		callCtx, cancel := c.callContext(ctx)
 		_, readinessErr := c.router.SetReadiness(callCtx, instance.RouterWorkerID, false)
 		cancel()
+		if errors.Is(readinessErr, routeradapter.ErrWorkerNotFound) {
+			// The worker is already absent from the Router (router restarted,
+			// registration lost, or the service already died). Readiness is
+			// closed by definition — draining must proceed, not abort.
+			c.log().Info("router worker already absent; skipping readiness close",
+				"instance_id", instanceID, "worker_id", instance.RouterWorkerID)
+			readinessErr = nil
+		}
 		if readinessErr != nil {
 			if c.metrics != nil {
 				c.metrics.IncCounter("readiness_drain_failures_total",

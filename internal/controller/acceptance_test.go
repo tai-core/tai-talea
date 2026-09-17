@@ -935,6 +935,50 @@ func TestAcceptanceRevocationDrainsThroughReadinessOnly(t *testing.T) {
 	}
 }
 
+// A Router restart or a lost registration must not wedge the drain: the worker
+// is already absent, so closing its readiness is a no-op by definition and the
+// service must still be retired. Found during the 2026-09-17 live run, where
+// FAILED instances kept stale worker ids from the replaced Router and every
+// drain attempt aborted with "router worker not found".
+func TestDrainProceedsWhenTheRouterWorkerIsGone(t *testing.T) {
+	h := newHarness(t)
+	h.handle(h.addedEvent("container-1", h.bootstrap.Endpoint(), "lease-1", h.clock.Now()))
+	if err := h.ctrl.StartService(context.Background(), "container-1", domain.RoleDecode); err != nil {
+		t.Fatalf("start service: %v", err)
+	}
+
+	// Exactly what replacing the Router looks like: the pool is empty, but the
+	// control plane still remembers the old worker id.
+	h.router.Reset()
+
+	if err := h.ctrl.BeginDrain(context.Background(), "container-1", "service failed with a stale worker id", 0); err != nil {
+		t.Fatalf("drain must tolerate an absent router worker: %v", err)
+	}
+	draining := h.instance("container-1")
+	if draining.ServiceState != domain.ServiceDraining {
+		t.Fatalf("service_state=%s, want DRAINING", draining.ServiceState)
+	}
+	if h.router.deletes() != 0 {
+		t.Fatal("draining must not use DELETE /workers even for an absent worker")
+	}
+
+	// The reconciler observes zero in-flight load and finishes the drain.
+	h.reconcile()
+	idle := h.instance("container-1")
+	if idle.ServiceState != domain.ServiceNone {
+		t.Fatalf("service_state=%s, want NONE after the drain", idle.ServiceState)
+	}
+	if idle.InstanceState != domain.InstanceIdle {
+		t.Fatalf("instance_state=%s, want IDLE (no release was requested)", idle.InstanceState)
+	}
+	if idle.Role != domain.RoleNone {
+		t.Fatalf("role=%s, want NONE so the planner can re-assign", idle.Role)
+	}
+	if idle.StartAttempts != 0 {
+		t.Fatalf("start_attempts=%d, want the retry budget reset", idle.StartAttempts)
+	}
+}
+
 // Acceptance: §17 M1 "控制面重启后能通过 reconcile 恢复状态".
 func TestAcceptanceReconcileRecoversAfterRestart(t *testing.T) {
 	h := newHarness(t)
