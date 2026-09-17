@@ -30,6 +30,9 @@ controller:
   drain_grace: 300s
   operation_retry: 15s
   call_timeout: 10s
+  # Waiting for a freshly started SGLang to answer health checks - model
+  # loading takes minutes, so this is not call_timeout.
+  start_timeout: 10m
   # Shared secret the container bootstrap requires on every /bootstrap call.
   # The same value must be provisioned inside the container via
   # TAI_TALEA_BOOTSTRAP_TOKEN. Required: the bootstrap has no unauthenticated

@@ -60,6 +60,11 @@ type ControllerConfig struct {
 	DrainGrace         Duration `yaml:"drain_grace" json:"drain_grace"`
 	OperationRetry     Duration `yaml:"operation_retry" json:"operation_retry"`
 	CallTimeout        Duration `yaml:"call_timeout" json:"call_timeout"`
+	// StartTimeout bounds how long the control plane waits for a freshly
+	// started SGLang to answer its health check. Loading a model legitimately
+	// takes minutes, so this is deliberately not call_timeout: that bounds one
+	// HTTP call, this bounds the whole startup.
+	StartTimeout Duration `yaml:"start_timeout" json:"start_timeout"`
 	// BootstrapToken is the shared secret the container bootstrap requires on
 	// every /bootstrap call. Required: an empty value would mean talking to an
 	// interface that anyone able to reach the port could drive.
@@ -224,6 +229,7 @@ func Default() Config {
 			DrainGrace:         Duration(300 * time.Second),
 			OperationRetry:     Duration(15 * time.Second),
 			CallTimeout:        Duration(10 * time.Second),
+			StartTimeout:       Duration(10 * time.Minute),
 			LeaseWarning:       Duration(120 * time.Second),
 			LostRateThreshold:  0.2,
 		},
@@ -301,6 +307,9 @@ func (c Config) Validate() error {
 	}
 	if c.Controller.CallTimeout.Duration() <= 0 {
 		return errors.New("controller.call_timeout must be positive")
+	}
+	if c.Controller.StartTimeout.Duration() <= 0 {
+		return errors.New("controller.start_timeout must be positive")
 	}
 	if len(strings.TrimSpace(c.Controller.BootstrapToken)) < 16 {
 		// Required, not optional: the container bootstrap refuses to serve

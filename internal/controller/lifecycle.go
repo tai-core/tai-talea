@@ -284,7 +284,7 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 // waitHealthy polls the bootstrap health endpoint until SGLang answers or the
 // call timeout expires.
 func (c *Controller) waitHealthy(ctx context.Context, instance domain.Instance) error {
-	deadline := c.now().Add(c.CallTimeout())
+	deadline := c.now().Add(c.StartTimeout())
 	var lastErr error
 	for {
 		callCtx, cancel := c.callContext(ctx)
@@ -299,7 +299,7 @@ func (c *Controller) waitHealthy(ctx context.Context, instance domain.Instance) 
 			lastErr = fmt.Errorf("bootstrap reports phase %s status %s", health.Phase, health.Status)
 		}
 		if c.now().After(deadline) {
-			return fmt.Errorf("health check did not pass within %s: %w", c.CallTimeout(), lastErr)
+			return fmt.Errorf("health check did not pass within %s: %w", c.StartTimeout(), lastErr)
 		}
 		select {
 		case <-ctx.Done():

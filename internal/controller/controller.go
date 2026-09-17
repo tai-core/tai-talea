@@ -145,6 +145,11 @@ func (c *Controller) Planner() *planner.Planner { return c.planner }
 // CallTimeout returns the per-call timeout used for container and Router calls.
 func (c *Controller) CallTimeout() time.Duration { return c.cfg.Controller.CallTimeout.Duration() }
 
+// StartTimeout bounds the whole wait for a freshly started SGLang to become
+// healthy, which includes model loading. Deliberately separate from
+// CallTimeout: that bounds one HTTP call, this bounds a multi-minute startup.
+func (c *Controller) StartTimeout() time.Duration { return c.cfg.Controller.StartTimeout.Duration() }
+
 func (c *Controller) callContext(parent context.Context) (context.Context, context.CancelFunc) {
 	timeout := c.CallTimeout()
 	if timeout <= 0 {
