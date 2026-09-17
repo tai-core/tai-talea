@@ -309,8 +309,16 @@ class ServiceTests(unittest.TestCase):
         bootstrap went on reporting RUNNING. The service's output is captured
         by the bootstrap itself, not by an SGLang flag.
         """
-        command = build_sglang_command("prefill", "model-a", extra_args=["--tp-size=1"])
+        command = build_sglang_command(
+            "prefill", "model-a",
+            # The allowlist matches whole tokens, so values ride along with an
+            # equals sign - exactly how the control plane sends them.
+            extra_args=["--tp-size=1",
+                        "--disaggregation-transfer-backend=mooncake_tcp",
+                        "--disaggregation-bootstrap-port=5757"])
         self.assertIn("--tp-size=1", command, "extra args must still reach the command")
+        self.assertIn("--disaggregation-transfer-backend=mooncake_tcp", command)
+        self.assertIn("--disaggregation-bootstrap-port=5757", command)
         self.assertNotIn("--log-file", command)
 
     def test_spawn_captures_the_child_output_into_the_log_file(self):

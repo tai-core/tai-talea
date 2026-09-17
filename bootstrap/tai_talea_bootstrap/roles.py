@@ -25,6 +25,11 @@ ALLOWED_EXTRA_FLAGS = (
     "--max-total-tokens",
     "--tp-size",
     "--dp-size",
+    # PD disaggregation (§8). The transfer backend has to match what the
+    # partner network supports - mooncake_tcp for overlays without RDMA - and
+    # the bootstrap port must be one the peer container can reach.
+    "--disaggregation-transfer-backend",
+    "--disaggregation-bootstrap-port",
     "--trust-remote-code",
     "--disable-radix-cache",
     "--attention-backend",
