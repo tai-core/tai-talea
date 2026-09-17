@@ -180,3 +180,50 @@ SGLang **强制要求 `mooncake-transfer-engine`**，没有就 abort（已在容
 - **摘流不丢在途请求** —— Router 已就位，可以做了。
 - **`save-image` 固化** —— 两台容器的环境都已就绪（bootstrap + venv 8.4G + mooncake + router），
   **正是固化成受控镜像的最佳时机**，之后新实例可免装直接用。
+
+## 8. 控制面真机驱动记录（2026-09-17 追加）
+
+用真正的 tai-talea 控制面（Linux 交叉编译二进制，跑在 prefill 容器内）驱动全流程，
+Push API 带真实 HMAC 签名推 `CAPACITY_ADDED`。结果与修掉的缺陷：
+
+**已验证 ✓**
+
+| 验收标准 | 结果 |
+| --- | --- |
+| 新实例能从 ADDED 进入 IDLE | ✓ 两台容器各验证两轮（准备阶段含兼容矩阵校验与 wheelhouse 离线安装） |
+| 重复事件不会重复启动或回收 | ✓ 重推同 event_id 返回 `duplicate:true / lifecycle action not repeated`，`capacity_events_total{DUPLICATE}` 计数出现，实例 attempts 不变 |
+| 服务能完成启动、健康检查和 Router 注册 | ◐ 启动 ✓、健康 ✓、注册 ✓（worker 落在 :9002、healthy、`bootstrap_port:8998` 成功携带）；**readiness 一步被 Router 缺陷挡住**（见下） |
+| 控制面重启后能通过 reconcile 恢复 | ✓ 验证了「收养已在运行服务」路径（重启控制面 → 重新注册 → 不重启服务） |
+| 摘流不会使用 DELETE | ◐ 结构上成立（RouterAdapter 接口无 delete 方法，单测断言摘流全程零 DELETE）；**真机验证被同一 Router 缺陷挡住** |
+
+**真机驱动修掉的四个缺陷（各自有提交）**：
+
+1. `Status.started_at` 声明成 `time.Time`，Python 侧发的是 epoch 数字 → 每次
+   `/bootstrap/status` 都解不开（`373b66d`）。纯单测抓不到：测试替身序列化的是 Go 形状的时间戳。
+2. `waitHealthy` 的窗口继承了 `call_timeout`（20s），而模型加载要 60-90s → 第一次尝试
+   判失败、重试撞 422。新增语义正确的 `controller.start_timeout`（默认 10m，`34fe5bc`）。
+3. 控制面启动 SGLang 时**没传端口**，bootstrap 默认绑 31000，而注册给 Router 的是
+   `service_endpoint`（9002）→ Router 对空地址健康检查失败、几秒内逐出 worker（`df2eca9`）。
+   修法：端口从 service_endpoint 解析，绑定与注册永不分歧。
+4. 「already RUNNING」被当成失败 → 实例永久无法恢复。改为**收养**：探测 status 确认
+   RUNNING 后继续健康等待（`cf299d7`）——这同时就是重启恢复路径。
+
+## 9. Router 缺陷：readiness API 对动态注册的 worker 一律 404（阻塞项）
+
+sglang-router 0.3.2（pip 版）的 `/state/workers/{id}` 与 `/state/workers` 对**动态注册**
+（POST /workers）的 worker 一律 404——即使 worker 在 `/workers/{id}` 里存在且 healthy
+（已实测，且注册携带的 `bootstrap_port: 8998` 正确出现在 worker 记录里）。
+
+**根因（源码定位）**：readiness 读写的是 `MemoryStateStore`，只有
+`core/steps/worker/shared/register.rs`（静态配置/服务发现路径）会 `upsert_worker` 播种；
+**动态注册路径 `create_worker.rs` 只写 worker_registry、不播种 state store**。
+`PUT /workers/{id}`（update_worker_properties）本可补种，但其异步 upsert 实测未生效。
+另外 PD 池生命周期（`PdPoolLifecycleState: Active/Draining/Unhealthy/Removed`）
+**没有任何 HTTP 端点暴露**。
+
+**影响**：readiness 门禁（§7.2 SERVING 的最后一步）与 readiness 摘流（§8 的唯一摘流原语）
+在动态注册模式下无法工作。§8 禁止 DELETE 作为摘流手段，所以这不是我们能绕过的——
+需要 Router 侧修复（create_worker 补 state store 播种，或暴露 PD 池生命周期端点）。
+
+**当前真机状态**：两台容器的 SGLang 正常运行并注册在 Router 中（healthy），
+控制面实例停在 IDLE/FAILED（readiness 步骤），Push API/幂等/指标/告警全部工作。
