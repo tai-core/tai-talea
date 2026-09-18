@@ -13,6 +13,7 @@
 | 镜像放 GitHub 吗 | GitHub 放**源码与 Dockerfile**；**镜像是构建产物，要推到 OCI 镜像仓库**。两者不是一回事 |
 | 不能自定义镜像时怎么管依赖 | 优先级：共享环境目录 > 预打包 venv 制品 > 运行时 pip install |
 | 合作商**只给最基础镜像**（如 ubuntu22.04/cu12.8/py3.10）时，能否把依赖全自动装齐 | **能**，且不需要镜像能力也不需要 docker。机制是**种子 + 清单 + 载体**三层可分离结构，见 §7 |
+| sglang 是内部 fork，怎么进容器 | **构建一次、分发车轮**：编译只发生在控制节点/CI（deploy key 只在那里），容器只装 wheel，永不接触仓库凭据。见 §8 |
 
 ## 1. push 与 pull：两条并行的发现通道
 
@@ -274,3 +275,77 @@ verify:
 | 长期 | 镜像烤入（一次投入，开机即就绪）；载荷随版本推进，靠换镜像 tag |
 
 **三档用的是同一份清单**，这正是把"装什么"和"怎么送"解耦的收益。
+
+> ⚠️ **前提修正见 §8**：sglang 不是 PyPI 上的公共包，而是**我们自己的内部 fork**
+> （`github.com/tai-core/sglang`，私有）。这会改变 §7.3 / §7.5 / §7.7 三处的结论。
+
+## 8. sglang 来自内部 fork：对铺装设计的三个改变（2026-09-18）
+
+### 8.1 事实核对
+
+- 运行时应当是 **`github.com/tai-core/sglang`**：**私有**仓库，**128 个分支**，
+  默认分支 `stable`（本次 HEAD `5a26fc1f`），访问方式是 **SSH deploy key**
+  （`~/.ssh/id_ed25519`；HTTPS 匿名访问返回 404）。
+- **但当前容器里跑的其实是公共包**：`sglang 0.5.19`，
+  `Home-page: github.com/sgl-project/sglang`，由 `pip install sglang==0.5.19` 装入。
+  也就是说 **§9 的 M1 验收是在公共 sglang 上完成的**——
+  换成 fork 重跑是**尚未完成的工作项**，不能把那份验收结论直接记在 fork 头上。
+
+### 8.2 改变一：容器不能再"直接装"
+
+`pip install git+ssh://git@github.com/tai-core/sglang@<sha>` 技术可行，但代价很大：
+
+- **凭据分发面 = 容器数**：每个合作商容器都要拿到我们私有仓库的凭据，
+  吊销和轮换变得极其困难，且凭据落在别人的 root 之下；
+- **容器上要源码编译**：sglang 带 CUDA 内核与 `sgl-kernel` / `flashinfer`，
+  编译耗时长、对工具链敏感——我们已经实测过"缺 `protoc`、缺 `libssl-dev`"
+  这类问题会直接中断构建（见 sglang-router 的编译记录）；
+- **无法回退**：合作商内网不通 GitHub 时没有任何补救手段。
+
+**结论：改为"构建一次、分发车轮"（build once, ship wheels）。**
+编译发生在**控制节点或 CI**——部署密钥只存在于那里；
+容器只做安装，**永不接触仓库凭据**。这也把"编译依赖"和"运行依赖"彻底分开：
+编译需要的工具链（rustc/protoc/libssl-dev/网络）只需在构建端存在一次。
+
+### 8.3 改变二：`wheelhouse` 从"可选"升级为"必需"
+
+§7.5 里 wheelhouse 是"离线时才需要"。有了内部 fork，它变成
+**承载 fork 的唯一手段**：fork 编译出的 `sglang` 轮子不可能从任何公网镜像源拿到。
+
+清单里 `sglang` 因此从"pip 版本号"变成"组件 + 轮子 digest"：
+
+```yaml
+components:
+  - name: sglang
+    source: {repo: github.com/tai-core/sglang, ref: <commit>}   # 只有构建端关心
+    artifact: {wheel: sglang-<ver>-cp311-<plat>.whl, digest: sha256:...}
+```
+
+分发形态三选一（仍按 §7.5 的载体能力决定）：
+
+| 形态 | 做法 | 评价 |
+| --- | --- | --- |
+| 共享存储 | wheel + wheelhouse 放共享目录，容器挂载后本地安装 | **最优**，零网络依赖 |
+| 私有 wheel 索引 | 控制节点起只读索引，`pip install --index-url https://<控制节点>/simple`，凭据按实例下发 | 灵活，可做版本选择 |
+| 随载荷 scp | SSH 载体下推过去 | fork 轮子 GB 级，逐台推不划算 |
+
+### 8.4 改变三：兼容类要多一维
+
+§7.7 的兼容类是 `(os, cuda, python)`。加上 fork 之后必须**再钉 fork commit**：
+同一个 `(os, cuda, python)` 上换 fork 版本就是另一套产物。
+
+```
+class: ubuntu2204-cu128-py311-sgl<commit 短号>
+```
+
+这样 dago 的 `compatibilityClass` 语义才完整：
+**构建结果只在"硬件 + 依赖库 + 我们的代码版本"三者都一致的机器上复用。**
+
+### 8.5 待办
+
+- [ ] 在控制节点验证 fork 能否产出 wheel——是否需要源码编译 `sgl-kernel` / `flashinfer`，
+      是否额外需要 `protoc`、`libssl-dev`。**这一条决定"构建一次"的实际成本。**
+- [ ] 定 fork 的版本策略：钉 `stable` 的 commit，还是切 release 分支？由谁推进？
+- [ ] 把 M1 验收从公共 `sglang 0.5.19` 换成 fork 重跑一遍。
+- [ ] 决定 `sglang-router` 是否同样按"构建二次分发"处理（本地已构建出
+      `sgl-model-gateway` 二进制，形态上是组件而非源码）。
