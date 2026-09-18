@@ -4,3 +4,4 @@ bin/
 *.db-wal
 __pycache__/
 *.pyc
+*.exe

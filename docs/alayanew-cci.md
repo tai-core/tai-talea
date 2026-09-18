@@ -386,3 +386,35 @@ python tools/alayanew/cci_probe.py ports <instance-id>
 
 签名实现已用文档给出的算法做定点自检（固定时间戳下逐位一致、hex 小写、方法大小写归一）。
 该工具**只读**：不含 open-port / save-image / release 等写操作。
+
+### 3.x 镜像与 registry 契约（2026-09-18 实测）
+
+实例创建时镜像只有三类：**基础镜像 / 应用镜像 / 私有镜像**（文档三处一致），
+没有「自定义镜像地址」入口；实例详情 `image` 字段是完整地址：
+
+```
+registry.hd-02.alayanew.com:8443/alayanew-public/pytorch:2.8.0-cuda12.8-cudnn9-runtime-<hash>
+```
+
+即 **CCI 只从九章自建 Harbor 拉镜像，不支持外部 registry**（dockerhub / tencentcloudcr 等）。
+
+该 Harbor 外网可达（`GET /v2/` → 401 + `WWW-Authenticate: Bearer realm=.../service/token,
+service=harbor-registry`）。逐项验证结果：
+
+| 验证 | 方法 | 结果 |
+| --- | --- | --- |
+| 公共库可匿名拉 | 匿名取 `alayanew-public/pytorch:pull` token | 签发成功 |
+| 私有库无凭据不可推 | 匿名取 `tai-talea/worker:pull,push` token 后解码 | `access.actions` 为**空数组** |
+| 同上，实测写入 | `PUT /v2/tai-talea/worker/manifests/probe` | **401** |
+| OpenAPI 有无镜像/存储接口 | 探测 `/v1/image/list`、`/v1/cci/image/list`、`/v1/nas/list`、`/v1/storage/list` 等 | 全部 404 `Not Found Api` |
+
+结论：**镜像路线无法绕开开通「混闪-镜像」**（凭据只能由其开通后下发）。
+开通后可选两条，不互斥：
+
+1. `save-image` 固化现有容器 → 私有镜像（**不需要任何本地 docker**，成本最低）；
+2. 任意有 docker 的机器构建派生镜像 → `docker push` 到
+   `registry.hd-02.alayanew.com:8443/<项目>/<镜像>:<tag>` → CCI 用私有镜像实例化
+   （dago 模式：基础镜像是输入、派生镜像是资产，可复现、可版本化）。
+
+另注：CCI 支持创建时挂载 NAS 型存储（混闪/全闪/AI DingoFS-NAS），
+但 OpenAPI 无存储类接口，NAS 的可选清单只能从控制台/Aladdin 页面查看。
