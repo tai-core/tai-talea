@@ -1,10 +1,10 @@
 {
   "os": "ubuntu-22.04",
-  "cuda": "12.4",
-  "python": "3.11",
-  "sglang": "0.4.x",
+  "cuda": "12.8",
+  "python": "3.10",
+  "sglang": "0.0.0+g5a26fc1f.cu12",
   "wheelhouse": "/opt/tai-talea/wheelhouse",
   "virtualenv": "/opt/tai-talea/venv",
   "bootstrap_version": "tai-talea-bootstrap/1",
-  "model_id": "model-a"
+  "model_id": "glm5.2"
 }

@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/schema#",
+  "type": "object",
+  "required": ["image", "model", "worker", "bootstrap", "runtime", "gpu", "cache"],
+  "properties": {
+    "replicaCount": {"type": "integer", "minimum": 1, "maximum": 1},
+    "image": {"type": "object", "required": ["repository", "tag"], "properties": {"repository": {"type": "string", "minLength": 1}, "tag": {"type": "string", "minLength": 1}, "pullPolicy": {"type": "string"}}},
+    "model": {"type": "object", "required": ["id", "path"], "properties": {"id": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1}}},
+    "worker": {"type": "object", "properties": {"serviceType": {"type": "string"}, "bootstrapPort": {"type": "integer", "minimum": 1, "maximum": 65535}, "servicePort": {"type": "integer", "minimum": 1, "maximum": 65535}, "prefillBootstrapPort": {"type": "integer", "minimum": 1, "maximum": 65535}, "role": {"enum": ["", "prefill", "decode"]}, "controlEndpoint": {"type": "string"}, "transferBackend": {"type": "string"}}},
+    "bootstrap": {"type": "object", "properties": {"token": {"type": "string"}, "tokenSecretName": {"type": "string"}, "tokenSecretKey": {"type": "string", "minLength": 1}}},
+    "runtime": {"type": "object", "required": ["cuda", "python", "sglang"], "properties": {"cuda": {"type": "string", "minLength": 1}, "python": {"type": "string", "minLength": 1}, "sglang": {"type": "string", "minLength": 1}}},
+    "gpu": {"type": "object", "properties": {"count": {"type": "integer", "minimum": 1}, "architecture": {"type": "string"}, "nodeSelector": {"type": "object"}, "tolerations": {"type": "array"}}},
+    "cache": {"type": "object", "properties": {"enabled": {"type": "boolean"}, "existingClaim": {"type": "string"}, "size": {"type": "string", "minLength": 1}, "storageClass": {"type": "string"}, "accessModes": {"type": "array", "minItems": 1}, "mountPath": {"type": "string", "minLength": 1}, "readOnly": {"type": "boolean"}}}
+  }
+}

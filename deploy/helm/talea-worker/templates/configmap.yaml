@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "talea-worker.fullname" . }}-profile
+  labels:
+    {{- include "talea-worker.labels" . | nindent 4 }}
+data:
+  profile.json: |
+    {
+      "os": "ubuntu-22.04",
+      "cuda": {{ .Values.runtime.cuda | quote }},
+      "python": {{ .Values.runtime.python | quote }},
+      "sglang": {{ .Values.runtime.sglang | quote }},
+      "wheelhouse": "/opt/tai-talea/wheelhouse",
+      "virtualenv": "/opt/tai-talea/venv",
+      "bootstrap_version": "tai-talea-bootstrap/1",
+      "model_id": {{ .Values.model.id | quote }}
+    }
+  worker.json: |
+    {
+      "desired_role": {{ .Values.worker.role | quote }},
+      "model_id": {{ .Values.model.id | quote }},
+      "model_path": {{ .Values.model.path | quote }},
+      "control_endpoint": {{ .Values.worker.controlEndpoint | quote }},
+      "bootstrap_port": {{ .Values.worker.bootstrapPort }},
+      "service_port": {{ .Values.worker.servicePort }}
+    }

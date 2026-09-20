@@ -1,0 +1,17 @@
+{{- if and .Values.cache.enabled (not .Values.cache.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "talea-worker.fullname" . }}-cache
+  labels:
+    {{- include "talea-worker.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.cache.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.cache.size }}
+  {{- with .Values.cache.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}

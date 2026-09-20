@@ -1,0 +1,3 @@
+# This is a contract placeholder, not a production lockfile. The approved
+# runtime base image must contain the locked Torch, SGLang fork, sgl_kernel,
+# NIXL and UCX wheels validated on the partner H20/H200 driver.

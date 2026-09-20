@@ -10,6 +10,7 @@
 - [项目说明书](docs/project-guide.md)：架构、构建部署、配置、接口、数据备份与当前边界。
 - [本轮审查与验证](docs/review-2026-09-20.md)：缺陷修复、验证结果和未验收场景。
 - [SSH 安装配置](docs/ssh-onboarding.md)、[监控指标与 benchmark](docs/pd-monitoring-and-benchmark.md)：需要具体参数时查阅。
+- [Kubernetes 交付](docs/kubernetes-delivery.md)：基础镜像、Helm、H20/H200 验收与运行约定。
 
 ## 当前能力
 

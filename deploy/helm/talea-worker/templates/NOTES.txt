@@ -1,0 +1,8 @@
+Talea worker {{ include "talea-worker.fullname" . }} is installed.
+
+Bootstrap:  http://{{ include "talea-worker.fullname" . }}:{{ .Values.worker.bootstrapPort }}
+Inference:  http://{{ include "talea-worker.fullname" . }}:{{ .Values.worker.servicePort }}
+
+The Pod only exposes the authenticated bootstrap. Talea must accept the
+capacity event and call /bootstrap/start before SGLang is expected to serve.
+Submit both endpoints to the control plane using the partner Push contract.

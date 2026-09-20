@@ -1,0 +1,52 @@
+replicaCount: 1
+image:
+  repository: ghcr.io/REPLACE_ME/tai-talea-worker
+  tag: dev
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+model:
+  id: glm5.2
+  path: /cache/models/glm5.2
+worker:
+  serviceType: ClusterIP
+  bootstrapPort: 9001
+  servicePort: 9002
+  prefillBootstrapPort: 8998
+  role: ""
+  controlEndpoint: ""
+  transferBackend: ""
+bootstrap:
+  token: ""
+  tokenSecretName: ""
+  tokenSecretKey: token
+runtime:
+  cuda: "12.8"
+  python: "3.10"
+  sglang: "0.0.0+g5a26fc1f.cu12"
+gpu:
+  count: 1
+  architecture: ""
+  nodeSelector: {}
+  tolerations: []
+resources:
+  requests:
+    cpu: "8"
+    memory: 32Gi
+    nvidia.com/gpu: "1"
+  limits:
+    cpu: "16"
+    memory: 64Gi
+    nvidia.com/gpu: "1"
+cache:
+  enabled: true
+  existingClaim: ""
+  size: 100Gi
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  mountPath: /cache
+  readOnly: false
+terminationGracePeriodSeconds: 120
+extraEnv: []
+podAnnotations: {}

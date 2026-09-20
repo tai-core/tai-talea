@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "talea-worker.fullname" . }}
+  labels:
+    {{- include "talea-worker.labels" . | nindent 4 }}
+  annotations:
+    talea.io/desired-role: {{ .Values.worker.role | quote }}
+    talea.io/control-endpoint: {{ .Values.worker.controlEndpoint | quote }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "talea-worker.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "talea-worker.labels" . | nindent 8 }}
+      annotations:
+        talea.io/desired-role: {{ .Values.worker.role | quote }}
+        talea.io/control-endpoint: {{ .Values.worker.controlEndpoint | quote }}
+      {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: 120
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gpu.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gpu.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: bootstrap
+              containerPort: {{ .Values.worker.bootstrapPort }}
+            - name: sglang
+              containerPort: {{ .Values.worker.servicePort }}
+            - name: pd-bootstrap
+              containerPort: {{ .Values.worker.prefillBootstrapPort }}
+          env:
+            - name: TAI_TALEA_BOOTSTRAP_PORT
+              value: {{ .Values.worker.bootstrapPort | quote }}
+            - name: TAI_TALEA_SERVICE_PORT
+              value: {{ .Values.worker.servicePort | quote }}
+            - name: TALEA_MODEL_ID
+              value: {{ .Values.model.id | quote }}
+            - name: TALEA_MODEL_PATH
+              value: {{ .Values.model.path | quote }}
+            - name: TALEA_CONTROL_ENDPOINT
+              value: {{ .Values.worker.controlEndpoint | quote }}
+            - name: TALEA_GPU_ARCH
+              value: {{ .Values.gpu.architecture | quote }}
+            - name: TALEA_PD_BOOTSTRAP_PORT
+              value: {{ .Values.worker.prefillBootstrapPort | quote }}
+            - name: TALEA_TRANSFER_BACKEND
+              value: {{ .Values.worker.transferBackend | quote }}
+            - name: TAI_TALEA_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-bootstrap" (include "talea-worker.fullname" .)) .Values.bootstrap.tokenSecretName }}
+                  key: {{ .Values.bootstrap.tokenSecretKey }}
+            {{- if .Values.worker.role }}
+            - name: TALEA_ROLE
+              value: {{ .Values.worker.role | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}{{ toYaml . | nindent 12 }}{{- end }}
+          volumeMounts:
+            - name: profile
+              mountPath: /etc/tai-talea/profile.json
+              subPath: profile.json
+              readOnly: true
+            - name: worker-config
+              mountPath: /etc/tai-talea/worker.json
+              subPath: worker.json
+              readOnly: true
+            - name: cache
+              mountPath: {{ .Values.cache.mountPath }}
+              readOnly: {{ .Values.cache.readOnly }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/tai-talea-entrypoint", "health"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          startupProbe:
+            exec:
+              command: ["/usr/local/bin/tai-talea-entrypoint", "health"]
+            failureThreshold: 30
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/tai-talea-entrypoint", "health"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/usr/local/bin/tai-talea-entrypoint", "stop"]
+      volumes:
+        - name: profile
+          configMap:
+            name: {{ include "talea-worker.fullname" . }}-profile
+        - name: worker-config
+          configMap:
+            name: {{ include "talea-worker.fullname" . }}-profile
+        - name: cache
+          {{- if and .Values.cache.enabled .Values.cache.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.cache.existingClaim }}
+          {{- else if .Values.cache.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "talea-worker.fullname" . }}-cache
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

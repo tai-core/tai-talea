@@ -1,0 +1,6 @@
+apiVersion: v2
+name: talea-worker
+description: Talea-managed SGLang worker bootstrap for P/D capacity
+type: application
+version: 0.1.0
+appVersion: "tai-talea-bootstrap/1"
