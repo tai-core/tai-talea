@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is bumped whenever the DDL below changes. Migrations are
 // applied inside a single transaction and recorded through PRAGMA user_version.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schemaDDL is the milestone 1 data model. Tables capacity_instances,
 // capacity_events, partner_snapshots and operations follow development
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS capacity_instances (
     start_attempts       INTEGER NOT NULL DEFAULT 0,
     drain_deadline_at    TEXT,
     pending_release      INTEGER NOT NULL DEFAULT 0,
+    pending_update_json  TEXT,
     lease_updated_at     TEXT,
     last_error           TEXT,
     last_seen_at         TEXT,
@@ -55,6 +56,8 @@ CREATE INDEX IF NOT EXISTS capacity_events_by_partner
     ON capacity_events(partner_id, received_at);
 CREATE INDEX IF NOT EXISTS capacity_events_by_result
     ON capacity_events(result, received_at);
+CREATE INDEX IF NOT EXISTS capacity_events_pending_order
+    ON capacity_events(result, occurred_at, event_id);
 
 CREATE TABLE IF NOT EXISTS partner_snapshots (
     partner_id     TEXT PRIMARY KEY,

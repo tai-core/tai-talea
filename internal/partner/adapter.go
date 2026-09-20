@@ -8,10 +8,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/tai-core/tai-talea/internal/domain"
@@ -77,6 +77,9 @@ type Snapshot struct {
 // CollectSnapshot performs the Pull steps 1 and 2 of development document §6.2:
 // read both views, then verify completeness before anything else happens.
 func CollectSnapshot(ctx context.Context, adapter PartnerAdapter) (Snapshot, error) {
+	// Fence the observation at the start of the poll. A Push received while
+	// either HTTP view is being fetched must remain newer than this snapshot.
+	observed := time.Now().UTC()
 	partnerID := adapter.PartnerID()
 	available, err := adapter.ListAvailableInstances(ctx)
 	if err != nil {
@@ -99,21 +102,37 @@ func CollectSnapshot(ctx context.Context, adapter PartnerAdapter) (Snapshot, err
 	}
 
 	merged := make(map[string]CapacityInstance, len(available))
+	// Active leases include occupied containers, which need not appear in the
+	// available (idle) view. Losing them here would revoke serving workers.
+	for id, lease := range leaseIndex {
+		merged[id] = lease
+	}
+	seenAvailable := make(map[string]bool, len(available))
 	for _, instance := range available {
 		if err := validateInstance(instance); err != nil {
 			return Snapshot{}, fmt.Errorf("%w: %v", ErrSnapshotIncomplete, err)
 		}
+		if seenAvailable[instance.ID] {
+			return Snapshot{}, fmt.Errorf("%w: available view repeats instance %s", ErrSnapshotIncomplete, instance.ID)
+		}
+		seenAvailable[instance.ID] = true
 		lease, ok := leaseIndex[instance.ID]
 		if !ok {
 			// A container without a lease cannot be trusted: refuse the whole
 			// snapshot instead of silently dropping or accepting it.
 			return Snapshot{}, fmt.Errorf("%w: instance %s has no active lease", ErrSnapshotIncomplete, instance.ID)
 		}
+		if instance.LeaseID != lease.LeaseID || domain.NormalizeEndpoint(instance.Endpoint) != domain.NormalizeEndpoint(lease.Endpoint) ||
+			(instance.ServiceEndpoint != "" && lease.ServiceEndpoint != "" && domain.NormalizeEndpoint(instance.ServiceEndpoint) != domain.NormalizeEndpoint(lease.ServiceEndpoint)) {
+			return Snapshot{}, fmt.Errorf("%w: conflicting capacity identity for %s", ErrSnapshotIncomplete, instance.ID)
+		}
 		merged[instance.ID] = mergeInstance(instance, lease)
 	}
 
 	instances := make([]CapacityInstance, 0, len(merged))
 	for _, instance := range merged {
+		instance.Endpoint = domain.NormalizeEndpoint(instance.Endpoint)
+		instance.ServiceEndpoint = domain.NormalizeEndpoint(instance.ServiceEndpoint)
 		instances = append(instances, instance)
 	}
 	sort.Slice(instances, func(i, j int) bool { return instances[i].ID < instances[j].ID })
@@ -121,7 +140,7 @@ func CollectSnapshot(ctx context.Context, adapter PartnerAdapter) (Snapshot, err
 	return Snapshot{
 		PartnerID: partnerID,
 		Version:   SnapshotVersion(instances),
-		Observed:  time.Now().UTC(),
+		Observed:  observed,
 		Instances: instances,
 	}, nil
 }
@@ -129,18 +148,15 @@ func CollectSnapshot(ctx context.Context, adapter PartnerAdapter) (Snapshot, err
 // SnapshotVersion derives a stable version from the instance content so that an
 // unchanged partner view never produces duplicate lifecycle events.
 func SnapshotVersion(instances []CapacityInstance) string {
-	lines := make([]string, 0, len(instances))
+	canonical := make([]CapacityInstance, 0, len(instances))
 	for _, instance := range instances {
-		models := instance.Spec.SnapshotSpec()
-		lease := instance.LeaseID
-		if !instance.LeaseUpdatedAt.IsZero() {
-			lease = fmt.Sprintf("%s@%d", lease, instance.LeaseUpdatedAt.Unix())
-		}
-		lines = append(lines, fmt.Sprintf("%s|%s|%s|%s|%d|%s",
-			instance.ID, instance.Endpoint, lease, instance.Spec.GPU, instance.Spec.GPUCount, strings.Join(models, ",")))
+		instance.Spec.ModelSupport = instance.Spec.SnapshotSpec()
+		instance.LeaseUpdatedAt = instance.LeaseUpdatedAt.UTC()
+		canonical = append(canonical, instance)
 	}
-	sort.Strings(lines)
-	digest := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].ID < canonical[j].ID })
+	encoded, _ := json.Marshal(canonical)
+	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])[:32]
 }
 
@@ -170,6 +186,9 @@ func SnapshotPayload(snapshot Snapshot) (string, error) {
 }
 
 func validateInstance(instance CapacityInstance) error {
+	if instance.Endpoint == "" || instance.LeaseID == "" {
+		return errors.New("partner instance requires endpoint and lease_id")
+	}
 	payload := instance.ToEventInstance()
 	if err := payload.Validate(); err != nil {
 		return fmt.Errorf("partner instance is invalid: %w", err)

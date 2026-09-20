@@ -151,7 +151,7 @@ func writeJSONStatus(writer http.ResponseWriter, status int, payload any) {
 }
 
 // newServer wires a complete control plane over real HTTP with stub containers.
-func newServer(t *testing.T) (*httptest.Server, *store.SQLiteStore, string) {
+func newServer(t *testing.T, configure ...func(*api.Options)) (*httptest.Server, *store.SQLiteStore, string) {
 	t.Helper()
 	container := stubBootstrap(t)
 	router := newStubRouter(t)
@@ -219,10 +219,14 @@ func newServer(t *testing.T) (*httptest.Server, *store.SQLiteStore, string) {
 	if err != nil {
 		t.Fatalf("controller: %v", err)
 	}
-	apiServer, err := api.New(api.Options{
+	options := api.Options{
 		Config: cfg, Store: persistence, Controller: ctrl, Metrics: metrics,
 		Ready: func() bool { return true },
-	})
+	}
+	for _, apply := range configure {
+		apply(&options)
+	}
+	apiServer, err := api.New(options)
 	if err != nil {
 		t.Fatalf("api server: %v", err)
 	}

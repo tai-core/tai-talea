@@ -22,6 +22,7 @@ import (
 	"github.com/tai-core/tai-talea/internal/planner"
 	"github.com/tai-core/tai-talea/internal/routeradapter"
 	"github.com/tai-core/tai-talea/internal/store"
+	"github.com/tai-core/tai-talea/internal/telemetry"
 )
 
 // ActorName is the audit actor for control plane driven actions.
@@ -29,7 +30,7 @@ const ActorName = "tai-talea"
 
 // RouterAdapter is the Router control surface required by the controller.
 // Draining is only ever expressed through SetReadiness: the interface
-// deliberately has no Worker deletion method (§8).
+// keeps stale-role cleanup separate from the ordinary drain surface (§8).
 type RouterAdapter interface {
 	RegisterWorker(ctx context.Context, request routeradapter.RegisterRequest) (routeradapter.Registration, error)
 	GetWorker(ctx context.Context, workerID string) (routeradapter.Worker, error)
@@ -74,20 +75,43 @@ type Deps struct {
 
 // Controller owns the dual-layer state machine.
 type Controller struct {
-	cfg      config.Config
-	store    store.Store
-	router   RouterAdapter
-	launcher Launcher
-	manager  InstanceManager
-	partners PartnerResolver
-	planner  *planner.Planner
-	metrics  *obs.Registry
-	alerts   *obs.Alerter
-	logger   *slog.Logger
-	now      func() time.Time
+	telemetry *telemetry.Collector
+	cfg       config.Config
+	store     store.Store
+	router    RouterAdapter
+	launcher  Launcher
+	manager   InstanceManager
+	partners  PartnerResolver
+	planner   *planner.Planner
+	metrics   *obs.Registry
+	alerts    *obs.Alerter
+	logger    *slog.Logger
+	now       func() time.Time
 
-	mu          sync.Mutex
-	ratioStreak int
+	mu                 sync.Mutex
+	ratioStreak        int
+	instanceOperations sync.Map
+	eventOperations    [64]sync.Mutex
+	capacityAdmissions sync.Mutex
+	pullOperations     sync.Map
+	eventRecovery      sync.Mutex
+	eventRecoveryAfter string
+	eventRecoveryTime  time.Time
+}
+
+func (c *Controller) eventOperation(id string) *sync.Mutex {
+	// A bounded stripe table avoids retaining one lock forever for every
+	// historical event. Collisions only serialize unrelated deliveries.
+	var hash uint64
+	for _, value := range []byte(id) {
+		hash = hash*1099511628211 ^ uint64(value)
+	}
+	return &c.eventOperations[hash%uint64(len(c.eventOperations))]
+}
+
+func (c *Controller) instanceOperation(id string) *sync.Mutex {
+	lock, _ := c.instanceOperations.LoadOrStore(id, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 // New validates dependencies and builds a controller.
@@ -122,17 +146,18 @@ func New(deps Deps) (*Controller, error) {
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Controller{
-		cfg:      deps.Config,
-		store:    deps.Store,
-		router:   deps.Router,
-		launcher: deps.Launcher,
-		manager:  deps.Manager,
-		partners: deps.Partners,
-		planner:  deps.Planner,
-		metrics:  deps.Metrics,
-		alerts:   deps.Alerter,
-		logger:   logger,
-		now:      now,
+		telemetry: telemetry.New(deps.Store, deps.Router),
+		cfg:       deps.Config,
+		store:     deps.Store,
+		router:    deps.Router,
+		launcher:  deps.Launcher,
+		manager:   deps.Manager,
+		partners:  deps.Partners,
+		planner:   deps.Planner,
+		metrics:   deps.Metrics,
+		alerts:    deps.Alerter,
+		logger:    logger,
+		now:       now,
 	}, nil
 }
 
@@ -141,6 +166,9 @@ func (c *Controller) Config() config.Config { return c.cfg }
 
 // Planner exposes the PD planner so the admin API can switch gears.
 func (c *Controller) Planner() *planner.Planner { return c.planner }
+
+// Telemetry exposes a partner-filtered snapshot; collection runs independently.
+func (c *Controller) Telemetry(owner string) telemetry.Snapshot { return c.telemetry.Snapshot(owner) }
 
 // CallTimeout returns the per-call timeout used for container and Router calls.
 func (c *Controller) CallTimeout() time.Duration { return c.cfg.Controller.CallTimeout.Duration() }

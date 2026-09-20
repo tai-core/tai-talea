@@ -92,6 +92,16 @@ func TestValidationRejectsIncompleteConfiguration(t *testing.T) {
 		"no sqlite path":           func(c *config.Config) { c.Storage.SQLitePath = "" },
 		"incomplete profile":       func(c *config.Config) { c.ImageProfile.Wheelhouse = "" },
 		"duplicate partner":        func(c *config.Config) { c.Partners = append(c.Partners, c.Partners[0]) },
+		"push token equals admin":  func(c *config.Config) { c.Partners[0].PushToken = c.Server.AdminToken },
+		"duplicate push token": func(c *config.Config) {
+			other := c.Partners[0]
+			other.ID = "partner-b"
+			c.Partners = append(c.Partners, other)
+		},
+		"invalid http adapter": func(c *config.Config) {
+			c.Partners[0].Adapter = "http"
+			c.Partners[0].HTTP.BaseURL = "file:///tmp/capacity"
+		},
 		// The bootstrap interface has no unauthenticated mode, so a control
 		// plane without a secret could not drive a single instance.
 		// An instance address that would only fail at dial time must be caught
@@ -132,6 +142,20 @@ func TestLoadRejectsUnknownFieldsAndBadDurations(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid duration") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadRejectsTrailingDocument(t *testing.T) {
+	raw, err := os.ReadFile(examplePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, append(raw, []byte("\n---\nserver:\n  listen: 0.0.0.0:9999\n")...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("second config document silently ignored")
 	}
 }
 

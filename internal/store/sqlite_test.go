@@ -273,49 +273,6 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
-func TestAbandonStaleEvents(t *testing.T) {
-	persistence := newStore(t)
-	ctx := context.Background()
-	old := domain.CapacityEvent{
-		EventID: "old", PartnerID: "partner-a", Type: domain.EventCapacityAdded,
-		OccurredAt: time.Now().Add(-time.Hour).UTC(),
-		Instance:   &domain.EventInstance{ID: "container-old"},
-		Source:     domain.SourcePush,
-		ReceivedAt: time.Now().Add(-time.Hour).UTC(),
-	}
-	if _, err := persistence.ClaimEvent(ctx, old, domain.ResultPending, ""); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-	fresh := old
-	fresh.EventID = "fresh"
-	fresh.ReceivedAt = time.Now().UTC()
-	if _, err := persistence.ClaimEvent(ctx, fresh, domain.ResultPending, ""); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-
-	abandoned, err := persistence.AbandonStaleEvents(ctx, time.Now().Add(-time.Minute))
-	if err != nil {
-		t.Fatalf("abandon: %v", err)
-	}
-	if abandoned != 1 {
-		t.Fatalf("abandoned=%d, want 1", abandoned)
-	}
-	record, err := persistence.GetEvent(ctx, "old")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if record.Result != domain.ResultAbandoned {
-		t.Fatalf("result=%s, want ABANDONED", record.Result)
-	}
-	record, err = persistence.GetEvent(ctx, "fresh")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if record.Result != domain.ResultPending {
-		t.Fatalf("a fresh event must stay pending, got %s", record.Result)
-	}
-}
-
 func TestCountsExcludeReleasedAndIdleServices(t *testing.T) {
 	persistence := newStore(t)
 	ctx := context.Background()

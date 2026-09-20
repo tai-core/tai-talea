@@ -32,6 +32,9 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 		decodeServing  int
 	)
 	for _, instance := range instances {
+		if instance.PendingRelease || instance.PendingUpdate != nil {
+			continue
+		}
 		switch {
 		case instance.InstanceState == domain.InstanceIdle && instance.Role.Valid() && hasLiveService(instance):
 			roleSince := instance.RoleAssignedAt
@@ -57,16 +60,19 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 	sort.Slice(input.Serving, func(i, j int) bool { return input.Serving[i].ID < input.Serving[j].ID })
 	sort.Slice(input.Idle, func(i, j int) bool { return input.Idle[i].ID < input.Idle[j].ID })
 
-	// Reserved extension point: milestone 3 fills this from the Router load API
-	// and switches the planner to adaptive sizing.
-	if loads, err := c.router.GetLoads(ctx); err == nil {
-		var total int64
-		for _, load := range loads {
-			if load.Load > 0 {
-				total += load.Load
-			}
-		}
-		input.Load.QueueLength = float64(total)
+	// Router in-flight counts are not scheduler queue lengths. Only fresh,
+	// complete scheduler samples are passed as measured planner inputs.
+	load := c.Telemetry("")
+	input.Load.MeasuredAt = load.At
+	input.Load.Valid = load.Complete
+	input.Load.Advice = load.Advice
+	if load.Complete {
+		input.Load.QueueLength = *load.Prefill.Queue + *load.Decode.Queue
+		input.Load.PrefillPressure = load.Prefill.Pressure
+		input.Load.DecodePressure = load.Decode.Pressure
+		input.Load.PDLoadImbalance = *load.PressureGap
+		input.Load.InputTokenRate = load.Prefill.TokenRate
+		input.Load.OutputTokenRate = load.Decode.TokenRate
 	}
 
 	decision, err := c.planner.Plan(input)
@@ -87,13 +93,13 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 			// Role conversion is staged through a drain: readiness closes first,
 			// the next round assigns the new role once the port is free.
 			if err := c.BeginDrain(ctx, action.InstanceID,
-				fmt.Sprintf("planner rebalance %s -> %s", action.FromRole, action.Role), 0); err != nil {
+				fmt.Sprintf("planner rebalance %s -> %s", action.FromRole, action.Role), c.DefaultDrainGrace()); err != nil {
 				c.log().Warn("planner reassign drain failed",
 					"instance_id", action.InstanceID, "error", err.Error())
 				continue
 			}
 		case planner.ActionDrain:
-			if err := c.BeginDrain(ctx, action.InstanceID, action.Reason, 0); err != nil {
+			if err := c.BeginDrain(ctx, action.InstanceID, action.Reason, c.DefaultDrainGrace()); err != nil {
 				c.log().Warn("planner drain failed", "instance_id", action.InstanceID, "error", err.Error())
 				continue
 			}
@@ -213,6 +219,7 @@ func (c *Controller) checkRatioDrift(ctx context.Context, decision planner.Decis
 // context is cancelled. Partner pull runs in its own loop so a slow partner
 // cannot delay container reconciliation.
 func (c *Controller) RunPeriodic(ctx context.Context) {
+	go c.telemetry.Run(ctx)
 	interval := c.cfg.Controller.ReconcileInterval.Duration()
 	if interval <= 0 {
 		interval = 10 * time.Second
@@ -275,20 +282,5 @@ func (c *Controller) RunPull(ctx context.Context, schedule PullSchedule) {
 // PullOnce performs one full pull round: plan, apply every generated event and
 // only then commit the snapshot as the new authoritative version.
 func (c *Controller) PullOnce(ctx context.Context, schedule PullSchedule) error {
-	plan, err := schedule.Puller.Plan(ctx, schedule.Adapter)
-	if err != nil {
-		return err
-	}
-	for _, event := range plan.Events {
-		outcome, err := c.HandleCapacityEvent(ctx, event)
-		if err != nil {
-			return fmt.Errorf("apply pull event %s: %w", event.EventID, err)
-		}
-		if !outcome.Accepted {
-			// Rejected pull events must not promote the snapshot: the partner
-			// view would silently diverge from the control plane view.
-			return fmt.Errorf("pull event %s was rejected: %s", event.EventID, outcome.Reason)
-		}
-	}
-	return schedule.Puller.Commit(ctx, plan)
+	return c.pullAuthoritative(ctx, schedule)
 }

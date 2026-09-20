@@ -27,6 +27,9 @@ func (c *Controller) runPrepare(ctx context.Context, instanceID, operationID str
 	if instance.InstanceState != domain.InstancePreparing {
 		return fmt.Errorf("instance %s is %s, cannot prepare", instanceID, instance.InstanceState)
 	}
+	// Every retry belongs to the same lease operation; otherwise an older
+	// pending row can bypass the newest retry delay after a restart.
+	operationID = lifecycleOperationID(instance, store.OpPrepare)
 
 	startedAt := c.now()
 	callCtx, cancel := c.callContext(ctx)
@@ -110,7 +113,15 @@ func (c *Controller) runPrepare(ctx context.Context, instanceID, operationID str
 	}
 
 	next.InstanceState = domain.InstanceIdle
-	next.ServiceState = domain.ServiceNone
+	// Preparation may be recovering an already running process after LOST.
+	// Keep its assigned role and enter the ordinary retry/adoption path.
+	if instance.Role.Valid() && report.Status.Phase == launcher.PhaseRunning {
+		next.ServiceState = domain.ServiceFailed
+	} else {
+		next.ServiceState = domain.ServiceNone
+		next.Role = domain.RoleNone
+		next.RoleAssignedAt = time.Time{}
+	}
 	next.PrepareAttempts = 0
 	next.LastError = ""
 	next.LastSeenAt = report.PreparedAt
@@ -156,6 +167,9 @@ func (c *Controller) runPrepare(ctx context.Context, instanceID, operationID str
 // reachable, SGLang is healthy, the worker is registered with the right role and
 // readiness is routable.
 func (c *Controller) StartService(ctx context.Context, instanceID string, role domain.Role) error {
+	lock := c.instanceOperation(instanceID)
+	lock.Lock()
+	defer lock.Unlock()
 	if !role.Valid() {
 		return fmt.Errorf("instance %s cannot start without a valid PD role", instanceID)
 	}
@@ -165,6 +179,9 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 	}
 	if instance.InstanceState != domain.InstanceIdle {
 		return fmt.Errorf("instance %s is %s, service start requires IDLE", instanceID, instance.InstanceState)
+	}
+	if instance.PendingRelease || instance.PendingUpdate != nil {
+		return fmt.Errorf("instance %s is pending release or identity update", instanceID)
 	}
 	if instance.ServiceState == domain.ServiceServing {
 		return nil
@@ -178,7 +195,7 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 	instance.ServiceState = domain.ServiceStarting
 	instance.StartAttempts++
 	operation := &store.Operation{
-		OperationID: c.operationID(instanceID, store.OpStart),
+		OperationID: lifecycleOperationID(instance, store.OpStart),
 		InstanceID:  instanceID,
 		Type:        store.OpStart,
 		Status:      store.OpInProgress,
@@ -222,6 +239,17 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 	if err := c.waitHealthy(ctx, instance); err != nil {
 		return c.failStart(ctx, instance, operation, "sglang health check failed", err)
 	}
+	callCtx, cancel = c.callContext(ctx)
+	status, statusErr := c.launcher.Status(callCtx, instance.Endpoint)
+	cancel()
+	if statusErr == nil && (status.Phase != launcher.PhaseRunning || status.Role != string(role) ||
+		(status.ModelID != "" && status.ModelID != c.cfg.Controller.ModelID)) {
+		statusErr = fmt.Errorf("bootstrap runs phase %s role %s model %s, expected RUNNING/%s/%s",
+			status.Phase, status.Role, status.ModelID, role, c.cfg.Controller.ModelID)
+	}
+	if statusErr != nil {
+		return c.failStart(ctx, instance, operation, "running service identity mismatch", statusErr)
+	}
 	instance.ServiceState = domain.ServiceHealthy
 	if err := c.transition(ctx, store.Transition{
 		InstanceID: instanceID,
@@ -261,6 +289,7 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 	}
 	instance.ReadinessGeneration = generation
 	instance.ServiceState = domain.ServiceServing
+	instance.StartAttempts = 0
 	instance.LastError = ""
 	instance.LastSeenAt = c.now()
 	operation.Status = store.OpSucceeded
@@ -298,11 +327,21 @@ func (c *Controller) waitHealthy(ctx context.Context, instance domain.Instance) 
 	deadline := c.now().Add(c.StartTimeout())
 	var lastErr error
 	for {
+		current, err := c.store.GetInstance(ctx, instance.ID)
+		if err != nil {
+			return err
+		}
+		if current.PendingRelease {
+			return fmt.Errorf("instance %s was reclaimed during startup", instance.ID)
+		}
 		callCtx, cancel := c.callContext(ctx)
 		health, err := c.launcher.Health(callCtx, instance.Endpoint)
 		cancel()
 		if err == nil && health.Healthy() && (health.Phase == "" || health.Phase == launcher.PhaseRunning) {
 			return nil
+		}
+		if err == nil && health.Phase == launcher.PhaseFailed {
+			return fmt.Errorf("sglang process failed during startup: %s", health.Detail)
 		}
 		if err != nil {
 			lastErr = err
@@ -323,6 +362,39 @@ func (c *Controller) waitHealthy(ctx context.Context, instance domain.Instance) 
 // register registers the worker with the Router, recovering when the Router
 // already tracks the URL from a previous control plane lifetime.
 func (c *Controller) register(ctx context.Context, instance domain.Instance, role domain.Role) (routeradapter.Registration, error) {
+	// Router POST is asynchronous and may deduplicate a previous add by URL.
+	// Check the existing role before reuse; a healthy HTTP process alone cannot
+	// establish that the Router's P/D pool matches the launched process.
+	lookupCtx, lookupCancel := c.callContext(ctx)
+	existing, found, lookupErr := c.router.FindWorkerByURL(lookupCtx, instance.ServiceURL())
+	lookupCancel()
+	if lookupErr != nil {
+		return routeradapter.Registration{}, lookupErr
+	}
+	if found {
+		if existing.WorkerType == string(role) {
+			return routeradapter.Registration{WorkerID: existing.ID, WorkerURL: existing.URL}, nil
+		}
+		closeCtx, cancel := c.callContext(ctx)
+		_, err := c.router.SetReadiness(closeCtx, existing.ID, false)
+		cancel()
+		if err != nil {
+			return routeradapter.Registration{}, err
+		}
+		cleaner, ok := c.router.(interface {
+			RemoveStaleMembership(context.Context, string, string, domain.Role) error
+		})
+		if !ok {
+			return routeradapter.Registration{}, fmt.Errorf("router role mismatch: %s != %s", existing.WorkerType, role)
+		}
+		cleanCtx, cleanCancel := c.callContext(ctx)
+		err = cleaner.RemoveStaleMembership(cleanCtx, existing.ID, instance.ServiceURL(), role)
+		cleanCancel()
+		if err != nil {
+			return routeradapter.Registration{}, err
+		}
+		c.audit(ctx, store.AuditEntry{Action: "stale_router_role_removed", InstanceID: instance.ID, PartnerID: instance.PartnerID, Details: map[string]string{"from_role": existing.WorkerType, "role": string(role)}})
+	}
 	callCtx, cancel := c.callContext(ctx)
 	// The Router routes inference traffic, so it needs the service address.
 	// Using the bootstrap endpoint here would register a URL that answers 404
@@ -336,29 +408,62 @@ func (c *Controller) register(ctx context.Context, instance domain.Instance, rol
 	})
 	cancel()
 	if err == nil {
-		return registration, nil
+		return c.waitMembership(ctx, registration, role)
 	}
 	if !errors.Is(err, routeradapter.ErrAlreadyRegistered) {
 		return routeradapter.Registration{}, err
 	}
-	lookupCtx, lookupCancel := c.callContext(ctx)
+	lookupCtx, lookupCancel = c.callContext(ctx)
 	defer lookupCancel()
-	existing, found, lookupErr := c.router.FindWorkerByURL(lookupCtx, serviceURL)
+	existing, found, lookupErr = c.router.FindWorkerByURL(lookupCtx, serviceURL)
 	if lookupErr != nil {
 		return routeradapter.Registration{}, lookupErr
 	}
 	if !found {
 		return routeradapter.Registration{}, err
 	}
+	if existing.WorkerType != string(role) {
+		return routeradapter.Registration{}, fmt.Errorf("router role mismatch: %s != %s", existing.WorkerType, role)
+	}
 	c.log().Warn("router already tracked the worker url; reusing the existing membership",
 		"instance_id", instance.ID, "worker_id", existing.ID, "endpoint", serviceURL)
 	return routeradapter.Registration{WorkerID: existing.ID, WorkerURL: existing.URL}, nil
+}
+
+func (c *Controller) waitMembership(ctx context.Context, registration routeradapter.Registration, role domain.Role) (routeradapter.Registration, error) {
+	call, cancel := c.callContext(ctx)
+	defer cancel()
+	for {
+		worker, err := c.router.GetWorker(call, registration.WorkerID)
+		if err == nil && worker.URL == registration.WorkerURL && worker.WorkerType == string(role) {
+			return registration, nil
+		}
+		if err != nil && !errors.Is(err, routeradapter.ErrWorkerNotFound) {
+			return routeradapter.Registration{}, err
+		}
+		select {
+		case <-call.Done():
+			return routeradapter.Registration{}, fmt.Errorf("router membership did not acquire role %s: %w", role, call.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // ensureReadiness makes sure readiness is routable and returns the generation.
 func (c *Controller) ensureReadiness(ctx context.Context, workerID string) (int64, bool, error) {
 	callCtx, cancel := c.callContext(ctx)
 	defer cancel()
+	worker, err := c.router.GetWorker(callCtx, workerID)
+	if err != nil {
+		return 0, false, err
+	}
+	if !worker.Healthy || worker.Metadata["__pd_state"] == "draining" {
+		_, closeErr := c.router.SetReadiness(callCtx, workerID, false)
+		if closeErr != nil {
+			return 0, false, closeErr
+		}
+		return 0, false, fmt.Errorf("router worker is not routable: healthy=%t pd_state=%s", worker.Healthy, worker.Metadata["__pd_state"])
+	}
 	record, err := c.router.GetReadiness(callCtx, workerID)
 	if err != nil {
 		if !errors.Is(err, routeradapter.ErrReadinessNotVisible) {
@@ -404,6 +509,7 @@ func servicePort(instance domain.Instance) int {
 }
 
 func (c *Controller) failStart(ctx context.Context, instance domain.Instance, operation *store.Operation, message string, cause error) error {
+	operation.OperationID = lifecycleOperationID(instance, operation.Type)
 	next := instance
 	next.ServiceState = domain.ServiceFailed
 	next.LastError = message + ": " + cause.Error()
@@ -470,13 +576,36 @@ func (c *Controller) failStart(ctx context.Context, instance domain.Instance, op
 // The container stays in the control plane after draining so the planner can
 // re-assign it a different role.
 func (c *Controller) BeginDrain(ctx context.Context, instanceID, reason string, grace time.Duration) error {
+	lock := c.instanceOperation(instanceID)
+	lock.Lock()
+	defer lock.Unlock()
 	return c.beginDrain(ctx, instanceID, reason, grace, false)
 }
 
 // DrainForRelease drains and then hands the container back to the partner. It is
 // the path taken when the partner revoked capacity (§5 and §7.3).
 func (c *Controller) DrainForRelease(ctx context.Context, instanceID, reason string, grace time.Duration) error {
+	if err := c.RequestReclaim(ctx, instanceID, reason, grace); err != nil {
+		return err
+	}
+	lock := c.instanceOperation(instanceID)
+	lock.Lock()
+	defer lock.Unlock()
 	return c.beginDrain(ctx, instanceID, reason, grace, true)
+}
+
+// RequestReclaim records intent only; the periodic reconciler owns network calls
+// and retries, including after a process restart or an HTTP client disconnect.
+func (c *Controller) RequestReclaim(ctx context.Context, instanceID, reason string, grace time.Duration) error {
+	if grace < 0 {
+		return errors.New("reclaim grace must not be negative")
+	}
+	return c.transition(ctx, store.Transition{
+		InstanceID: instanceID, RequestRelease: true,
+		Next: domain.Instance{DrainDeadlineAt: c.now().Add(grace)},
+		Audit: store.AuditEntry{Action: "instance_reclaim_requested", InstanceID: instanceID,
+			Details: map[string]string{"reason": reason, "grace": grace.String()}},
+	})
 }
 
 func (c *Controller) beginDrain(ctx context.Context, instanceID, reason string, grace time.Duration, release bool) error {
@@ -501,13 +630,18 @@ func (c *Controller) beginDrain(ctx context.Context, instanceID, reason string, 
 		return nil
 	}
 	if !instance.HasService() {
-		// Nothing to drain: hand the container straight back.
-		return c.BeginRelease(ctx, instanceID, reason)
+		if release {
+			return c.BeginRelease(ctx, instanceID, reason)
+		}
+		return nil
 	}
 	if grace < 0 {
 		grace = 0
 	}
 	deadline := c.now().Add(grace)
+	if instance.PendingRelease && !instance.DrainDeadlineAt.IsZero() {
+		deadline = instance.DrainDeadlineAt
+	}
 
 	// Close readiness first: this is the only supported drain primitive (§8).
 	if instance.RouterWorkerID != "" {
@@ -538,6 +672,23 @@ func (c *Controller) beginDrain(ctx context.Context, instanceID, reason string, 
 			return readinessErr
 		}
 	}
+	// Registration may have reached the Router before its ID was committed to
+	// SQLite (for example a crash during readiness). Resolve that membership so
+	// reclaim still closes admission and waits for its real outstanding load.
+	if instance.RouterWorkerID == "" {
+		call, cancel := c.callContext(ctx)
+		worker, found, err := c.router.FindWorkerByURL(call, instance.ServiceURL())
+		cancel()
+		if err != nil {
+			return err
+		}
+		if found {
+			instance.RouterWorkerID = worker.ID
+			if err := c.closeReadiness(ctx, instance); err != nil {
+				return err
+			}
+		}
+	}
 
 	next := instance
 	next.ServiceState = domain.ServiceDraining
@@ -548,7 +699,7 @@ func (c *Controller) beginDrain(ctx context.Context, instanceID, reason string, 
 		InstanceID: instanceID,
 		Next:       next,
 		Operation: &store.Operation{
-			OperationID: c.operationID(instanceID, store.OpDrain),
+			OperationID: drainOperationID(instance),
 			InstanceID:  instanceID,
 			Type:        store.OpDrain,
 			Status:      store.OpInProgress,
@@ -576,6 +727,21 @@ func (c *Controller) beginDrain(ctx context.Context, instanceID, reason string, 
 // the drain deadline expired, then leaves the instance idle and unreleased so
 // the caller can decide between release and re-assignment.
 func (c *Controller) FinishDrain(ctx context.Context, instance domain.Instance) error {
+	lock := c.instanceOperation(instance.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return c.finishDrain(ctx, instance)
+}
+
+func (c *Controller) finishDrain(ctx context.Context, instance domain.Instance) error {
+	current, err := c.store.GetInstance(ctx, instance.ID)
+	if err != nil {
+		return err
+	}
+	if current.LeaseID != instance.LeaseID {
+		return store.ErrConflict
+	}
+	instance = current
 	if instance.ServiceState != domain.ServiceDraining {
 		return nil
 	}
@@ -584,13 +750,13 @@ func (c *Controller) FinishDrain(ctx context.Context, instance domain.Instance) 
 		c.log().Warn("drain load probe failed", "instance_id", instance.ID, "error", err.Error())
 	}
 	deadline := instance.DrainDeadlineAt
-	timedOut := !deadline.IsZero() && c.now().After(deadline)
-	if loadKnown && load > 0 && !timedOut {
+	timedOut := !deadline.IsZero() && !c.now().Before(deadline)
+	if (!loadKnown || load > 0) && !timedOut {
 		return nil
 	}
 
 	force := false
-	if timedOut && loadKnown && load > 0 {
+	if timedOut && (!loadKnown || load > 0) {
 		force = true
 		if c.metrics != nil {
 			c.metrics.IncCounter(obs.MetricServiceDrainTimeout,
@@ -601,9 +767,10 @@ func (c *Controller) FinishDrain(ctx context.Context, instance domain.Instance) 
 			Severity:   obs.SeverityCritical,
 			InstanceID: instance.ID,
 			PartnerID:  instance.PartnerID,
-			Message:    "drain exceeded its grace period with in-flight requests; forcing service stop",
+			Message:    "drain deadline expired with outstanding or unknown load; forcing service stop",
 			Details: map[string]string{
 				"in_flight_load": fmt.Sprintf("%d", load),
+				"load_known":     fmt.Sprintf("%t", loadKnown),
 				"deadline":       deadline.Format(time.RFC3339),
 			},
 		})
@@ -618,6 +785,9 @@ func (c *Controller) FinishDrain(ctx context.Context, instance domain.Instance) 
 	if stopErr != nil {
 		return c.failDrain(ctx, instance, stopErr)
 	}
+	if result.Phase != launcher.PhaseStopped {
+		return c.failDrain(ctx, instance, fmt.Errorf("bootstrap stop did not confirm process exit: phase=%s detail=%s", result.Phase, result.Detail))
+	}
 
 	next := instance
 	next.ServiceState = domain.ServiceNone
@@ -626,13 +796,21 @@ func (c *Controller) FinishDrain(ctx context.Context, instance domain.Instance) 
 	next.StartAttempts = 0
 	next.DrainDeadlineAt = time.Time{}
 	next.LastSeenAt = c.now()
+	next.LastError = ""
 	pendingRelease := instance.PendingRelease
 	next.PendingRelease = false
+	if instance.PendingUpdate != nil && !pendingRelease {
+		applyInstanceUpdate(&next, *instance.PendingUpdate)
+		next.InstanceState = domain.InstancePreparing
+		next.RouterWorkerID = ""
+		next.ReadinessGeneration = 0
+	}
 	if err := c.transition(ctx, store.Transition{
-		InstanceID: instance.ID,
-		Next:       next,
+		InstanceID:         instance.ID,
+		Next:               next,
+		ApplyPendingUpdate: instance.PendingUpdate != nil && !pendingRelease,
 		Operation: &store.Operation{
-			OperationID: c.operationID(instance.ID, store.OpDrain),
+			OperationID: drainOperationID(instance),
 			InstanceID:  instance.ID,
 			Type:        store.OpDrain,
 			Status:      store.OpSucceeded,
@@ -670,13 +848,13 @@ func (c *Controller) FinishDrain(ctx context.Context, instance domain.Instance) 
 
 func (c *Controller) failDrain(ctx context.Context, instance domain.Instance, cause error) error {
 	next := instance
-	next.ServiceState = domain.ServiceFailed
+	next.ServiceState = domain.ServiceDraining
 	next.LastError = "drain stop failed: " + cause.Error()
 	if err := c.transition(ctx, store.Transition{
 		InstanceID: instance.ID,
 		Next:       next,
 		Operation: &store.Operation{
-			OperationID: c.operationID(instance.ID, store.OpDrain),
+			OperationID: drainOperationID(instance),
 			InstanceID:  instance.ID,
 			Type:        store.OpDrain,
 			Status:      store.OpPending,
@@ -730,8 +908,8 @@ func (c *Controller) workerLoad(ctx context.Context, instance domain.Instance) (
 		}
 		return load.Load, true, nil
 	}
-	// The worker is not in the Router any more, so no traffic can arrive.
-	return 0, true, nil
+	// Missing membership cannot prove that a previously dispatched request ended.
+	return 0, false, nil
 }
 
 // BeginRelease hands the container back to the partner (§7.3).
@@ -755,12 +933,21 @@ func (c *Controller) BeginRelease(ctx context.Context, instanceID, reason string
 	next.InstanceState = domain.InstanceReleasing
 	next.LastSeenAt = c.now()
 	operation := &store.Operation{
-		OperationID: c.operationID(instanceID, store.OpRelease),
+		OperationID: lifecycleOperationID(instance, store.OpRelease),
 		InstanceID:  instanceID,
 		Type:        store.OpRelease,
 		Status:      store.OpInProgress,
 		Attempt:     1,
 		CreatedAt:   c.now(),
+	}
+	if previous, err := c.store.GetOperation(ctx, operation.OperationID); err == nil {
+		operation.Attempt = previous.Attempt + 1
+		operation.CreatedAt = previous.CreatedAt
+		if !previous.Status.Terminal() && !previous.NextRetryAt.IsZero() && c.now().Before(previous.NextRetryAt) {
+			return nil
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
 	}
 	if err := c.transition(ctx, store.Transition{
 		InstanceID: instanceID,
@@ -779,7 +966,6 @@ func (c *Controller) BeginRelease(ctx context.Context, instanceID, reason string
 	cancel()
 	if releaseErr != nil {
 		operation.Status = store.OpPending
-		operation.Attempt = 2
 		operation.NextRetryAt = c.now().Add(c.cfg.Controller.OperationRetry.Duration())
 		operation.LastError = releaseErr.Error()
 		next.LastError = "release failed: " + releaseErr.Error()
@@ -789,7 +975,7 @@ func (c *Controller) BeginRelease(ctx context.Context, instanceID, reason string
 			Operation:  operation,
 			Audit: store.AuditEntry{
 				Action: "instance_release_failed", InstanceID: instanceID, PartnerID: instance.PartnerID,
-				Details: map[string]string{"attempt": "1", "error": releaseErr.Error()},
+				Details: map[string]string{"attempt": fmt.Sprint(operation.Attempt), "error": releaseErr.Error()},
 			},
 		}); err != nil {
 			return err
@@ -806,6 +992,8 @@ func (c *Controller) BeginRelease(ctx context.Context, instanceID, reason string
 	}
 
 	next.InstanceState = domain.InstanceReleased
+	next.PendingRelease = false
+	next.DrainDeadlineAt = time.Time{}
 	next.Role = domain.RoleNone
 	next.RoleAssignedAt = time.Time{}
 	next.LastError = ""
@@ -825,10 +1013,20 @@ func (c *Controller) BeginRelease(ctx context.Context, instanceID, reason string
 	return nil
 }
 
+func lifecycleOperationID(instance domain.Instance, kind store.OperationType) string {
+	return fmt.Sprintf("%s:%d:%s:%s", kind, len(instance.ID), instance.ID, instance.LeaseID)
+}
+
 // markLost parks an instance whose container or lease cannot be trusted (§4.1).
 func (c *Controller) markLost(ctx context.Context, instance domain.Instance, reason string) error {
-	if instance.InstanceState == domain.InstanceLost || instance.InstanceState == domain.InstanceReleased {
+	if instance.InstanceState == domain.InstanceReleased {
 		return nil
+	}
+	// Bootstrap loss does not prove the model is dead. Close admission while
+	// retaining the service state and the outstanding load for later recovery.
+	closeErr := c.closeReadiness(ctx, instance)
+	if instance.InstanceState == domain.InstanceLost {
+		return closeErr
 	}
 	next := instance
 	next.InstanceState = domain.InstanceLost
@@ -856,7 +1054,43 @@ func (c *Controller) markLost(ctx context.Context, instance domain.Instance, rea
 		Message:    "instance is LOST; it must not be scheduled",
 		Details:    map[string]string{"reason": reason, "endpoint": instance.Endpoint},
 	})
-	return nil
+	return closeErr
+}
+
+func (c *Controller) closeReadiness(ctx context.Context, instance domain.Instance) error {
+	workerID := instance.RouterWorkerID
+	if workerID == "" && instance.HasService() {
+		call, cancel := c.callContext(ctx)
+		worker, found, err := c.router.FindWorkerByURL(call, instance.ServiceURL())
+		cancel()
+		if err != nil {
+			return err
+		}
+		if found {
+			workerID = worker.ID
+		}
+	}
+	if workerID == "" {
+		return nil
+	}
+	call, cancel := c.callContext(ctx)
+	defer cancel()
+	_, err := c.router.SetReadiness(call, workerID, false)
+	if errors.Is(err, routeradapter.ErrWorkerNotFound) {
+		return nil
+	}
+	return err
+}
+
+func applyInstanceUpdate(instance *domain.Instance, update domain.InstanceUpdate) {
+	instance.Endpoint = update.Endpoint
+	instance.ServiceEndpoint = update.ServiceEndpoint
+	instance.LeaseID = update.LeaseID
+	instance.Spec = update.Spec
+	instance.LeaseUpdatedAt = update.ObservedAt
+	instance.PrepareAttempts = 0
+	instance.StartAttempts = 0
+	instance.PendingUpdate = nil
 }
 
 // Probe verifies that a container is still reachable and reports its phase.

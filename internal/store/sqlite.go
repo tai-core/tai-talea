@@ -82,6 +82,7 @@ type addedColumn struct {
 // first. Adding one is a schemaVersion bump plus an entry here.
 var addedColumns = []addedColumn{
 	{table: "capacity_instances", name: "service_endpoint", definition: "TEXT"},
+	{table: "capacity_instances", name: "pending_update_json", definition: "TEXT"},
 }
 
 // ensureColumn adds a column when it is missing, leaving existing data intact.
@@ -158,17 +159,15 @@ func (s *SQLiteStore) migrate() error {
 
 // ---------------------------------------------------------------- events
 
-// ClaimEvent records an event as PENDING. The primary key on event_id makes
-// duplicate delivery idempotent: the caller receives claimed=false and must not
-// trigger any lifecycle action again.
+// ClaimEvent persists normalized intent before execution. The primary key on
+// event_id makes duplicate delivery idempotent; the controller separately
+// resumes unfinished intents after interruptions.
 func (s *SQLiteStore) ClaimEvent(ctx context.Context, event domain.CapacityEvent, result domain.EventResult, reason string) (bool, error) {
-	payload := event.Raw
-	if len(payload) == 0 {
-		encoded, err := json.Marshal(event)
-		if err != nil {
-			return false, fmt.Errorf("encode event payload: %w", err)
-		}
-		payload = encoded
+	// Persist normalized fields, including an authenticated partner omitted
+	// from the wire body, so this record can safely replay after a restart.
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return false, fmt.Errorf("encode event payload: %w", err)
 	}
 	receivedAt := event.ReceivedAt
 	if receivedAt.IsZero() {
@@ -245,24 +244,63 @@ FROM capacity_events ORDER BY received_at DESC, event_id DESC LIMIT ?`, limit)
 	return records, rows.Err()
 }
 
-// AbandonStaleEvents marks events that were claimed but never finalized during
-// a previous process lifetime. They are never replayed automatically: the
-// reconciler rebuilds actual state from the container, SGLang and the Router.
-func (s *SQLiteStore) AbandonStaleEvents(ctx context.Context, olderThan time.Time) (int, error) {
-	outcome, err := s.db.ExecContext(ctx, `
-UPDATE capacity_events
-SET result = ?, reason = 'control plane restarted while processing', processed_at = ?
-WHERE result = ? AND received_at < ?`,
-		string(ResultAbandoned()), FormatTime(time.Now()), string(domain.ResultPending), FormatTime(olderThan))
-	if err != nil {
-		return 0, fmt.Errorf("abandon stale events: %w", err)
-	}
-	affected, _ := outcome.RowsAffected()
-	return int(affected), nil
+// ListPendingEvents returns unfinished intents in event-time order.
+func (s *SQLiteStore) ListPendingEvents(ctx context.Context, limit int) ([]EventRecord, error) {
+	return s.ListPendingEventsAfter(ctx, limit, time.Time{}, "")
 }
 
-// ResultAbandoned exposes the abandoned result value for SQL parameters.
-func ResultAbandoned() domain.EventResult { return domain.ResultAbandoned }
+// HasRevokeAfter retains the ordering barrier even when revoke arrived before
+// the instance ever existed. The event log serves as the absent-node tombstone.
+func (s *SQLiteStore) HasRevokeAfter(ctx context.Context, partnerID, instanceID, leaseID string, occurredAt time.Time) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT occurred_at FROM capacity_events
+WHERE partner_id = ? AND event_type = ? AND result IN (?, ?)
+AND json_valid(payload_json) AND json_extract(payload_json, '$.instance.id') = ?
+AND (COALESCE(json_extract(payload_json, '$.instance.lease_id'), '') = '' OR json_extract(payload_json, '$.instance.lease_id') = ?)`,
+		partnerID, string(domain.EventCapacityRevoked), string(domain.ResultApplied), string(domain.ResultPending), instanceID, leaseID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return false, err
+		}
+		at, err := ParseTime(value)
+		if err != nil {
+			return false, err
+		}
+		if at.After(occurredAt) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// ListPendingEventsAfter supports a bounded round-robin recovery scan so a
+// permanently blocked early event cannot starve later accepted intents.
+func (s *SQLiteStore) ListPendingEventsAfter(ctx context.Context, limit int, occurredAt time.Time, afterID string) ([]EventRecord, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT event_id, partner_id, event_type, payload_json, source, occurred_at, received_at, processed_at, result, reason
+FROM capacity_events WHERE result = ? AND (occurred_at > ? OR (occurred_at = ? AND event_id > ?))
+ORDER BY occurred_at, event_id LIMIT ?`, string(domain.ResultPending), FormatTime(occurredAt), FormatTime(occurredAt), afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending events: %w", err)
+	}
+	defer rows.Close()
+	var records []EventRecord
+	for rows.Next() {
+		record, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -305,7 +343,7 @@ func scanEvent(row rowScanner) (EventRecord, error) {
 const instanceColumns = `id, partner_id, endpoint, service_endpoint, lease_id, spec_json,
 	instance_state, service_state,
 	role, role_assigned_at, router_worker_id, readiness_generation, prepare_attempts, start_attempts,
-	drain_deadline_at, pending_release, lease_updated_at, last_error, last_seen_at, created_at, updated_at`
+	drain_deadline_at, pending_release, pending_update_json, lease_updated_at, last_error, last_seen_at, created_at, updated_at`
 
 // GetInstance reads one instance row.
 func (s *SQLiteStore) GetInstance(ctx context.Context, id string) (domain.Instance, error) {
@@ -393,6 +431,7 @@ func scanInstance(row rowScanner) (domain.Instance, error) {
 		routerWorkerID  sql.NullString
 		drainDeadline   sql.NullString
 		pendingRelease  int
+		pendingUpdate   sql.NullString
 		leaseUpdated    sql.NullString
 		lastError       sql.NullString
 		lastSeen        sql.NullString
@@ -402,7 +441,7 @@ func scanInstance(row rowScanner) (domain.Instance, error) {
 	if err := row.Scan(
 		&instance.ID, &instance.PartnerID, &instance.Endpoint, &serviceEndpoint, &leaseID, &specJSON,
 		&instanceState, &serviceState, &role, &roleAssignedAt, &routerWorkerID, &instance.ReadinessGeneration,
-		&instance.PrepareAttempts, &instance.StartAttempts, &drainDeadline, &pendingRelease, &leaseUpdated,
+		&instance.PrepareAttempts, &instance.StartAttempts, &drainDeadline, &pendingRelease, &pendingUpdate, &leaseUpdated,
 		&lastError, &lastSeen, &createdAt, &updatedAt,
 	); err != nil {
 		return domain.Instance{}, err
@@ -415,6 +454,11 @@ func scanInstance(row rowScanner) (domain.Instance, error) {
 	instance.ServiceState = domain.ServiceState(serviceState)
 	instance.LastError = lastError.String
 	instance.PendingRelease = pendingRelease != 0
+	if pendingUpdate.Valid && pendingUpdate.String != "" {
+		if err := json.Unmarshal([]byte(pendingUpdate.String), &instance.PendingUpdate); err != nil {
+			return domain.Instance{}, fmt.Errorf("decode pending update of instance %s: %w", instance.ID, err)
+		}
+	}
 	if specJSON != "" {
 		if err := json.Unmarshal([]byte(specJSON), &instance.Spec); err != nil {
 			return domain.Instance{}, fmt.Errorf("decode spec of instance %s: %w", instance.ID, err)
@@ -470,12 +514,81 @@ func (s *SQLiteStore) ApplyTransition(ctx context.Context, transition Transition
 		if next.InstanceState != domain.InstanceAllocating {
 			return fmt.Errorf("%w: instance %s", ErrNotFound, transition.InstanceID)
 		}
+		if verdict := domain.CheckCombination(next.InstanceState, next.ServiceState, next.Role); !verdict.Legal {
+			return domain.NewViolation(verdict.Code, verdict.Severity, "refuse initial state: %s", verdict.Reason)
+		}
 		if err := insertInstanceTx(ctx, tx, next); err != nil {
 			return err
 		}
 	case err != nil:
 		return err
 	default:
+		if transition.CreateOnly {
+			return ErrConflict
+		}
+		if (transition.ExpectPartnerID != "" && transition.ExpectPartnerID != current.PartnerID) ||
+			(transition.ExpectLeaseID != nil && *transition.ExpectLeaseID != current.LeaseID) ||
+			(!transition.ExpectLeaseUpdatedAt.IsZero() && !transition.ExpectLeaseUpdatedAt.Equal(current.LeaseUpdatedAt)) {
+			return fmt.Errorf("%w: instance lease changed", ErrConflict)
+		}
+		if !transition.RequestRelease && current.PartnerID != next.PartnerID {
+			return fmt.Errorf("%w: instance owner cannot change", ErrConflict)
+		}
+		if transition.RequestRelease && !transition.ReleaseObservedAt.IsZero() && current.PendingUpdate != nil &&
+			current.PendingUpdate.ObservedAt.After(transition.ReleaseObservedAt) {
+			return fmt.Errorf("%w: a newer identity update is pending", ErrConflict)
+		}
+		if transition.Reoffer {
+			if current.InstanceState != domain.InstanceReleased || current.ServiceState != domain.ServiceNone ||
+				current.PartnerID != next.PartnerID || next.LeaseID == "" || next.LeaseID == current.LeaseID ||
+				next.InstanceState != domain.InstanceAllocating || next.ServiceState != domain.ServiceNone || next.PendingRelease || next.Role != domain.RoleNone {
+				return ErrConflict
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE operations SET status = ?, last_error = ? WHERE instance_id = ? AND status IN (?, ?)`,
+				string(OpFailed), "superseded by a new lease", current.ID, string(OpPending), string(OpInProgress)); err != nil {
+				return err
+			}
+		}
+		if transition.RequestRelease {
+			if current.PendingRelease || current.InstanceState == domain.InstanceReleased {
+				return nil
+			}
+			deadline := next.DrainDeadlineAt
+			next = current
+			next.PendingRelease = true
+			if next.DrainDeadlineAt.IsZero() {
+				next.DrainDeadlineAt = deadline
+			}
+		} else if current.PendingRelease && next.InstanceState != domain.InstanceReleased {
+			if next.Endpoint != current.Endpoint || next.ServiceEndpoint != current.ServiceEndpoint || next.LeaseID != current.LeaseID {
+				return fmt.Errorf("%w: reclaim identity cannot change", ErrConflict)
+			}
+			// An earlier start/probe must never erase a newer reclaim request.
+			next.PendingRelease = true
+			next.DrainDeadlineAt = current.DrainDeadlineAt
+			if next.InstanceState != domain.InstanceLost && (next.ServiceState == domain.ServiceStarting ||
+				next.ServiceState == domain.ServiceHealthy || next.ServiceState == domain.ServiceRegistering ||
+				next.ServiceState == domain.ServiceServing) {
+				return fmt.Errorf("%w: instance %s is pending release", ErrConflict, current.ID)
+			}
+		}
+		if transition.ApplyPendingUpdate {
+			if current.PendingUpdate == nil || current.PendingRelease || current.ServiceState != domain.ServiceDraining ||
+				next.ServiceState != domain.ServiceNone || next.InstanceState != domain.InstancePreparing {
+				return fmt.Errorf("%w: pending identity update cannot be applied", ErrConflict)
+			}
+			update := current.PendingUpdate
+			next.Endpoint, next.ServiceEndpoint, next.LeaseID = update.Endpoint, update.ServiceEndpoint, update.LeaseID
+			next.Spec, next.LeaseUpdatedAt = update.Spec, update.ObservedAt
+			next.PendingUpdate = nil
+		} else if !transition.Reoffer {
+			// Probes and starts must not erase a concurrently queued update.
+			if next.PendingRelease || next.InstanceState == domain.InstanceReleased {
+				next.PendingUpdate = nil
+			} else if current.PendingUpdate != nil && (next.PendingUpdate == nil || next.PendingUpdate.ObservedAt.Before(current.PendingUpdate.ObservedAt)) {
+				next.PendingUpdate = current.PendingUpdate
+			}
+		}
 		if transition.ExpectInstanceState != "" && current.InstanceState != transition.ExpectInstanceState {
 			return fmt.Errorf("%w: instance %s is %s, expected %s",
 				ErrConflict, transition.InstanceID, current.InstanceState, transition.ExpectInstanceState)
@@ -484,8 +597,10 @@ func (s *SQLiteStore) ApplyTransition(ctx context.Context, transition Transition
 			return fmt.Errorf("%w: instance %s service is %s, expected %s",
 				ErrConflict, transition.InstanceID, current.ServiceState, transition.ExpectServiceState)
 		}
-		if err := domain.ValidateTransition(current, next); err != nil {
-			return err
+		if !transition.Reoffer {
+			if err := domain.ValidateTransition(current, next); err != nil {
+				return err
+			}
 		}
 		if verdict := domain.CheckCombination(next.InstanceState, next.ServiceState, next.Role); !verdict.Legal {
 			return domain.NewViolation(verdict.Code, verdict.Severity, "refuse %s -> %s/%s/%s: %s",
@@ -523,6 +638,10 @@ func insertInstanceTx(ctx context.Context, tx *sql.Tx, instance domain.Instance)
 	if err != nil {
 		return fmt.Errorf("encode spec: %w", err)
 	}
+	pendingJSON, err := json.Marshal(instance.PendingUpdate)
+	if err != nil {
+		return fmt.Errorf("encode pending update: %w", err)
+	}
 	now := time.Now().UTC()
 	if instance.CreatedAt.IsZero() {
 		instance.CreatedAt = now
@@ -531,14 +650,14 @@ func insertInstanceTx(ctx context.Context, tx *sql.Tx, instance domain.Instance)
 INSERT INTO capacity_instances (
     id, partner_id, endpoint, service_endpoint, lease_id, spec_json, instance_state, service_state, role,
     role_assigned_at, router_worker_id, readiness_generation, prepare_attempts, start_attempts,
-    drain_deadline_at, pending_release, lease_updated_at, last_error, last_seen_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    drain_deadline_at, pending_release, pending_update_json, lease_updated_at, last_error, last_seen_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		instance.ID, instance.PartnerID, instance.Endpoint, nullString(instance.ServiceEndpoint),
 		nullString(instance.LeaseID), string(specJSON),
 		string(instance.InstanceState), string(instance.ServiceState), nullString(string(instance.Role)),
 		nullTime(instance.RoleAssignedAt), nullString(instance.RouterWorkerID), instance.ReadinessGeneration,
 		instance.PrepareAttempts, instance.StartAttempts, nullTime(instance.DrainDeadlineAt),
-		boolInt(instance.PendingRelease), nullTime(instance.LeaseUpdatedAt),
+		boolInt(instance.PendingRelease), string(pendingJSON), nullTime(instance.LeaseUpdatedAt),
 		nullString(instance.LastError), nullTime(instance.LastSeenAt),
 		FormatTime(instance.CreatedAt), FormatTime(now))
 	if err != nil {
@@ -555,18 +674,22 @@ func updateInstanceTx(ctx context.Context, tx *sql.Tx, current, next domain.Inst
 	if err != nil {
 		return fmt.Errorf("encode spec: %w", err)
 	}
+	pendingJSON, err := json.Marshal(next.PendingUpdate)
+	if err != nil {
+		return fmt.Errorf("encode pending update: %w", err)
+	}
 	_, err = tx.ExecContext(ctx, `
 UPDATE capacity_instances SET
     partner_id = ?, endpoint = ?, service_endpoint = ?, lease_id = ?, spec_json = ?,
     instance_state = ?, service_state = ?, role = ?, role_assigned_at = ?, router_worker_id = ?,
     readiness_generation = ?, prepare_attempts = ?, start_attempts = ?, drain_deadline_at = ?,
-    pending_release = ?, lease_updated_at = ?, last_error = ?, last_seen_at = ?, updated_at = ?
+    pending_release = ?, pending_update_json = ?, lease_updated_at = ?, last_error = ?, last_seen_at = ?, updated_at = ?
 WHERE id = ?`,
 		next.PartnerID, next.Endpoint, nullString(next.ServiceEndpoint), nullString(next.LeaseID), string(specJSON),
 		string(next.InstanceState), string(next.ServiceState), nullString(string(next.Role)),
 		nullTime(next.RoleAssignedAt), nullString(next.RouterWorkerID), next.ReadinessGeneration,
 		next.PrepareAttempts, next.StartAttempts, nullTime(next.DrainDeadlineAt),
-		boolInt(next.PendingRelease), nullTime(next.LeaseUpdatedAt), nullString(next.LastError),
+		boolInt(next.PendingRelease), string(pendingJSON), nullTime(next.LeaseUpdatedAt), nullString(next.LastError),
 		nullTime(next.LastSeenAt), FormatTime(time.Now()), next.ID)
 	if err != nil {
 		return fmt.Errorf("update instance %s: %w", next.ID, err)

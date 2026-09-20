@@ -268,7 +268,7 @@ func diffInstances(previous, current []CapacityInstance) (added, updated []Capac
 }
 
 func instanceChanged(before, after CapacityInstance) bool {
-	if before.Endpoint != after.Endpoint || before.LeaseID != after.LeaseID {
+	if before.Endpoint != after.Endpoint || before.ServiceEndpoint != after.ServiceEndpoint || before.LeaseID != after.LeaseID {
 		return true
 	}
 	if !before.LeaseUpdatedAt.Equal(after.LeaseUpdatedAt) {

@@ -122,6 +122,17 @@ type RoleStateCount struct {
 
 // Transition is one atomic state change request.
 type Transition struct {
+	// CreateOnly refuses to overwrite an existing capacity row.
+	CreateOnly bool
+	// Reoffer explicitly begins a new lease of a released container. Ordinary
+	// lifecycle transitions cannot resurrect it.
+	Reoffer bool
+	// ApplyPendingUpdate consumes the latest queued identity after the old
+	// service has stopped, within the same transaction as the state change.
+	ApplyPendingUpdate bool
+	// RequestRelease atomically records a reclaim intent against the latest row.
+	// Only Next.DrainDeadlineAt is used; a stale caller cannot replace live state.
+	RequestRelease bool
 	// InstanceID identifies the row to update.
 	InstanceID string
 	// Next is the desired instance row. CreatedAt/UpdatedAt are overwritten.
@@ -132,6 +143,12 @@ type Transition struct {
 	// exist yet, the only accepted Next.InstanceState is ALLOCATING.
 	ExpectInstanceState domain.InstanceState
 	ExpectServiceState  domain.ServiceState
+	// Optional identity guards stop a stale revoke crossing a lease boundary.
+	ExpectPartnerID      string
+	ExpectLeaseID        *string
+	ExpectLeaseUpdatedAt time.Time
+	// ReleaseObservedAt prevents an older revoke cancelling a newer queued identity.
+	ReleaseObservedAt time.Time
 
 	// Operation, when set, is upserted in the same transaction.
 	Operation *Operation
@@ -148,7 +165,9 @@ type Store interface {
 	CompleteEvent(ctx context.Context, eventID string, result domain.EventResult, reason string) error
 	GetEvent(ctx context.Context, eventID string) (EventRecord, error)
 	ListRecentEvents(ctx context.Context, limit int) ([]EventRecord, error)
-	AbandonStaleEvents(ctx context.Context, olderThan time.Time) (int, error)
+	ListPendingEvents(ctx context.Context, limit int) ([]EventRecord, error)
+	ListPendingEventsAfter(ctx context.Context, limit int, occurredAt time.Time, afterID string) ([]EventRecord, error)
+	HasRevokeAfter(ctx context.Context, partnerID, instanceID, leaseID string, occurredAt time.Time) (bool, error)
 
 	GetInstance(ctx context.Context, id string) (domain.Instance, error)
 	ListInstances(ctx context.Context) ([]domain.Instance, error)

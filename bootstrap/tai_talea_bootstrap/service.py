@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -106,6 +107,25 @@ class BootstrapState:
 STARTUP_GRACE_SECONDS = 0.25
 
 
+def _proc_stat(pid):
+    """Linux process identity; comm can itself contain spaces and parentheses."""
+    fields = Path("/proc/%s/stat" % pid).read_text().rsplit(")", 1)[1].split()
+    return fields[0], int(fields[2]), int(fields[3]), int(fields[19])
+
+
+def _own_process_group(process):
+    # Popen(start_new_session=True) made this child the session/group leader.
+    # Never infer group ownership from an arbitrary injected runner or a PID
+    # lookup after the leader has exited (its PID may have been reused).
+    if os.name == "posix":
+        process._talea_pgid = process.pid
+        try:
+            process._talea_start_time = _proc_stat(process.pid)[3]
+        except (OSError, ValueError, IndexError):
+            process._talea_start_time = None
+    return process
+
+
 class SGLangService:
     """Owns the SGLang child process, the health probe and the exit code."""
 
@@ -118,6 +138,10 @@ class SGLangService:
         self._health_probe = health_probe or self._probe_http_health
         self._now = now or time.time
         self._lock = threading.RLock()
+        self._start_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._generation = 0
+        self._stopping = False
         self._process = None
         self.state = BootstrapState(environment=profile.as_dict())
 
@@ -125,11 +149,13 @@ class SGLangService:
 
     def status(self):
         with self._lock:
+            self._refresh_process()
             return self.state.as_dict()
 
     def health(self):
         """Health surface: the bootstrap is up, and whether SGLang answers."""
         with self._lock:
+            self._refresh_process()
             phase = self.state.phase
             pid = self.state.service_pid
             port = self._port
@@ -145,6 +171,18 @@ class SGLangService:
             "service_id": str(pid),
         }
 
+    def _refresh_process(self):
+        """Observe exits after the initial startup grace period, under the lock."""
+        if self.state.phase != PHASE_RUNNING or self._process is None:
+            return
+        code = self._process.poll()
+        if code is None:
+            return
+        self.state.exit_code = code
+        self.state.stopped_at = self._now()
+        self.state.last_error = "sglang exited unexpectedly with code %s" % code
+        self.state.record(PHASE_FAILED, self.state.last_error)
+
     @property
     def _port(self):
         return getattr(self, "_bound_port", 31000)
@@ -154,10 +192,26 @@ class SGLangService:
     def start(self, role, model_id, model_path="", port=31000, extra_args=(), log_file="",
               prepare_environment=True):
         """Prepare the environment and start SGLang for one role."""
+        if not self._start_lock.acquire(blocking=False):
+            return StartResult(False, self.state.phase, "a service is already starting")
+        try:
+            return self._start(role, model_id, model_path, port, extra_args, log_file,
+                               prepare_environment)
+        finally:
+            self._start_lock.release()
+
+    def _start(self, role, model_id, model_path, port, extra_args, log_file,
+               prepare_environment):
         with self._lock:
-            if self.state.phase in (PHASE_RUNNING, PHASE_STARTING, PHASE_INSTALLING):
+            self._refresh_process()
+            alive = self._process is not None and self._process_alive(self._process)
+            if (self._stopping or alive or self.state.phase in
+                    (PHASE_RUNNING, PHASE_STARTING, PHASE_INSTALLING, PHASE_STOPPING)):
                 return StartResult(False, self.state.phase,
                                    "a service is already %s" % self.state.phase)
+            self._generation += 1
+            generation = self._generation
+            self.state.phase = PHASE_INSTALLING if prepare_environment else PHASE_STARTING
             self._bound_port = port
             self.state.role = role
             self.state.model_id = model_id
@@ -174,6 +228,8 @@ class SGLangService:
         try:
             if prepare_environment:
                 with self._lock:
+                    if generation != self._generation:
+                        return StartResult(False, self.state.phase, "start was cancelled by stop")
                     self.state.record(PHASE_INSTALLING, "preparing the offline virtualenv")
                 python_executable = self.installer.prepare()
             command = self._command_factory(
@@ -181,22 +237,24 @@ class SGLangService:
                 python_executable=python_executable, extra_args=extra_args,
             )
         except ConfigurationError as error:
-            return self._fail(str(error), exitcodes.EXIT_BAD_REQUEST)
+            return self._start_failure(generation, str(error), exitcodes.EXIT_BAD_REQUEST)
         except Exception as error:  # environment preparation failures
-            return self._fail("environment preparation failed: %s" % error,
-                              exitcodes.EXIT_ENV_INSTALL_FAILED)
+            return self._start_failure(generation, "environment preparation failed: %s" % error,
+                                       exitcodes.EXIT_ENV_INSTALL_FAILED)
 
         with self._lock:
+            if generation != self._generation:
+                return StartResult(False, self.state.phase, "start was cancelled by stop")
             self.state.command = render_command(command)
             self.state.started_at = self._now()
             self.state.record(PHASE_STARTING, self.state.command)
 
-        try:
-            process = self._spawn(command, log_file=log_file)
-        except Exception as error:
-            return self._fail("could not spawn sglang: %s" % error, exitcodes.EXIT_START_FAILED)
-
-        with self._lock:
+            # Keep process publication atomic with respect to stop. Otherwise a
+            # stop between spawn and assignment can report success yet orphan it.
+            try:
+                process = self._spawn(command, log_file=log_file)
+            except Exception as error:
+                return self._fail("could not spawn sglang: %s" % error, exitcodes.EXIT_START_FAILED)
             self._process = process
             self.state.service_pid = process.pid
             self.state.started_count += 1
@@ -207,13 +265,22 @@ class SGLangService:
         # it was checked, so a dead service was reported as RUNNING with
         # exit_code 0.
         time.sleep(STARTUP_GRACE_SECONDS)
-        if process.poll() is not None:
-            code = getattr(process, "returncode", None)
-            if code is None:
-                code = process.poll()
-            return self._fail("sglang exited immediately with code %s" % code,
-                              exitcodes.EXIT_SERVICE_CRASHED)
-        return StartResult(True, PHASE_RUNNING, self.state.command)
+        with self._lock:
+            if generation != self._generation:
+                return StartResult(False, self.state.phase, "start was cancelled by stop")
+            if process.poll() is not None:
+                code = getattr(process, "returncode", None)
+                if code is None:
+                    code = process.poll()
+                return self._fail("sglang exited immediately with code %s" % code,
+                                  exitcodes.EXIT_SERVICE_CRASHED)
+            return StartResult(True, PHASE_RUNNING, self.state.command)
+
+    def _start_failure(self, generation, message, code):
+        with self._lock:
+            if generation != self._generation:
+                return StartResult(False, self.state.phase, "start was cancelled by stop")
+            return self._fail(message, code)
 
     def _spawn(self, command, log_file=""):
         """Start the service, capturing its output when a log file is given.
@@ -224,57 +291,85 @@ class SGLangService:
         """
         if self._runner is not None:
             return self._runner(command)
+        environment = os.environ.copy()
+        environment["VIRTUAL_ENV"] = self.profile.virtualenv
+        environment["PATH"] = (
+            os.path.dirname(self.installer.python_executable)
+            + os.pathsep + environment.get("PATH", "")
+        )
         if log_file:
             # Append, so repeated starts keep their history. The parent's copy
             # of the handle is closed below; the child keeps its own.
             output = open(log_file, "ab")  # noqa: SIM115 - closed after Popen
             try:
-                return subprocess.Popen(  # noqa: S603 - the vector is allowlisted
+                return _own_process_group(subprocess.Popen(  # noqa: S603 - the vector is allowlisted
                     command, stdout=output, stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
+                    start_new_session=True, env=environment,
+                ))
             finally:
                 output.close()
-        return subprocess.Popen(  # noqa: S603 - the vector is built from an allowlist
+        return _own_process_group(subprocess.Popen(  # noqa: S603 - the vector is built from an allowlist
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+            start_new_session=True, env=environment,
+        ))
 
     # --------------------------------------------------------------- stop
 
     def stop(self, timeout=60.0, force=False):
         """Stop SGLang and report the final exit code (§9)."""
+        with self._stop_lock:
+            with self._lock:
+                self._generation += 1
+                self._stopping = True
+            try:
+                return self._stop(timeout, force)
+            finally:
+                with self._lock:
+                    self._stopping = False
+
+    def _stop(self, timeout, force):
         with self._lock:
             process = self._process
-            if process is None or process.poll() is not None:
+            if process is None or not self._process_alive(process):
+                self._process = None
                 self.state.stopped_at = self._now()
                 self.state.service_pid = 0
                 if self.state.phase != PHASE_FAILED:
-                    self.state.record(PHASE_STOPPED, "no service was running")
                     self.state.exit_code = exitcodes.EXIT_OK
+                self.state.record(PHASE_STOPPED, "no service was running")
                 return StopResult(self.state.phase, self.state.exit_code, False, "nothing to stop")
             self.state.record(PHASE_STOPPING, "graceful stop requested")
             self.state.stopped_count += 1
 
-        if not force:
+        if force:
+            self._kill(process)
+        else:
             self._terminate(process)
         deadline = self._now() + max(0.0, float(timeout))
         while self._now() < deadline:
-            if process.poll() is not None:
+            if not self._process_alive(process):
                 break
             time.sleep(0.05)
 
-        timed_out = process.poll() is None
+        timed_out = self._process_alive(process)
         if timed_out:
             self._kill(process)
             self._wait_briefly(process)
 
         exit_code = process.poll()
-        if exit_code is None:
-            exit_code = exitcodes.EXIT_STOP_TIMEOUT
-        elif exit_code != 0 and not timed_out:
+        if self._process_alive(process):
+            with self._lock:
+                self.state.exit_code = exitcodes.EXIT_STOP_TIMEOUT
+                self.state.last_error = "sglang process group is still alive after forced termination"
+                self.state.record(PHASE_FAILED, self.state.last_error)
+            return StopResult(PHASE_FAILED, exitcodes.EXIT_STOP_TIMEOUT, True,
+                              self.state.last_error)
+        expected_signals = (-signal.SIGTERM,)
+        if force:
+            expected_signals += (-getattr(signal, "SIGKILL", 9),)
+        if exit_code != 0 and exit_code not in expected_signals and not timed_out:
             # The service already crashed on its own: keep the crash code.
             exit_code = exitcodes.EXIT_SERVICE_CRASHED
         elif timed_out:
@@ -294,29 +389,80 @@ class SGLangService:
             else:
                 self.state.phase = PHASE_STOPPED
         return StopResult(self.state.phase, exit_code, timed_out,
-                          "forced kill after the deadline" if timed_out else "")
+                          "forced kill after the deadline" if timed_out else
+                          ("forced stop requested" if force else ""))
 
     def _terminate(self, process):
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        except (OSError, AttributeError):
-            try:
-                process.terminate()
-            except OSError:
-                pass
+        self._signal(process, signal.SIGTERM, process.terminate)
 
     def _kill(self, process):
+        self._signal(process, getattr(signal, "SIGKILL", 9), process.kill)
+
+    def _signal(self, process, signum, fallback):
+        pgid = getattr(process, "_talea_pgid", None)
+        if pgid is not None:
+            if self._group_alive(process):
+                try:
+                    os.killpg(pgid, signum)
+                except OSError:
+                    pass
+            return
+        # Custom runners are not known to own a process group. They must never
+        # cause us to signal the bootstrap's or another application's group.
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (OSError, AttributeError):
+            if process.poll() is None:
+                fallback()
+        except OSError:
+            pass
+
+    def _group_alive(self, process):
+        pgid = getattr(process, "_talea_pgid", None)
+        if pgid is None:
+            return False
+        if Path("/proc/self/stat").is_file():
             try:
-                process.kill()
+                # A different leader at this PID means the old group is gone.
+                identity = _proc_stat(pgid)
+                original = getattr(process, "_talea_start_time", None)
+                if original is not None and identity[3] != original:
+                    process._talea_pgid = None
+                    return False
+            except FileNotFoundError:
+                pass  # The leader exited; its children can still own the group.
+            except (OSError, ValueError, IndexError):
+                return True
+            try:
+                for entry in Path("/proc").iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        state, group, session, _ = _proc_stat(entry.name)
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, ValueError, IndexError):
+                        return True
+                    if group == pgid and session == pgid and state not in ("Z", "X"):
+                        return True
             except OSError:
-                pass
+                return True
+            # Zombies hold no GPU memory; container PID 1 may delay reaping them.
+            process._talea_pgid = None
+            return False
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            process._talea_pgid = None
+            return False
+        except OSError:
+            return True
+
+    def _process_alive(self, process):
+        return process.poll() is None or self._group_alive(process)
 
     def _wait_briefly(self, process, timeout=5.0):
         deadline = self._now() + timeout
-        while self._now() < deadline and process.poll() is None:
+        while self._now() < deadline and self._process_alive(process):
             time.sleep(0.05)
 
     # ------------------------------------------------------------ failures

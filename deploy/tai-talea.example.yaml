@@ -1,7 +1,7 @@
 # SGLang containerised instance capacity control plane.
 #
-# This file is the complete milestone 1 surface. Every field is validated on
-# startup; `tai-talea --check-config` verifies it without serving.
+# Configuration template. Replace credentials, addresses and runtime versions.
+# `tai-talea --check-config` validates the configuration without serving.
 
 server:
   # The Push API and the admin API share one listener. Bind the admin surface to
@@ -17,6 +17,14 @@ server:
 
 storage:
   sqlite_path: /var/lib/tai-talea/tai-talea.db
+
+# Enable web SSH onboarding after preparing the fixed artifacts and manifest.
+# See docs/ssh-onboarding.md; leave this commented to disable first installation.
+# onboarding:
+#   python: /opt/tai-talea/provision-venv/bin/python
+#   script: /opt/tai-talea/provision/ssh_install.py
+#   manifest: /etc/tai-talea/onboarding-manifest.json
+#   state_dir: /var/lib/tai-talea/onboarding
 
 controller:
   # §13 default reconcile cadence.
@@ -53,6 +61,8 @@ router:
   url: http://127.0.0.1:30001
   mode: readiness-v1
   timeout: 10s
+  # Must match the SGLang prefill disaggregation bootstrap port.
+  prefill_bootstrap_port: 8998
 
 planner:
   # §11 manual gear. Supported: 1:1, 2:1, 1:2.
@@ -64,8 +74,8 @@ planner:
   # did not offer.
   max_serving: 0
 
-# Milestone 2 turns Pull reconciliation into the authoritative capacity source.
-# The mechanism already ships, so enabling it is a configuration change.
+# Enable after validating the partner's complete snapshot/release contract.
+# Both HTTP queries must provide a consistent, complete, unpaginated view.
 pull:
   enabled: false
   interval: 30s
@@ -91,6 +101,8 @@ partners:
     # static: capacity comes from this file (M1 local harness and partners
     # without a live API). http: a generic JSON partner API.
     adapter: static
+    # Optional partner-scoped web access; use a unique random token (16+ chars).
+    # console_token: replace-with-unique-partner-console-token
     # §6.1 partner credential presented as `Authorization: Bearer <push_token>`.
     push_token: partner-a-push-token
     # HMAC-SHA256 secret used to sign `<timestamp>.<body>`.

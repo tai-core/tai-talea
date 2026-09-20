@@ -179,11 +179,12 @@ def command_serve(args):
         serve(service, host=args.host, port=args.port, token=token, stop_event=stop_event,
               log_dir=args.log_dir)
     finally:
-        if service.state.phase not in ("STOPPED", "FAILED"):
+        failed_before_shutdown = service.state.phase == "FAILED"
+        if service.state.phase != "STOPPED":
             service.stop(timeout=args.stop_timeout)
 
     code = service.state.exit_code
-    if code == exitcodes.EXIT_OK and service.state.phase == "FAILED":
+    if code == exitcodes.EXIT_OK and (failed_before_shutdown or service.state.phase == "FAILED"):
         code = exitcodes.EXIT_START_FAILED
     return code
 

@@ -132,8 +132,8 @@ type StopResult struct {
 
 // Client is a stateless bootstrap client. The endpoint is supplied per call so
 // one client serves every container; the shared secret is fixed for the whole
-// deployment, because partner consoles create the containers and the value has
-// to be provisioned on both sides by hand.
+// deployment. SSH onboarding provisions it automatically; preinstalled workers
+// must be configured with the same value.
 type Client struct {
 	http  *http.Client
 	token string
@@ -159,13 +159,24 @@ func NewWithHTTPClient(client *http.Client, token string) (*Client, error) {
 		// unauthenticated bootstrap, which must never exist.
 		return nil, errors.New("bootstrap shared secret is required")
 	}
-	return &Client{http: client, token: strings.TrimSpace(token)}, nil
+	// X-Bootstrap-Token is a custom header and Go would forward it across a
+	// redirect, even to a different host. Clone the client to preserve callers'
+	// transport while refusing redirects on the authenticated control channel.
+	bounded := *client
+	bounded.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &Client{http: &bounded, token: strings.TrimSpace(token)}, nil
 }
 
 // Health probes GET /bootstrap/health.
 func (c *Client) Health(ctx context.Context, endpoint string) (Health, error) {
 	var health Health
 	if err := c.call(ctx, endpoint, http.MethodGet, PathHealth, nil, &health); err != nil {
+		var statusErr *HTTPStatusError
+		// A structured FAILED service response proves bootstrap reachability;
+		// keep the failure phase so lifecycle code can restart the model.
+		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusServiceUnavailable && json.Unmarshal([]byte(statusErr.Body), &health) == nil && health.Phase == PhaseFailed && health.Status == "failed" && health.Version != "" {
+			return health, nil
+		}
 		return Health{}, err
 	}
 	return health, nil
@@ -201,7 +212,7 @@ func (c *Client) Start(ctx context.Context, endpoint string, request StartReques
 		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnprocessableEntity {
 			// Confirm against the status surface: a RUNNING phase means the
 			// service this request asked for is already being supervised.
-			if status, statusErr2 := c.Status(ctx, endpoint); statusErr2 == nil && status.Phase == PhaseRunning {
+			if status, statusErr2 := c.Status(ctx, endpoint); statusErr2 == nil && status.Phase == PhaseRunning && status.Role == string(request.Role) && status.ModelID == request.ModelID {
 				return fmt.Errorf("%w: %s", ErrAlreadyRunning, endpoint)
 			}
 		}

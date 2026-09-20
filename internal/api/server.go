@@ -15,12 +15,14 @@ import (
 	"github.com/tai-core/tai-talea/internal/controller"
 	"github.com/tai-core/tai-talea/internal/domain"
 	"github.com/tai-core/tai-talea/internal/obs"
+	"github.com/tai-core/tai-talea/internal/onboarding"
 	"github.com/tai-core/tai-talea/internal/planner"
 	"github.com/tai-core/tai-talea/internal/store"
 )
 
 // Options configures the HTTP surface.
 type Options struct {
+	Onboarding *onboarding.Manager
 	Config     config.Config
 	Store      store.Store
 	Controller *controller.Controller
@@ -59,6 +61,7 @@ func New(opts Options) (*Server, error) {
 // Handler returns the fully wired HTTP handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	s.registerConsole(mux)
 
 	// Partner Push API (§6.1).
 	mux.HandleFunc("POST /v1/capacity/events", s.handlePushEvent)
@@ -68,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/capacity/instances/{id}", s.admin(s.handleGetInstance))
 	mux.HandleFunc("POST /v1/capacity/instances/{id}/drain", s.admin(s.handleDrainInstance))
 	mux.HandleFunc("POST /v1/capacity/instances/{id}/release", s.admin(s.handleReleaseInstance))
+	mux.HandleFunc("POST /v1/capacity/instances/{id}/reclaim", s.admin(s.handleReclaimInstance))
 	mux.HandleFunc("GET /v1/capacity/instances/{id}/audit", s.admin(s.handleInstanceAudit))
 	mux.HandleFunc("GET /v1/capacity/events", s.admin(s.handleListEvents))
 	mux.HandleFunc("GET /v1/capacity/planner", s.admin(s.handleGetPlanner))
@@ -274,6 +278,15 @@ func (s *Server) handleListInstances(writer http.ResponseWriter, request *http.R
 		s.writeStoreError(writer, err)
 		return
 	}
+	if owner := consolePartner(request); owner != "" {
+		filtered := []domain.Instance{}
+		for _, instance := range instances {
+			if instance.PartnerID == owner {
+				filtered = append(filtered, instance)
+			}
+		}
+		instances = filtered
+	}
 	writeJSON(writer, http.StatusOK, map[string]any{"instances": instances, "count": len(instances)})
 }
 
@@ -336,9 +349,11 @@ func (s *Server) handleListEvents(writer http.ResponseWriter, request *http.Requ
 
 func (s *Server) handleGetPlanner(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]any{
-		"gear":        s.opts.Controller.Planner().Config().Gear,
-		"gears":       planner.GearNames(),
-		"last_change": s.opts.Controller.Planner().LastChangeAt(),
+		"mode":               "fixed",
+		"last_observed_load": s.opts.Controller.Planner().LastObservedLoad(),
+		"gear":               s.opts.Controller.Planner().Config().Gear,
+		"gears":              planner.GearNames(),
+		"last_change":        s.opts.Controller.Planner().LastChangeAt(),
 	})
 }
 

@@ -30,6 +30,7 @@ import hmac
 import json
 import os
 import logging
+import math
 import signal
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -209,7 +210,7 @@ class BootstrapHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._write(400, {"error": "invalid_payload", "message": "timeout must be a number"})
             return
-        if timeout < 0 or timeout > 3600:
+        if not math.isfinite(timeout) or timeout < 0 or timeout > 3600:
             self._write(400, {"error": "invalid_payload", "message": "timeout must be between 0 and 3600"})
             return
         result = self.service.stop(timeout=timeout, force=bool(payload.get("force", False)))
@@ -245,7 +246,13 @@ def serve(service, host=DEFAULT_HOST, port=8080, token="", stop_event=None, log_
 
     def _shutdown(_signum=None, _frame=None):
         stop_event.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    def _watch_stop():
+        stop_event.wait()
+        server.shutdown()
+
+    watcher = threading.Thread(target=_watch_stop, daemon=True)
+    watcher.start()
 
     previous = {}
     for name in ("SIGTERM", "SIGINT"):
@@ -262,7 +269,9 @@ def serve(service, host=DEFAULT_HOST, port=8080, token="", stop_event=None, log_
     try:
         server.serve_forever(poll_interval=0.2)
     finally:
+        stop_event.set()
         server.server_close()
+        watcher.join(timeout=1)
         for number, handler in previous.items():
             try:
                 signal.signal(number, handler)

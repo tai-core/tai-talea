@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/tai-core/tai-talea/internal/domain"
+	"github.com/tai-core/tai-talea/internal/partner"
 	"github.com/tai-core/tai-talea/internal/planner"
 	"github.com/tai-core/tai-talea/internal/routeradapter"
 )
@@ -51,6 +53,15 @@ type StorageConfig struct {
 	SQLitePath string `yaml:"sqlite_path" json:"sqlite_path"`
 }
 
+// OnboardingConfig points to the operator-installed, fixed SSH provisioner.
+// Credentials and resumable jobs live under StateDir, never in the API output.
+type OnboardingConfig struct {
+	Python   string `yaml:"python" json:"python"`
+	Script   string `yaml:"script" json:"script"`
+	Manifest string `yaml:"manifest" json:"manifest"`
+	StateDir string `yaml:"state_dir" json:"state_dir"`
+}
+
 // ControllerConfig configures lifecycle orchestration.
 type ControllerConfig struct {
 	ReconcileInterval  Duration `yaml:"reconcile_interval" json:"reconcile_interval"`
@@ -69,10 +80,8 @@ type ControllerConfig struct {
 	// every /bootstrap call. Required: an empty value would mean talking to an
 	// interface that anyone able to reach the port could drive.
 	//
-	// One secret covers the whole deployment because partner consoles create the
-	// containers, so the value has to be provisioned on both sides by hand. Per
-	// partner or per instance secrets would need programmatic instance creation,
-	// which the M1 partner platform does not expose.
+	// One secret covers the deployment. SSH onboarding provisions it on workers;
+	// externally prepared containers must be configured with the same value.
 	BootstrapToken    string   `yaml:"bootstrap_token" json:"bootstrap_token"`
 	SandboxDirs       []string `yaml:"sandbox_dirs" json:"sandbox_dirs"`
 	ModelID           string   `yaml:"model_id" json:"model_id"`
@@ -130,9 +139,8 @@ func (c PlannerConfig) ToPlanner() planner.Config {
 
 // PullConfig configures partner reconciliation.
 //
-// Milestone 1 keeps this disabled: the design document schedules
-// "Pull 对账成为权威来源" for M2. The mechanism is implemented and tested so that
-// enabling it is a configuration change.
+// Disabled by default. Enable only after validating the partner adapter's
+// complete snapshot and release contract against the target platform.
 type PullConfig struct {
 	Enabled          bool     `yaml:"enabled" json:"enabled"`
 	Interval         Duration `yaml:"interval" json:"interval"`
@@ -168,7 +176,8 @@ type PartnerHTTPConfig struct {
 
 // PartnerConfig describes one partner integration.
 type PartnerConfig struct {
-	ID string `yaml:"id" json:"id"`
+	ID           string `yaml:"id" json:"id"`
+	ConsoleToken string `yaml:"console_token" json:"console_token"`
 	// Adapter is "static" or "http".
 	Adapter string `yaml:"adapter" json:"adapter"`
 	// PushToken authenticates the partner on POST /v1/capacity/events.
@@ -199,6 +208,7 @@ type StaticInstanceConfig struct {
 
 // Config is the whole control plane configuration.
 type Config struct {
+	Onboarding   OnboardingConfig `yaml:"onboarding" json:"onboarding"`
 	Server       ServerConfig     `yaml:"server" json:"server"`
 	Storage      StorageConfig    `yaml:"storage" json:"storage"`
 	Controller   ControllerConfig `yaml:"controller" json:"controller"`
@@ -276,6 +286,10 @@ func Load(path string) (Config, error) {
 	if err := decoder.Decode(&config); err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return Config{}, errors.New("config must contain exactly one YAML document")
+	}
 	if err := config.Validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
 	}
@@ -330,6 +344,13 @@ func (c Config) Validate() error {
 		return errors.New("at least one partner must be configured")
 	}
 	seen := make(map[string]bool, len(c.Partners))
+	consoleTokens := map[string]bool{c.Server.AdminToken: true}
+	for _, p := range c.Partners {
+		if consoleTokens[p.PushToken] {
+			return errors.New("partner push_token must be distinct from admin_token and other partner tokens")
+		}
+		consoleTokens[p.PushToken] = true
+	}
 	for index, partner := range c.Partners {
 		if err := partner.Validate(); err != nil {
 			return fmt.Errorf("partners[%d]: %w", index, err)
@@ -338,6 +359,15 @@ func (c Config) Validate() error {
 			return fmt.Errorf("partners[%d]: duplicate partner id %q", index, partner.ID)
 		}
 		seen[partner.ID] = true
+		if partner.ConsoleToken != "" {
+			if len(partner.ConsoleToken) < 16 || consoleTokens[partner.ConsoleToken] {
+				return fmt.Errorf("partners[%d]: console_token must be at least 16 characters and distinct from all other credentials", index)
+			}
+			consoleTokens[partner.ConsoleToken] = true
+		}
+	}
+	if c.Onboarding.Script != "" && (c.Onboarding.StateDir == "" || c.Onboarding.Manifest == "") {
+		return errors.New("onboarding.state_dir and manifest are required")
 	}
 	if err := c.ImageProfile.Validate(); err != nil {
 		return fmt.Errorf("image_profile: %w", err)
@@ -376,7 +406,7 @@ func (p PartnerConfig) Validate() error {
 	}
 	switch p.Adapter {
 	case "static":
-		if len(p.Instances) == 0 {
+		if len(p.Instances) == 0 && p.ConsoleToken == "" {
 			return errors.New("static adapter requires at least one instance")
 		}
 		seen := make(map[string]bool, len(p.Instances))
@@ -390,8 +420,8 @@ func (p PartnerConfig) Validate() error {
 			seen[instance.ID] = true
 		}
 	case "http":
-		if strings.TrimSpace(p.HTTP.BaseURL) == "" {
-			return errors.New("http adapter requires http.base_url")
+		if err := (partner.HTTPAdapterConfig{PartnerID: p.ID, BaseURL: p.HTTP.BaseURL, Timeout: p.HTTP.Timeout.Duration()}).Validate(); err != nil {
+			return fmt.Errorf("http adapter: %w", err)
 		}
 	default:
 		return fmt.Errorf("adapter must be static or http, got %q", p.Adapter)

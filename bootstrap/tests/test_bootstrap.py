@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from http.client import HTTPConnection
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,7 +31,7 @@ from tai_talea_bootstrap.roles import (  # noqa: E402
     build_sglang_command,
     validate_extra_args,
 )
-from tai_talea_bootstrap.server import ENV_TOKEN, HEADER_TOKEN, BootstrapServer  # noqa: E402
+from tai_talea_bootstrap.server import ENV_TOKEN, HEADER_TOKEN, BootstrapServer, serve  # noqa: E402
 from tai_talea_bootstrap.service import (  # noqa: E402
     PHASE_FAILED,
     PHASE_IDLE,
@@ -288,6 +289,151 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(second.accepted)
         self.assertIn("already", second.detail)
 
+    def test_concurrent_start_cannot_spawn_a_second_process(self):
+        entered, release = threading.Event(), threading.Event()
+        spawned = []
+
+        def command(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return build_sglang_command(*args, **kwargs)
+
+        service = self.make_service(command_factory=command)
+        service._runner = lambda argv: spawned.append(argv) or FakeProcess()
+        results = []
+        worker = threading.Thread(target=lambda: results.append(service.start("prefill", "model-a", prepare_environment=False)))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertFalse(service.start("decode", "model-a", prepare_environment=False).accepted)
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(results[0].accepted)
+        self.assertEqual(len(spawned), 1)
+
+    def test_stop_during_preparation_prevents_a_late_start(self):
+        entered, release = threading.Event(), threading.Event()
+        installer = FakeInstaller()
+
+        def prepare():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return installer.python_executable
+
+        installer.prepare = prepare
+        service = self.make_service(installer=installer)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(service.start("prefill", "model-a")))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertEqual(service.stop(timeout=0).phase, PHASE_STOPPED)
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(results[0].accepted)
+        self.assertEqual(service.state.started_count, 0)
+        self.assertEqual(service.status()["phase"], PHASE_STOPPED)
+
+    def test_cancelled_preparation_error_does_not_overwrite_stop_or_next_start(self):
+        entered, release = threading.Event(), threading.Event()
+        installer = FakeInstaller()
+
+        def prepare():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            raise RuntimeError("old preparation failed")
+
+        installer.prepare = prepare
+        service = self.make_service(installer=installer)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(service.start("prefill", "old-model")))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            service.stop(timeout=0)
+            self.assertFalse(service.start("decode", "new-model", prepare_environment=False).accepted)
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(results[0].accepted)
+        self.assertEqual(service.status()["phase"], PHASE_STOPPED)
+        self.assertEqual(service.state.last_error, "")
+        self.assertTrue(service.start("decode", "new-model", prepare_environment=False).accepted)
+        self.assertEqual(service.state.model_id, "new-model")
+        self.assertEqual(service.state.last_error, "")
+
+    def test_unowned_runner_never_signals_an_external_process_group(self):
+        process = FakeProcess(pid=os.getpid())
+        service = self.make_service(process=process)
+        with patch("tai_talea_bootstrap.service.os.killpg", create=True) as signal_group:
+            service._kill(process)
+            self.assertTrue(process.killed)
+            signal_group.assert_not_called()
+
+    def test_reused_leader_pid_is_not_signalled(self):
+        process = FakeProcess()
+        process._talea_pgid = process.pid
+        process._talea_start_time = 100
+        service = self.make_service(process=process)
+        with patch("tai_talea_bootstrap.service.Path.is_file", return_value=True), \
+                patch("tai_talea_bootstrap.service._proc_stat", return_value=("S", process.pid, process.pid, 200)), \
+                patch("tai_talea_bootstrap.service.os.killpg", create=True) as signal_group:
+            service._kill(process)
+            signal_group.assert_not_called()
+            self.assertIsNone(process._talea_pgid)
+
+    def test_stop_during_startup_grace_does_not_report_a_crash(self):
+        entered, release = threading.Event(), threading.Event()
+        service = self.make_service()
+        results = []
+
+        def grace(_seconds):
+            entered.set()
+            self.assertTrue(release.wait(5))
+
+        with patch("tai_talea_bootstrap.service.time.sleep", side_effect=grace):
+            worker = threading.Thread(target=lambda: results.append(service.start("prefill", "model-a")))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                service.stop(timeout=0)
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(results[0].accepted)
+        self.assertEqual(service.status()["phase"], PHASE_STOPPED)
+        self.assertEqual(service.state.last_error, "")
+
+    def test_expected_sigterm_exit_is_successful(self):
+        process = FakeProcess(exit_code=-15)
+        service = self.make_service(process=process)
+        self.assertTrue(service.start("prefill", "model-a").accepted)
+        service._terminate = lambda child: child.terminate()
+        result = service.stop(timeout=1)
+        self.assertEqual(result.exit_code, exitcodes.EXIT_OK)
+
+    def test_force_kills_immediately_and_retains_unreaped_process(self):
+        process = FakeProcess()
+        service = self.make_service(process=process)
+        service.start("prefill", "model-a")
+        service._kill = lambda child: child.kill()
+        result = service.stop(timeout=60, force=True)
+        self.assertTrue(process.killed)
+        self.assertFalse(result.timed_out)
+        process = FakeProcess()
+        service._runner = lambda _command: process
+        service.start("prefill", "model-a")
+        service._kill = lambda child: None
+        service._wait_briefly = lambda child: None
+        result = service.stop(timeout=0, force=True)
+        self.assertEqual(result.phase, PHASE_FAILED)
+        self.assertEqual(service.status()["service_pid"], process.pid)
+        self.assertFalse(service.start("decode", "model-a").accepted)
+
     def test_invalid_role_fails_with_bad_request(self):
         service = self.make_service()
         result = service.start("router", "model-a")
@@ -349,6 +495,53 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result.exit_code, exitcodes.EXIT_OK)
         self.assertFalse(result.timed_out)
         self.assertEqual(service.status()["phase"], PHASE_STOPPED)
+
+    def test_child_inherits_the_managed_virtualenv_environment(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        installer = FakeInstaller()
+        installer.python_executable = os.path.join(directory, "bin", "python")
+        service = SGLangService(profile(virtualenv=directory), installer=installer)
+        # Exercise both real Popen branches. A Python launched by absolute path
+        # still needs the venv's bin directory when it invokes tools like ninja.
+        code = (
+            "import os, sys; "
+            "assert os.environ['VIRTUAL_ENV'] == sys.argv[1]; "
+            "assert os.environ['PATH'].split(os.pathsep)[0] == sys.argv[2]"
+        )
+        for log_file in ("", os.path.join(directory, "child.log")):
+            with self.subTest(log_file=log_file):
+                process = service._spawn(
+                    [sys.executable, "-c", code, directory,
+                     os.path.dirname(installer.python_executable)], log_file=log_file)
+                self.assertEqual(process.wait(timeout=20), 0)
+
+    def test_late_exit_is_reported_by_status_and_health_once(self):
+        for first_query in ("status", "health"):
+            with self.subTest(first_query=first_query):
+                process = FakeProcess(exit_code=3)
+                service = self.make_service(process=process)
+                self.assertTrue(service.start("prefill", "model-a").accepted)
+                process.terminated = True
+                self.assertEqual(getattr(service, first_query)()["phase"], PHASE_FAILED)
+                status = service.status()
+                self.assertEqual(status["exit_code"], 3)
+                self.assertGreater(status["stopped_at"], 0)
+                self.assertEqual(service.health()["status"], "failed")
+                self.assertIn("code 3", status["last_error"])
+                failures = [e for e in service.status()["history"] if e["phase"] == PHASE_FAILED]
+                self.assertEqual(len(failures), 1)
+
+    def test_start_can_retry_a_late_exit_without_a_prior_status_query(self):
+        process = FakeProcess(exit_code=3)
+        service = self.make_service(process=process)
+        self.assertTrue(service.start("prefill", "model-a").accepted)
+        process.terminated = True
+        replacement = FakeProcess(pid=4322)
+        service._runner = lambda _command: replacement
+        self.assertTrue(service.start("prefill", "model-a").accepted)
+        self.assertEqual(service.status()["service_pid"], replacement.pid)
+        self.assertEqual(service.status()["last_error"], "")
 
     def test_stop_timeout_is_reported(self):
         stubborn = FakeProcess()
@@ -463,6 +656,15 @@ class HttpSurfaceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["phase"], PHASE_IDLE)
 
+    def test_nonfinite_stop_timeout_is_rejected_without_stopping(self):
+        self.service.start("prefill", "model-a")
+        for timeout in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(timeout=timeout):
+                status, _ = self.request("POST", "/bootstrap/stop", {"timeout": timeout})
+                self.assertEqual(status, 400)
+                self.assertFalse(self.process.terminated)
+                self.assertFalse(self.process.killed)
+
     def test_start_then_status_then_stop(self):
         status, payload = self.request("POST", "/bootstrap/start", {
             "role": "prefill", "model_id": "model-a", "port": 31000, "prepare_environment": False,
@@ -505,6 +707,34 @@ class HttpSurfaceTests(unittest.TestCase):
     def test_unknown_path_is_not_found(self):
         status, _ = self.request("GET", "/bootstrap/exec")
         self.assertEqual(status, 404)
+
+
+class ServerShutdownTests(unittest.TestCase):
+    def test_external_stop_event_terminates_http_server(self):
+        stop, ready = threading.Event(), threading.Event()
+        servers, results = [], []
+
+        def create(*args, **kwargs):
+            server = BootstrapServer(*args, **kwargs)
+            servers.append(server)
+            ready.set()
+            return server
+
+        with patch("tai_talea_bootstrap.server.BootstrapServer", side_effect=create):
+            worker = threading.Thread(target=lambda: results.append(serve(
+                SGLangService(profile()), port=0, token=TOKEN, stop_event=stop)), daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(ready.wait(5))
+                stop.set()
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(results, [exitcodes.EXIT_OK])
+            finally:
+                stop.set()
+                if worker.is_alive() and servers:
+                    servers[0].shutdown()
+                    worker.join(3)
 
 
 class BootstrapAuthTests(unittest.TestCase):
@@ -724,6 +954,26 @@ class ServeCommandTests(unittest.TestCase):
             code = bootstrap_cli.main(["serve", "--profile", missing])
         self.assertEqual(code, exitcodes.EXIT_ENV_INCOMPATIBLE)
         self.assertIn("profile_invalid", stderr.getvalue())
+
+    def test_shutdown_cleans_failed_service_and_preserves_failure_exit(self):
+        process = FakeProcess()
+        service = SGLangService(profile(), installer=FakeInstaller(), runner=lambda _command: process)
+
+        def failed_serve(*_args, **_kwargs):
+            service._process = process
+            service.state.service_pid = process.pid
+            service.state.phase = PHASE_FAILED
+            service.state.last_error = "leader failed with remaining workers"
+            service.state.exit_code = 0
+
+        with patch.object(bootstrap_cli, "detect_environment", return_value=EnvironmentReport()), \
+                patch.object(bootstrap_cli, "SGLangService", return_value=service), \
+                patch.object(bootstrap_cli, "serve", side_effect=failed_serve), \
+                patch("signal.signal"):
+            code, _, _ = self.run_serve()
+        self.assertTrue(process.terminated)
+        self.assertEqual(service.state.phase, PHASE_STOPPED)
+        self.assertEqual(code, exitcodes.EXIT_START_FAILED)
 
 
 class ExitCodeTests(unittest.TestCase):

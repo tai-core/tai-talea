@@ -69,17 +69,23 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// LoadSnapshot is the reserved load input surface described in §11. Milestone 1
-// never reads it, but the planner contract already accepts it so that M3 can
-// switch to adaptive sizing without changing callers.
+// LoadSnapshot carries measured scheduler load for diagnostics. The fixed gear
+// planner records it but does not use it to automatically change the PD ratio.
 type LoadSnapshot struct {
-	RequestThroughput    float64 `json:"request_throughput"`
-	PrefillLatencyMS     float64 `json:"prefill_latency_ms"`
-	DecodeLatencyMS      float64 `json:"decode_latency_ms"`
-	TokenRate            float64 `json:"token_rate"`
-	QueueLength          float64 `json:"queue_length"`
-	WorkerGPUUtilization float64 `json:"worker_gpu_utilization"`
-	PDLoadImbalance      float64 `json:"pd_load_imbalance"`
+	Valid                bool      `json:"valid"`
+	MeasuredAt           time.Time `json:"measured_at"`
+	Advice               string    `json:"advice"`
+	PrefillPressure      *float64  `json:"prefill_pressure"`
+	DecodePressure       *float64  `json:"decode_pressure"`
+	InputTokenRate       *float64  `json:"input_tokens_per_second"`
+	OutputTokenRate      *float64  `json:"output_tokens_per_second"`
+	RequestThroughput    float64   `json:"request_throughput,omitempty"`
+	PrefillLatencyMS     float64   `json:"prefill_latency_ms,omitempty"`
+	DecodeLatencyMS      float64   `json:"decode_latency_ms,omitempty"`
+	TokenRate            float64   `json:"token_rate,omitempty"`
+	QueueLength          float64   `json:"queue_length"`
+	WorkerGPUUtilization float64   `json:"worker_gpu_utilization,omitempty"`
+	PDLoadImbalance      float64   `json:"pd_load_imbalance"`
 }
 
 // Candidate is one instance the planner may consider.
@@ -129,22 +135,24 @@ type Action struct {
 
 // Decision is the planner output for one round.
 type Decision struct {
-	Gear          string    `json:"gear"`
-	TargetRatio   float64   `json:"target_ratio"`
-	CurrentRatio  float64   `json:"current_ratio"`
-	TargetPrefill int       `json:"target_prefill"`
-	TargetDecode  int       `json:"target_decode"`
-	ServingCount  int       `json:"serving_count"`
-	IdleCount     int       `json:"idle_count"`
-	Actions       []Action  `json:"actions"`
-	Notes         []string  `json:"notes,omitempty"`
-	PlannedAt     time.Time `json:"planned_at"`
+	ObservedLoad  LoadSnapshot `json:"observed_load"`
+	Gear          string       `json:"gear"`
+	TargetRatio   float64      `json:"target_ratio"`
+	CurrentRatio  float64      `json:"current_ratio"`
+	TargetPrefill int          `json:"target_prefill"`
+	TargetDecode  int          `json:"target_decode"`
+	ServingCount  int          `json:"serving_count"`
+	IdleCount     int          `json:"idle_count"`
+	Actions       []Action     `json:"actions"`
+	Notes         []string     `json:"notes,omitempty"`
+	PlannedAt     time.Time    `json:"planned_at"`
 }
 
 // Planner applies a fixed ratio gear to the current worker population.
 type Planner struct {
-	config Config
-	mu     sync.Mutex
+	lastLoad LoadSnapshot
+	config   Config
+	mu       sync.Mutex
 	// lastChangeAt is the timestamp of the last round that produced changes.
 	lastChangeAt time.Time
 }
@@ -158,7 +166,14 @@ func New(config Config) (*Planner, error) {
 }
 
 // Config returns the active configuration.
-func (p *Planner) Config() Config { return p.config }
+func (p *Planner) Config() Config { p.mu.Lock(); defer p.mu.Unlock(); return p.config }
+
+// LastObservedLoad is the input used by the last plan, with its sample timestamp.
+func (p *Planner) LastObservedLoad() LoadSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastLoad
+}
 
 // SetGear switches the manual gear.
 func (p *Planner) SetGear(gear string) error {
@@ -191,6 +206,7 @@ func (p *Planner) LastChangeAt() time.Time {
 func (p *Planner) Plan(input Input) (Decision, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.lastLoad = input.Load
 
 	now := input.Now
 	if now.IsZero() {
@@ -202,6 +218,7 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 	}
 
 	decision := Decision{
+		ObservedLoad: input.Load,
 		Gear:         p.config.Gear,
 		TargetRatio:  ratio,
 		ServingCount: len(input.Serving),
@@ -232,16 +249,39 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 		total = p.config.MaxServing
 	}
 	decision.TargetPrefill = int(math.Floor(float64(total) * ratio))
+	// A disaggregated deployment with at least two workers needs both roles,
+	// including when rounding a 1:2 gear over only two available containers.
+	if total >= 2 {
+		decision.TargetPrefill = max(1, min(total-1, decision.TargetPrefill))
+	}
 	decision.TargetDecode = total - decision.TargetPrefill
 
 	// Drain surplus capacity before it can take a role.
 	actions := []Action{}
+	prefillPlanned := prefillNow
+	decodePlanned := len(input.Serving) - prefillNow
 	drainBudget := len(input.Serving) - total
 	if drainBudget > 0 {
-		for _, candidate := range movable(input.Serving, now, p.config.MinHold) {
-			if drainBudget == 0 {
+		eligible := movable(input.Serving, now, p.config.MinHold)
+		for drainBudget > 0 && len(actions) < p.config.MaxChangePerRound {
+			chosen := -1
+			for index, candidate := range eligible {
+				if alreadyPlanned(actions, candidate.ID) {
+					continue
+				}
+				if chosen == -1 {
+					chosen = index
+				}
+				if candidate.Role == domain.RolePrefill && prefillPlanned > decision.TargetPrefill ||
+					candidate.Role == domain.RoleDecode && decodePlanned > decision.TargetDecode {
+					chosen = index
+					break
+				}
+			}
+			if chosen == -1 {
 				break
 			}
+			candidate := eligible[chosen]
 			actions = append(actions, Action{
 				Kind:       ActionDrain,
 				InstanceID: candidate.ID,
@@ -249,7 +289,11 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 				Reason:     fmt.Sprintf("surplus capacity beyond max_serving=%d", p.config.MaxServing),
 			})
 			drainBudget--
-			decision.ServingCount--
+			if candidate.Role == domain.RolePrefill {
+				prefillPlanned--
+			} else {
+				decodePlanned--
+			}
 		}
 	}
 
@@ -260,9 +304,7 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 	copy(idle, input.Idle)
 	sort.Slice(idle, func(i, j int) bool { return idle[i].ID < idle[j].ID })
 
-	prefillPlanned := prefillNow
-	decodePlanned := decision.ServingCount - prefillNow
-	for len(idle) > 0 {
+	for len(idle) > 0 && prefillPlanned+decodePlanned < total {
 		if len(actions) >= p.config.MaxChangePerRound {
 			decision.Notes = append(decision.Notes, "max_change_per_round reached")
 			break
@@ -360,7 +402,7 @@ done:
 // alreadyPlanned reports whether the round already changed the instance.
 func alreadyPlanned(actions []Action, instanceID string) bool {
 	for _, action := range actions {
-		if action.InstanceID == instanceID && action.Kind == ActionReassign {
+		if action.InstanceID == instanceID {
 			return true
 		}
 	}

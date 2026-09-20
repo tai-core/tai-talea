@@ -21,7 +21,8 @@ const (
 	InstanceAllocating InstanceState = "ALLOCATING"
 	// InstancePreparing means the container is being probed and prepared.
 	InstancePreparing InstanceState = "PREPARING"
-	// InstanceIdle means the container is usable but runs no SGLang service.
+	// InstanceIdle means the container is prepared and usable. The legacy IDLE
+	// value says nothing about service occupancy; consult ServiceState for that.
 	InstanceIdle InstanceState = "IDLE"
 	// InstanceReleasing means the partner was asked to reclaim the container.
 	InstanceReleasing InstanceState = "RELEASING"
@@ -112,12 +113,15 @@ type Instance struct {
 	// capacity event instead of being derived here. Empty means "same as
 	// Endpoint", which keeps single-port deployments and the local harness
 	// working unchanged.
-	ServiceEndpoint string        `json:"service_endpoint,omitempty"`
-	LeaseID         string        `json:"lease_id,omitempty"`
-	Spec            InstanceSpec  `json:"spec"`
-	InstanceState   InstanceState `json:"instance_state"`
-	ServiceState    ServiceState  `json:"service_state"`
-	Role            Role          `json:"role,omitempty"`
+	ServiceEndpoint string       `json:"service_endpoint,omitempty"`
+	LeaseID         string       `json:"lease_id,omitempty"`
+	Spec            InstanceSpec `json:"spec"`
+	// PendingUpdate keeps the replacement identity durable while the old
+	// endpoint drains. It is applied only after the old process has stopped.
+	PendingUpdate *InstanceUpdate `json:"pending_update,omitempty"`
+	InstanceState InstanceState   `json:"instance_state"`
+	ServiceState  ServiceState    `json:"service_state"`
+	Role          Role            `json:"role,omitempty"`
 	// RoleAssignedAt records when the current PD role was assigned. The planner
 	// uses it to honour min_hold_seconds.
 	RoleAssignedAt      time.Time `json:"role_assigned_at,omitempty"`
@@ -135,6 +139,16 @@ type Instance struct {
 	LastSeenAt     time.Time `json:"last_seen_at,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// InstanceUpdate is a fully materialized replacement of partner-owned metadata.
+// ObservedAt orders overlapping updates without replacing the running identity.
+type InstanceUpdate struct {
+	Endpoint        string       `json:"endpoint"`
+	ServiceEndpoint string       `json:"service_endpoint,omitempty"`
+	LeaseID         string       `json:"lease_id"`
+	Spec            InstanceSpec `json:"spec"`
+	ObservedAt      time.Time    `json:"observed_at"`
 }
 
 // Runnable reports whether the container may host a control-plane SGLang service.

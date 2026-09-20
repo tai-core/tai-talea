@@ -11,9 +11,8 @@
 //	PUT    /state/workers/{worker_id}   -> 200 {previous_state, record, changed}
 //	GET    /get_loads                   -> 200 {loads:[{worker,worker_type,load}]}
 //
-// Draining is expressed exclusively through readiness. DELETE /workers is
-// deliberately not exposed: development document §8 forbids it as a drain
-// primitive.
+// Draining is expressed exclusively through readiness. DELETE is limited to
+// replacing an unavailable, idle membership whose role is stale (§8 recovery).
 package routeradapter
 
 import (
@@ -146,11 +145,12 @@ type ReadinessTransition struct {
 
 // Worker is a Router membership entry.
 type Worker struct {
-	ID         string `json:"id"`
-	URL        string `json:"url"`
-	WorkerType string `json:"worker_type"`
-	Healthy    bool   `json:"is_healthy"`
-	Load       int64  `json:"load"`
+	ID         string            `json:"id"`
+	URL        string            `json:"url"`
+	WorkerType string            `json:"worker_type"`
+	Healthy    bool              `json:"is_healthy"`
+	Load       int64             `json:"load"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
 // WorkerLoad is one entry of GET /get_loads. A negative load means the Router
@@ -378,12 +378,75 @@ func (c *Client) GetLoads(ctx context.Context) ([]WorkerLoad, error) {
 	}
 	httpRequest.Header.Set("Accept", "application/json")
 	var response struct {
-		Loads []WorkerLoad `json:"loads"`
+		Loads   []WorkerLoad `json:"loads"`
+		Workers []WorkerLoad `json:"workers"`
 	}
 	if err := c.doJSON(httpRequest, http.StatusOK, &response); err != nil {
 		return nil, err
 	}
-	return response.Loads, nil
+	if response.Workers != nil {
+		return response.Workers, nil
+	}
+	if response.Loads != nil {
+		return response.Loads, nil
+	}
+	return nil, errors.New("router get_loads returned neither workers nor loads")
+}
+
+// RemoveStaleMembership is an abnormal role-recovery operation, never a drain
+// primitive. The caller must first close readiness. Unknown/nonzero load fails
+// closed, and URL/type are checked again before submitting asynchronous removal.
+func (c *Client) RemoveStaleMembership(ctx context.Context, id, endpoint string, desired domain.Role) error {
+	worker, err := c.GetWorker(ctx, id)
+	if err != nil {
+		return err
+	}
+	if worker.URL != endpoint || worker.WorkerType == string(desired) || !desired.Valid() {
+		return errors.New("membership is not a stale role")
+	}
+	ready, err := c.GetReadiness(ctx, id)
+	if err != nil {
+		return err
+	}
+	if ready.Ready() {
+		return errors.New("stale membership is still routable")
+	}
+	loads, err := c.GetLoads(ctx)
+	if err != nil {
+		return err
+	}
+	idle := false
+	for _, l := range loads {
+		if l.Worker == endpoint {
+			idle = l.Load == 0
+			break
+		}
+	}
+	if !idle {
+		return errors.New("stale membership load is nonzero or unknown; retry after requests drain")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.BaseURL()+"/workers/"+url.PathEscape(id), nil)
+	if err != nil {
+		return err
+	}
+	var accepted map[string]any
+	if err = c.doJSON(req, http.StatusAccepted, &accepted); err != nil {
+		return err
+	}
+	for {
+		_, err = c.GetWorker(ctx, id)
+		if errors.Is(err, ErrWorkerNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (c *Client) validateWorkerID(workerID string) error {

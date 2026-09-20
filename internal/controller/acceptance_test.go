@@ -261,6 +261,11 @@ func (f *routerFake) workerHandler(writer http.ResponseWriter, request *http.Req
 		// The control plane must never delete a worker to drain it.
 		f.mu.Lock()
 		f.deleteCalls++
+		id := strings.TrimPrefix(request.URL.Path, "/workers/")
+		if worker, ok := f.workers[id]; ok {
+			delete(f.byURL, worker.URL)
+			delete(f.workers, id)
+		}
 		f.mu.Unlock()
 		writeTestJSON(writer, http.StatusAccepted, map[string]string{"worker_id": "deleted"})
 		return
@@ -363,7 +368,7 @@ func (f *routerFake) readinessItem(writer http.ResponseWriter, request *http.Req
 				worker.Reason = "manual"
 			}
 		}
-		worker.Load = 0
+		// Closing readiness does not complete requests already in flight.
 		f.readinessSets = append(f.readinessSets, id+":"+payload.State)
 		writeTestJSON(writer, http.StatusOK, map[string]any{
 			"previous_state": previous,

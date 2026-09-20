@@ -3,6 +3,7 @@ package domain
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -154,8 +155,10 @@ func validateEventEndpoint(field, value string) error {
 	if strings.ContainsAny(value, "\x00\r\n") {
 		return fmt.Errorf("%s contains control characters", field)
 	}
-	if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
-		return fmt.Errorf("%s must be an http(s) origin", field)
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s must be an http(s) origin without credentials, path, query or fragment", field)
 	}
 	return nil
 }

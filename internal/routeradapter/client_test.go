@@ -318,3 +318,29 @@ func TestRouterConfigFeedsTheAdapter(t *testing.T) {
 		t.Fatalf("router config must validate: %v", err)
 	}
 }
+
+func TestLoadsWireFormats(t *testing.T) {
+	for _, body := range []string{`{"workers":[{"worker":"http://p:1","load":7}]}`, `{"loads":[{"worker":"http://p:1","load":7}]}`, `{"workers":[]}`, `{}`} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+			defer server.Close()
+			client, err := routeradapter.New(routeradapter.Config{Name: "test", URL: server.URL, Mode: routeradapter.ModeReadinessV1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			loads, err := client.GetLoads(t.Context())
+			if body == `{}` {
+				if err == nil {
+					t.Fatal("unknown envelope accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(body, `"load":7`) && (len(loads) != 1 || loads[0].Load != 7) {
+				t.Fatal(loads)
+			}
+		})
+	}
+}

@@ -75,7 +75,8 @@ func NewHTTPAdapter(config HTTPAdapterConfig) (*HTTPAdapter, error) {
 	if config.Timeout == 0 {
 		config.Timeout = 15 * time.Second
 	}
-	return &HTTPAdapter{config: config, http: &http.Client{Timeout: config.Timeout}}, nil
+	return &HTTPAdapter{config: config, http: &http.Client{Timeout: config.Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
 // PartnerID implements PartnerAdapter.
@@ -115,13 +116,24 @@ func (a *HTTPAdapter) list(ctx context.Context, path string) ([]CapacityInstance
 		return nil, fmt.Errorf("%w: GET %s returned HTTP %d", ErrPartnerUnavailable, path, response.StatusCode)
 	}
 	var body struct {
-		Instances []CapacityInstance `json:"instances"`
+		Instances *[]CapacityInstance `json:"instances"`
+		Complete  *bool               `json:"complete,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
+	// This adapter accepts a complete, unpaginated envelope only. Unknown
+	// pagination fields must not silently turn a partial page into revocations.
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil {
 		return nil, fmt.Errorf("%w: decode %s: %v", ErrSnapshotIncomplete, path, err)
 	}
-	return body.Instances, nil
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: %s must contain one JSON document", ErrSnapshotIncomplete, path)
+	}
+	if body.Instances == nil || (body.Complete != nil && !*body.Complete) {
+		return nil, fmt.Errorf("%w: %s requires an explicit complete instances array", ErrSnapshotIncomplete, path)
+	}
+	return *body.Instances, nil
 }
 
 // ReleaseInstance implements PartnerAdapter.
@@ -144,7 +156,7 @@ func (a *HTTPAdapter) ReleaseInstance(ctx context.Context, instanceID string) er
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<16))
-	if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusConflict {
+	if response.StatusCode == http.StatusNotFound {
 		// Already gone is an idempotent success for release.
 		return nil
 	}

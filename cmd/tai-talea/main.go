@@ -27,6 +27,7 @@ import (
 	"github.com/tai-core/tai-talea/internal/instancemanager"
 	"github.com/tai-core/tai-talea/internal/launcher"
 	"github.com/tai-core/tai-talea/internal/obs"
+	"github.com/tai-core/tai-talea/internal/onboarding"
 	"github.com/tai-core/tai-talea/internal/partner"
 	"github.com/tai-core/tai-talea/internal/partners"
 	"github.com/tai-core/tai-talea/internal/planner"
@@ -139,7 +140,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	}
 
 	var ready atomic.Bool
+	var onboards *onboarding.Manager
+	if cfg.Onboarding.Script != "" {
+		if cfg.Onboarding.Python == "" {
+			cfg.Onboarding.Python = "python3"
+		}
+		onboards, err = onboarding.New(cfg.Onboarding.StateDir, persistence, onboarding.ProcessRunner(cfg.Onboarding, cfg.Controller.BootstrapToken), ctrl.EnrollPrepared)
+		if err != nil {
+			return fmt.Errorf("onboarding: %w", err)
+		}
+	}
 	apiServer, err := api.New(api.Options{
+		Onboarding: onboards,
 		Config:     cfg,
 		Store:      persistence,
 		Controller: ctrl,
@@ -165,7 +177,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		logger.Info("startup recovery complete",
 			"checked", report.Checked, "lost", len(report.Lost),
 			"recovered", len(report.Recovered), "reregistered", len(report.Reregister),
-			"resumed_operations", len(resumed), "abandoned_events", report.Abandoned)
+			"resumed_operations", len(resumed), "resumed_events", report.ResumedEvents)
 	}
 	if err := ctrl.PublishGauges(ctx); err != nil {
 		logger.Warn("initial gauge publication failed", "error", err.Error())
@@ -173,6 +185,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	ready.Store(true)
 
 	go ctrl.RunPeriodic(ctx)
+	if onboards != nil {
+		go onboards.Run(ctx)
+	}
 	if cfg.Pull.Enabled {
 		puller := partner.NewPuller(persistence, metrics, alerter, logger, cfg.Pull.FailureThreshold)
 		for _, adapter := range registry.All() {

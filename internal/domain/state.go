@@ -56,7 +56,7 @@ const (
 // IDLE -> PREPARING exists so that a container which failed preparation can be
 // re-prepared without being released.
 var instanceTransitions = map[InstanceState]map[InstanceState]bool{
-	InstanceAllocating: {InstancePreparing: true, InstanceLost: true},
+	InstanceAllocating: {InstancePreparing: true, InstanceReleasing: true, InstanceLost: true},
 	InstancePreparing:  {InstanceIdle: true, InstanceReleasing: true, InstanceLost: true},
 	InstanceIdle:       {InstancePreparing: true, InstanceReleasing: true, InstanceLost: true},
 	InstanceReleasing:  {InstanceReleased: true, InstanceLost: true},
@@ -74,9 +74,9 @@ var instanceTransitions = map[InstanceState]map[InstanceState]bool{
 //	FAILED -> NONE (retry) | STARTING (retry)
 var serviceTransitions = map[ServiceState]map[ServiceState]bool{
 	ServiceNone:        {ServiceStarting: true},
-	ServiceStarting:    {ServiceHealthy: true, ServiceFailed: true},
-	ServiceHealthy:     {ServiceRegistering: true, ServiceFailed: true},
-	ServiceRegistering: {ServiceServing: true, ServiceFailed: true},
+	ServiceStarting:    {ServiceHealthy: true, ServiceFailed: true, ServiceDraining: true},
+	ServiceHealthy:     {ServiceRegistering: true, ServiceFailed: true, ServiceDraining: true},
+	ServiceRegistering: {ServiceServing: true, ServiceFailed: true, ServiceDraining: true},
 	ServiceServing:     {ServiceDraining: true, ServiceFailed: true},
 	ServiceDraining:    {ServiceNone: true, ServiceFailed: true},
 	// FAILED -> DRAINING exists so that a failed service can still be stopped

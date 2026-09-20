@@ -19,6 +19,7 @@ _FORBIDDEN = ("\x00", "\n", "\r")
 # control plane only ever sends these, and a compromised caller cannot smuggle in
 # an arbitrary switch.
 ALLOWED_EXTRA_FLAGS = (
+    "--enable-metrics",
     "--mem-fraction-static",
     "--max-running-requests",
     "--chunked-prefill-size",
