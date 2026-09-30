@@ -236,7 +236,8 @@ def install(payload):
             put_bytes(sftp, seed, Path(__file__).with_name('install_node.py').read_bytes())
             put_bytes(sftp, '/opt/tai-talea/onboarding/sglang_compat.py', Path(__file__).with_name('sglang_compat.py').read_bytes())
             runtime = dict(profile=profile, environment=manifest.get('environment',{}), token=payload['bootstrap_token'],
-                           interface=observed['interface'], model_path=manifest['model_target'])
+                           interface=observed['interface'], model_path=manifest['model_target'],
+                           transfer_backend=manifest.get('transfer_backend', 'nixl'))
             config_path = '/opt/tai-talea/onboarding/install.json'
             put_bytes(sftp, config_path, json.dumps(runtime).encode())
         emit(stage='安装依赖并启动节点管理服务')
