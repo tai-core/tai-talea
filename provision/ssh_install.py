@@ -202,7 +202,10 @@ def install(payload):
             raise InstallError('SSH 主机指纹不匹配')
         observed = remote(client, PROBE, {'probe_ip':manifest['probe_ip'], 'token':payload['bootstrap_token']})
         if observed['uid'] != 0: raise InstallError('自动安装需要容器内 root 权限')
-        if observed['hostname'] == socket.gethostname(): raise InstallError('不能把 Talea 控制节点上线为推理节点')
+        # When the control plane intentionally shares a node with inference
+        # (small deployments), the manifest opts out of this hostname guard.
+        if observed['hostname'] == socket.gethostname() and not manifest.get('allow_control_node'):
+            raise InstallError('不能把 Talea 控制节点上线为推理节点')
         if observed['phase'] in ['RUNNING', 'STARTING', 'INSTALLING', 'STOPPING']:
             raise InstallError('该容器已有运行中的服务，请先通过 Talea 回收原节点')
         if observed['occupied'] and not observed['phase']:
