@@ -244,10 +244,17 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 	if !ok {
 		return partner.CapacityInstance{}, fmt.Errorf("bootstrap port %d not published", a.cfg.BootstrapPort)
 	}
+	// The operator-chosen instance name is the identity the control plane
+	// enrolled through onboarding. The platform UUID would look like a brand
+	// new container on every poll and revoke the managed node instead.
+	name := record.Name
+	if name == "" {
+		name = record.ID
+	}
 	instance := partner.CapacityInstance{
-		ID:       record.ID,
+		ID:       name,
+		LeaseID:  "cci-" + name,
 		Endpoint: bootstrap,
-		LeaseID:  "cci-" + record.ID,
 		Spec: domain.InstanceSpec{
 			GPU:          record.Resource.GPUName,
 			GPUCount:     record.Resource.GPUCount,

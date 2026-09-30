@@ -164,7 +164,7 @@ for root in json.load(sys.stdin):
             shutil.rmtree(path)
         else:
             os.unlink(path)
-print("cleaned")
+print('{}')
 ''', [target], timeout=300)
 
 

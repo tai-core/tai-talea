@@ -130,7 +130,9 @@ func TestSnapshotConvertsRunningInstancesWithPortMapping(t *testing.T) {
 		t.Fatalf("expected 1 instance, got %d", len(snapshot.Instances))
 	}
 	got := snapshot.Instances[0]
-	if got.ID != "inst-a" || got.LeaseID != "cci-inst-a" {
+	// The operator-chosen name is the managed identity; the platform UUID
+	// would look like a replacement container on every pull.
+	if got.ID != "node-a" || got.LeaseID != "cci-node-a" {
 		t.Errorf("unexpected identity: %+v", got)
 	}
 	if got.Endpoint != "http://203.0.113.9:30086" || got.ServiceEndpoint != "http://203.0.113.9:30093" {
