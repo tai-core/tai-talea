@@ -92,10 +92,30 @@ func (a *Adapter) ListActiveLeases(ctx context.Context) ([]partner.CapacityInsta
 
 // ReleaseInstance implements partner.PartnerAdapter.
 func (a *Adapter) ReleaseInstance(ctx context.Context, instanceID string) error {
-	if err := a.client.releaseInstance(ctx, instanceID); err != nil {
+	uuid, err := a.resolveUUID(ctx, instanceID)
+	if err != nil {
+		return fmt.Errorf("release %s: %w", instanceID, err)
+	}
+	if err := a.client.releaseInstance(ctx, uuid); err != nil {
 		return fmt.Errorf("release %s: %w", instanceID, err)
 	}
 	return nil
+}
+
+// resolveUUID maps the control-plane identity (the operator-chosen instance
+// name, or an already-UUID instance from the provision flow) to the platform
+// instance ID that mutation endpoints require.
+func (a *Adapter) resolveUUID(ctx context.Context, nameOrID string) (string, error) {
+	records, err := a.client.listInstances(ctx, a.cfg.AIDCId, "")
+	if err != nil {
+		return "", err
+	}
+	for _, record := range records {
+		if record.Name == nameOrID || record.ID == nameOrID {
+			return record.ID, nil
+		}
+	}
+	return "", fmt.Errorf("instance not found on the platform")
 }
 
 // AwaitSSHAccess implements partner.ProvisioningAdapter: poll the instance

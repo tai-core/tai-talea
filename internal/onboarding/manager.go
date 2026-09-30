@@ -290,8 +290,12 @@ func (m *Manager) RunOnce(ctx context.Context) error {
 		}
 		if err == nil {
 			// Refuse changed ownership or an intervening online operation before SSH.
+			// A LOST instance is re-onboardable: its container exists but the
+			// control plane cannot reach a healthy bootstrap on it, which is
+			// exactly the situation SSH installation fixes.
 			current, e := m.store.GetInstance(ctx, r.ID)
-			if e == nil && (current.PartnerID != r.PartnerID || current.InstanceState != domain.InstanceReleased) {
+			if e == nil && (current.PartnerID != r.PartnerID ||
+				(current.InstanceState != domain.InstanceReleased && current.InstanceState != domain.InstanceLost)) {
 				err = ErrConflict
 			}
 			if e != nil && !errors.Is(e, store.ErrNotFound) {
