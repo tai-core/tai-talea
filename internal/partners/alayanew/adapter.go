@@ -282,9 +282,10 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 	// The platform publishes the public ingress host, but Router health
 	// checks and PD disaggregation originate from inside the same network,
 	// where the public IP is a hairpin that never completes. Swap in the
-	// configured internal address when the operator provided one; ports are
-	// identical on both sides (CCI publishes a 1:1 port passthrough).
-	rewrite := func(endpoint string) string {
+	// configured internal address and the container port (the published
+	// ingress port maps 1:1 to the container port, so inside the network
+	// peers reach the container port directly).
+	rewrite := func(endpoint string, containerPort int) string {
 		host, ok := a.cfg.AdvertiseHosts[name]
 		if !ok || host == "" {
 			return endpoint
@@ -293,17 +294,13 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 		if err != nil || u.Host == "" {
 			return endpoint
 		}
-		_, port, err2 := net.SplitHostPort(u.Host)
-		if err2 != nil {
-			return endpoint
-		}
-		u.Host = net.JoinHostPort(host, port)
+		u.Host = net.JoinHostPort(host, strconv.Itoa(containerPort))
 		return u.String()
 	}
 	instance := partner.CapacityInstance{
 		ID:       name,
 		LeaseID:  "cci-" + name,
-		Endpoint: rewrite(bootstrap),
+		Endpoint: rewrite(bootstrap, a.cfg.BootstrapPort),
 		Spec: domain.InstanceSpec{
 			GPU:          record.Resource.GPUName,
 			GPUCount:     int(record.Resource.GPUCount),
@@ -311,7 +308,7 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 		},
 	}
 	if service, ok := mapped[a.cfg.ServicePort]; ok {
-		instance.ServiceEndpoint = rewrite(service)
+		instance.ServiceEndpoint = rewrite(service, a.cfg.ServicePort)
 	}
 	return instance, nil
 }
