@@ -40,11 +40,6 @@ def install():
         env.update(cfg['environment'])
         env['PATH'] = '/opt/tai-talea/venv/bin:/usr/local/cuda/bin:' + os.environ.get('PATH','')
         env['PYTHONPATH'] = str(ROOT/'onboarding/bootstrap')
-        # PyPI mooncake wheels link libcudart.so.12 even on a CUDA 13 image;
-        # the wheelhouse ships the cu12 runtime and it must be discoverable.
-        cu12lib = ROOT / 'venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib'
-        if cu12lib.is_dir():
-            env['LD_LIBRARY_PATH'] = str(cu12lib) + (':' + env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
         if cfg.get('interface'): env['UCX_NET_DEVICES'] = cfg['interface']
         def run(argv, timeout=1800):
             result = subprocess.run(argv, stdout=log, stderr=log, env=env, timeout=timeout)
@@ -59,6 +54,14 @@ def install():
             run(['/usr/bin/python3','-m','venv',str(ROOT/'venv')])
         run([str(ROOT/'venv/bin/python'),'-m','pip','install','--no-index','--find-links='+profile['wheelhouse'],'-r',profile['wheelhouse']+'/requirements.txt'],3600)
         run([str(ROOT/'venv/bin/python'),'-m','pip','check'])
+        # PyPI mooncake wheels link libcudart.so.12 even on a CUDA 13 image.
+        # The cu12 runtime arrives with the wheelhouse install above, so the
+        # path only exists now; export it before the checks that import
+        # mooncake, and before the bootstrap starts, since that process
+        # inherits this environment and launches sglang itself.
+        cu12lib = ROOT / 'venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib'
+        if cu12lib.is_dir():
+            env['LD_LIBRARY_PATH'] = str(cu12lib) + (':' + env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
         emit(stage='应用已验证的 P/D 运行时兼容修复')
         run([str(ROOT/'venv/bin/python'),str(ROOT/'onboarding/sglang_compat.py')])
         profile_path = ROOT/'onboarding/profile.json'
