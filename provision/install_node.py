@@ -61,7 +61,11 @@ def install():
         profile_path.chmod(0o600)
         emit(stage='校验 CUDA、GPU 与模型')
         run([str(ROOT/'venv/bin/python'),'-m','tai_talea_bootstrap','check','--profile',str(profile_path)],180)
-        run([str(ROOT/'venv/bin/python'),'-c',"import torch,sglang,sgl_kernel; from nixl._api import nixl_agent,nixl_agent_config; assert torch.cuda.is_available(); a=nixl_agent('talea-install-check',nixl_agent_config(backends=['UCX'])); print(a.get_plugin_list())"],180)
+        if cfg.get('transfer_backend', 'nixl') == 'mooncake':
+            # sglang 0.5.x PD route: mooncake transfer engine instead of NIXL.
+            run([str(ROOT/'venv/bin/python'),'-c',"import torch,sglang,sgl_kernel,mooncake; assert torch.cuda.is_available(); print('mooncake transfer OK')"],180)
+        else:
+            run([str(ROOT/'venv/bin/python'),'-c',"import torch,sglang,sgl_kernel; from nixl._api import nixl_agent,nixl_agent_config; assert torch.cuda.is_available(); a=nixl_agent('talea-install-check',nixl_agent_config(backends=['UCX'])); print(a.get_plugin_list())"],180)
         if not (Path(cfg['model_path'])/'config.json').is_file():
             raise RuntimeError('模型目录不完整，缺少 config.json')
         # Stop only an idle Talea bootstrap, with command-line and phase guards.
