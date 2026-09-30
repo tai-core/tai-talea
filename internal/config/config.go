@@ -217,6 +217,10 @@ type PartnerAlayaNeWConfig struct {
 	NASMountPath     string            `yaml:"nas_mount_path" json:"nas_mount_path"`
 	NASReadOnly      bool              `yaml:"nas_read_only" json:"nas_read_only"`
 	Env              map[string]string `yaml:"env" json:"env"`
+	// AdvertiseHosts maps an instance name to the internal address peers in
+	// the same intelligent computing center should use; CCI's published
+	// endpoints are public-ingress IPs unreachable from the containers.
+	AdvertiseHosts map[string]string `yaml:"advertise_hosts" json:"advertise_hosts"`
 	// WaitTimeout bounds waiting for a created instance to reach RUNNING.
 	WaitTimeout Duration `yaml:"wait_timeout" json:"wait_timeout"`
 }

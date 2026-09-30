@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +36,12 @@ type Config struct {
 	// BootstrapPort and ServicePort are the container ports published by CCI.
 	BootstrapPort int
 	ServicePort   int
+	// AdvertiseHosts maps an instance name to the address peers inside the
+	// intelligent computing center should use. CCI port mappings expose the
+	// public ingress IP, but cross-worker traffic (Router health checks, PD
+	// disaggregation) runs inside the same network, where the public IP is
+	// not reachable from the containers themselves.
+	AdvertiseHosts map[string]string `json:"advertise_hosts"`
 	// Timeout bounds one signed request.
 	Timeout time.Duration
 	// WaitTimeout bounds waiting for a created instance to reach RUNNING.
@@ -271,10 +279,31 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 	if name == "" {
 		name = record.ID
 	}
+	// The platform publishes the public ingress host, but Router health
+	// checks and PD disaggregation originate from inside the same network,
+	// where the public IP is a hairpin that never completes. Swap in the
+	// configured internal address when the operator provided one; ports are
+	// identical on both sides (CCI publishes a 1:1 port passthrough).
+	rewrite := func(endpoint string) string {
+		host, ok := a.cfg.AdvertiseHosts[name]
+		if !ok || host == "" {
+			return endpoint
+		}
+		u, err := url.Parse(endpoint)
+		if err != nil || u.Host == "" {
+			return endpoint
+		}
+		_, port, err2 := net.SplitHostPort(u.Host)
+		if err2 != nil {
+			return endpoint
+		}
+		u.Host = net.JoinHostPort(host, port)
+		return u.String()
+	}
 	instance := partner.CapacityInstance{
 		ID:       name,
 		LeaseID:  "cci-" + name,
-		Endpoint: bootstrap,
+		Endpoint: rewrite(bootstrap),
 		Spec: domain.InstanceSpec{
 			GPU:          record.Resource.GPUName,
 			GPUCount:     int(record.Resource.GPUCount),
@@ -282,7 +311,7 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 		},
 	}
 	if service, ok := mapped[a.cfg.ServicePort]; ok {
-		instance.ServiceEndpoint = service
+		instance.ServiceEndpoint = rewrite(service)
 	}
 	return instance, nil
 }

@@ -77,6 +77,7 @@ func buildAdapter(cfg config.PartnerConfig) (partner.PartnerAdapter, error) {
 			NASMountPath:     cfg.AlayaNeW.NASMountPath,
 			NASReadOnly:      cfg.AlayaNeW.NASReadOnly,
 			Env:              cfg.AlayaNeW.Env,
+			AdvertiseHosts:   cfg.AlayaNeW.AdvertiseHosts,
 			Timeout:          cfg.AlayaNeW.Timeout.Duration(),
 			WaitTimeout:      cfg.AlayaNeW.WaitTimeout.Duration(),
 		})
