@@ -79,10 +79,12 @@ def validate_extra_args(extra_args):
         argument = _clean(raw, "extra_args entry", max_length=256)
         if not argument:
             continue
-        flag = argument.split("=", 1)[0]
+        # Operators write "--kv-cache-dtype bfloat16" or "--tp-size=8" with
+        # equal ease; both must become separate argv entries for the child.
+        flag = argument.split("=", 1)[0].split(None, 1)[0]
         if flag not in ALLOWED_EXTRA_FLAGS:
             raise ConfigurationError("extra argument %r is not allowed" % flag)
-        validated.append(argument)
+        validated.extend(shlex.split(argument))
     return validated
 
 
