@@ -157,6 +157,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Controller: ctrl,
 		Metrics:    metrics,
 		Logger:     logger,
+		Partners:   registry,
 		Ready:      ready.Load,
 	})
 	if err != nil {

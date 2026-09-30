@@ -66,6 +66,30 @@ var (
 	ErrPartnerUnavailable = errors.New("partner api unavailable")
 )
 
+// SSHAccess describes how the control plane reaches one container over SSH for
+// first-time provisioning. It is short-lived and never persisted in plaintext.
+type SSHAccess struct {
+	Host     string
+	Port     int
+	User     string
+	Password string
+}
+
+// ProvisioningAdapter is implemented by partners that can create capacity on
+// demand. The control plane discovers it with a type assertion on the
+// PartnerAdapter; the read-mostly contract stays untouched.
+type ProvisioningAdapter interface {
+	// CreateInstance asks the partner to provision one container and returns
+	// an opaque creation key for polling.
+	CreateInstance(ctx context.Context, name string) (string, error)
+	// WaitCreation blocks until the creation resolves, returning the instance
+	// id, or an error when the platform rejects the request.
+	WaitCreation(ctx context.Context, creationKey string) (string, error)
+	// AwaitSSHAccess waits until the instance is running and returns the SSH
+	// connection details needed by the provisioning pipeline.
+	AwaitSSHAccess(ctx context.Context, instanceID string) (SSHAccess, error)
+}
+
 // Snapshot is a validated, versioned view of one partner's capacity.
 type Snapshot struct {
 	PartnerID string             `json:"partner_id"`

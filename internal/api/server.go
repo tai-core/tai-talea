@@ -16,6 +16,7 @@ import (
 	"github.com/tai-core/tai-talea/internal/domain"
 	"github.com/tai-core/tai-talea/internal/obs"
 	"github.com/tai-core/tai-talea/internal/onboarding"
+	"github.com/tai-core/tai-talea/internal/partners"
 	"github.com/tai-core/tai-talea/internal/planner"
 	"github.com/tai-core/tai-talea/internal/store"
 )
@@ -28,6 +29,8 @@ type Options struct {
 	Controller *controller.Controller
 	Metrics    *obs.Registry
 	Logger     *slog.Logger
+	// Partners resolves partner adapters for the on-demand provisioning entry.
+	Partners *partners.Registry
 	// Ready reports whether the process finished recovery.
 	Ready func() bool
 	Now   func() time.Time

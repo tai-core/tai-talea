@@ -6,6 +6,7 @@ import (
 
 	"github.com/tai-core/tai-talea/internal/config"
 	"github.com/tai-core/tai-talea/internal/partner"
+	"github.com/tai-core/tai-talea/internal/partners/alayanew"
 )
 
 // Registry resolves a partner id to its adapter.
@@ -56,6 +57,28 @@ func buildAdapter(cfg config.PartnerConfig) (partner.PartnerAdapter, error) {
 			LeasesPath:          cfg.HTTP.LeasesPath,
 			ReleasePathTemplate: cfg.HTTP.ReleasePathTemplate,
 			Timeout:             cfg.HTTP.Timeout.Duration(),
+		})
+	case "alayanew":
+		if cfg.AlayaNeW == nil {
+			return nil, fmt.Errorf("alayanew adapter requires alayanew configuration")
+		}
+		return alayanew.New(cfg.ID, alayanew.Config{
+			AccessKey:        cfg.AlayaNeW.AccessKey,
+			SecretKey:        cfg.AlayaNeW.SecretKey,
+			AIDCId:           cfg.AlayaNeW.AIDCId,
+			ModelSupport:     cfg.AlayaNeW.ModelSupport,
+			BootstrapPort:    cfg.AlayaNeW.BootstrapPort,
+			ServicePort:      cfg.AlayaNeW.ServicePort,
+			ProductCode:      cfg.AlayaNeW.ProductCode,
+			Image:            cfg.AlayaNeW.Image,
+			ComputeResource:  cfg.AlayaNeW.ComputeResource,
+			NASStorageID:     cfg.AlayaNeW.NASStorageID,
+			NASFileDirectory: cfg.AlayaNeW.NASFileDirectory,
+			NASMountPath:     cfg.AlayaNeW.NASMountPath,
+			NASReadOnly:      cfg.AlayaNeW.NASReadOnly,
+			Env:              cfg.AlayaNeW.Env,
+			Timeout:          cfg.AlayaNeW.Timeout.Duration(),
+			WaitTimeout:      cfg.AlayaNeW.WaitTimeout.Duration(),
 		})
 	default:
 		return nil, fmt.Errorf("unsupported adapter %q", cfg.Adapter)

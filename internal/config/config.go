@@ -178,7 +178,7 @@ type PartnerHTTPConfig struct {
 type PartnerConfig struct {
 	ID           string `yaml:"id" json:"id"`
 	ConsoleToken string `yaml:"console_token" json:"console_token"`
-	// Adapter is "static" or "http".
+	// Adapter is "static", "http" or "alayanew".
 	Adapter string `yaml:"adapter" json:"adapter"`
 	// PushToken authenticates the partner on POST /v1/capacity/events.
 	PushToken string `yaml:"push_token" json:"push_token"`
@@ -192,6 +192,33 @@ type PartnerConfig struct {
 	Instances []StaticInstanceConfig `yaml:"instances" json:"instances"`
 	// HTTP configures the generic HTTP adapter.
 	HTTP PartnerHTTPConfig `yaml:"http" json:"http"`
+	// AlayaNeW configures the 九章智算云 CCI adapter.
+	AlayaNeW *PartnerAlayaNeWConfig `yaml:"alayanew" json:"alayanew"`
+}
+
+// PartnerAlayaNeWConfig is the 九章智算云 adapter wiring. The credentials are
+// platform keys and must not appear in API responses or audit records.
+type PartnerAlayaNeWConfig struct {
+	AccessKey  string   `yaml:"access_key" json:"-"`
+	SecretKey  string   `yaml:"secret_key" json:"-"`
+	AIDCId     int      `yaml:"aidc_id" json:"aidc_id"`
+	Timeout    Duration `yaml:"timeout" json:"timeout"`
+	// ModelSupport is advertised on every discovered instance.
+	ModelSupport []string `yaml:"model_support" json:"model_support"`
+	// BootstrapPort / ServicePort are the container ports CCI publishes.
+	BootstrapPort int `yaml:"bootstrap_port" json:"bootstrap_port"`
+	ServicePort   int `yaml:"service_port" json:"service_port"`
+	// Creation defaults; empty product_code disables on-demand creation.
+	ProductCode      string            `yaml:"product_code" json:"product_code"`
+	Image            string            `yaml:"image" json:"image"`
+	ComputeResource  string            `yaml:"compute_resource" json:"compute_resource"`
+	NASStorageID     string            `yaml:"nas_storage_id" json:"nas_storage_id"`
+	NASFileDirectory string            `yaml:"nas_file_directory" json:"nas_file_directory"`
+	NASMountPath     string            `yaml:"nas_mount_path" json:"nas_mount_path"`
+	NASReadOnly      bool              `yaml:"nas_read_only" json:"nas_read_only"`
+	Env              map[string]string `yaml:"env" json:"env"`
+	// WaitTimeout bounds waiting for a created instance to reach RUNNING.
+	WaitTimeout Duration `yaml:"wait_timeout" json:"wait_timeout"`
 }
 
 // StaticInstanceConfig is one container of the static adapter.
@@ -423,8 +450,18 @@ func (p PartnerConfig) Validate() error {
 		if err := (partner.HTTPAdapterConfig{PartnerID: p.ID, BaseURL: p.HTTP.BaseURL, Timeout: p.HTTP.Timeout.Duration()}).Validate(); err != nil {
 			return fmt.Errorf("http adapter: %w", err)
 		}
+	case "alayanew":
+		if p.AlayaNeW == nil {
+			return errors.New("alayanew adapter requires alayanew configuration")
+		}
+		if p.AlayaNeW.AccessKey == "" || p.AlayaNeW.SecretKey == "" {
+			return errors.New("alayanew adapter requires access_key and secret_key")
+		}
+		if p.AlayaNeW.Timeout.Duration() <= 0 {
+			return errors.New("alayanew adapter requires a positive timeout")
+		}
 	default:
-		return fmt.Errorf("adapter must be static or http, got %q", p.Adapter)
+		return fmt.Errorf("adapter must be static, http or alayanew, got %q", p.Adapter)
 	}
 	if p.ReplayCacheSize < 0 {
 		return errors.New("replay_cache_size must not be negative")

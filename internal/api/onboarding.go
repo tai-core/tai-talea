@@ -59,6 +59,7 @@ func (s *Server) registerOnboarding(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
 	}))
 	mux.HandleFunc("POST /v1/capacity/console/onboarding", s.consoleAuth(s.handleOnboard))
+	s.registerProvision(mux)
 }
 func (s *Server) handleOnboard(w http.ResponseWriter, r *http.Request) {
 	if s.opts.Onboarding == nil {
