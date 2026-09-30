@@ -209,7 +209,8 @@ func (m *Manager) Submit(ctx context.Context, r Request) (Job, error) {
 		return Job{}, errors.New("上线队列已满，请稍后重试")
 	}
 	row, err := m.store.GetInstance(ctx, r.ID)
-	if err == nil && (row.PartnerID != r.PartnerID || row.InstanceState != domain.InstanceReleased) {
+	if err == nil && (row.PartnerID != r.PartnerID ||
+		(row.InstanceState != domain.InstanceReleased && row.InstanceState != domain.InstanceLost)) {
 		return Job{}, ErrConflict
 	}
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
