@@ -257,7 +257,7 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 		Endpoint: bootstrap,
 		Spec: domain.InstanceSpec{
 			GPU:          record.Resource.GPUName,
-			GPUCount:     record.Resource.GPUCount,
+			GPUCount:     int(record.Resource.GPUCount),
 			ModelSupport: a.cfg.ModelSupport,
 		},
 	}

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -113,6 +114,24 @@ func (c *Client) call(ctx context.Context, method, path, query string, body any,
 	return nil
 }
 
+// FlexInt accepts both JSON numbers and numeric strings: the platform API
+// returns gpuCount as a string on some endpoints and as a number on others.
+type FlexInt int
+
+func (f *FlexInt) UnmarshalJSON(data []byte) error {
+	text := strings.Trim(string(data), "\"")
+	if text == "" || text == "null" {
+		*f = 0
+		return nil
+	}
+	value, err := strconv.Atoi(text)
+	if err != nil {
+		return fmt.Errorf("not a number: %q", text)
+	}
+	*f = FlexInt(value)
+	return nil
+}
+
 // InstanceRecord is one entry of the instance list.
 type InstanceRecord struct {
 	ID       string `json:"id"`
@@ -121,10 +140,10 @@ type InstanceRecord struct {
 	AIDCId   int    `json:"aidcId"`
 	Image    string `json:"image"`
 	Resource struct {
-		GPUName  string `json:"gpuName"`
-		GPUCount int    `json:"gpuCount"`
-		CPUCores string `json:"cpuCores"`
-		MemoryGB string `json:"memoryGB"`
+		GPUName  string  `json:"gpuName"`
+		GPUCount FlexInt `json:"gpuCount"`
+		CPUCores string  `json:"cpuCores"`
+		MemoryGB string  `json:"memoryGB"`
 	} `json:"resource"`
 }
 
