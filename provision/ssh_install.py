@@ -219,8 +219,14 @@ def install(payload):
         emit(stage='校验并分发运行时制品')
         with client.open_sftp() as sftp:
             upload_files(client, sftp, files)
-            emit(stage='同步模型与节点管理程序')
-            upload_files(client, sftp, inventory(manifest['model_source'], manifest['model_target']))
+            if manifest.get('model_source'):
+                # Platforms that mount a shared model volume skip this: the
+                # weights are already at model_target and re-pushing 300+ GB
+                # over SFTP would be pure waste.
+                emit(stage='同步模型与节点管理程序')
+                upload_files(client, sftp, inventory(manifest['model_source'], manifest['model_target']))
+            else:
+                emit(stage='使用平台共享模型卷，跳过模型分发')
             source = '/opt/tai-talea/onboarding/bootstrap'
             upload_files(client, sftp, inventory(manifest['bootstrap_source'], source))
             seed = '/opt/tai-talea/onboarding/install_node.py'
