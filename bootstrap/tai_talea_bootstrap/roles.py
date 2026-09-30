@@ -35,6 +35,8 @@ ALLOWED_EXTRA_FLAGS = (
     "--disable-radix-cache",
     "--attention-backend",
     "--kv-cache-dtype",
+    "--load-format",
+    "--model-loader-extra-config",
     # GLM-5.3-Flash (Glm5NextForConditionalGeneration) verified configuration.
     # The DSA backends and deep_gemm MoE runner are what took single-stream
     # decoding from 9 to 113 tok/s on H100 (docs/glm53-h100-validation-2026-09-23.md).
