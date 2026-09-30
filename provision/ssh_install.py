@@ -144,6 +144,30 @@ print('{}')
 ''', checks, timeout=1800)
 
 
+def clear_remote_dir(client, target):
+    """Empty a remote directory before re-uploading a source tree.
+
+    upload_files transfers only what the checksum gate considers missing, so
+    files left by an earlier upload with a different layout survive forever.
+    A stale module at the tree root then shadows a standard-library module
+    inside the managed venv (a leftover profile.py breaks torch's cProfile
+    import), which is invisible to the checksum gate.
+    """
+    remote(client, r'''
+import json,os,shutil,sys
+for root in json.load(sys.stdin):
+    if not os.path.isdir(root):
+        continue
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+print("cleaned")
+''', [target], timeout=300)
+
+
 def inventory(source, destination):
     source = Path(source)
     if not source.is_dir():
@@ -231,6 +255,7 @@ def install(payload):
             else:
                 emit(stage='使用平台共享模型卷，跳过模型分发')
             source = '/opt/tai-talea/onboarding/bootstrap'
+            clear_remote_dir(client, source)
             upload_files(client, sftp, inventory(manifest['bootstrap_source'], source))
             seed = '/opt/tai-talea/onboarding/install_node.py'
             put_bytes(sftp, seed, Path(__file__).with_name('install_node.py').read_bytes())
