@@ -40,6 +40,11 @@ def install():
         env.update(cfg['environment'])
         env['PATH'] = '/opt/tai-talea/venv/bin:/usr/local/cuda/bin:' + os.environ.get('PATH','')
         env['PYTHONPATH'] = str(ROOT/'onboarding/bootstrap')
+        # PyPI mooncake wheels link libcudart.so.12 even on a CUDA 13 image;
+        # the wheelhouse ships the cu12 runtime and it must be discoverable.
+        cu12lib = ROOT / 'venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib'
+        if cu12lib.is_dir():
+            env['LD_LIBRARY_PATH'] = str(cu12lib) + (':' + env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
         if cfg.get('interface'): env['UCX_NET_DEVICES'] = cfg['interface']
         def run(argv, timeout=1800):
             result = subprocess.run(argv, stdout=log, stderr=log, env=env, timeout=timeout)
@@ -63,7 +68,7 @@ def install():
         run([str(ROOT/'venv/bin/python'),'-m','tai_talea_bootstrap','check','--profile',str(profile_path)],180)
         if cfg.get('transfer_backend', 'nixl') == 'mooncake':
             # sglang 0.5.x PD route: mooncake transfer engine instead of NIXL.
-            run([str(ROOT/'venv/bin/python'),'-c',"import torch,sglang,sgl_kernel,mooncake; assert torch.cuda.is_available(); print('mooncake transfer OK')"],180)
+            run([str(ROOT/'venv/bin/python'),'-c',"from mooncake.engine import TransferEngine; import torch,sglang,sgl_kernel; assert torch.cuda.is_available(); print('mooncake transfer OK')"],180)
         else:
             run([str(ROOT/'venv/bin/python'),'-c',"import torch,sglang,sgl_kernel; from nixl._api import nixl_agent,nixl_agent_config; assert torch.cuda.is_available(); a=nixl_agent('talea-install-check',nixl_agent_config(backends=['UCX'])); print(a.get_plugin_list())"],180)
         if not (Path(cfg['model_path'])/'config.json').is_file():
