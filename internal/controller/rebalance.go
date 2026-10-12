@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tai-core/tai-talea/internal/domain"
@@ -27,6 +28,12 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 	}
 
 	input := planner.Input{Now: c.now()}
+	if c.capacity != nil {
+		// Capacity the partner has accepted but not delivered is invisible
+		// everywhere else: on a full pool the container exists neither as
+		// serving nor as idle capacity, so only the executor knows it is coming.
+		input.Capacity = planner.CapacityState{Provisioning: c.capacity.OutstandingCapacity()}
+	}
 	var (
 		prefillServing int
 		decodeServing  int
@@ -80,6 +87,7 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 		return planner.Decision{}, err
 	}
 	c.publishPlanMetrics(prefillServing, decodeServing, decision)
+	c.recordGearChange(ctx, decision)
 
 	for _, action := range decision.Actions {
 		switch action.Kind {
@@ -103,10 +111,24 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 				c.log().Warn("planner drain failed", "instance_id", action.InstanceID, "error", err.Error())
 				continue
 			}
+		case planner.ActionProvision:
+			if !c.provisionCapacity(ctx, action) {
+				continue
+			}
+		case planner.ActionRelease:
+			// Releasing goes through the same durable intent as an operator
+			// reclaim: the instance drains first, and the intent survives a
+			// control plane restart.
+			if err := c.RequestReclaim(ctx, action.InstanceID,
+				"planner capacity release", c.DefaultDrainGrace()); err != nil {
+				c.log().Warn("planner capacity release failed",
+					"instance_id", action.InstanceID, "error", err.Error())
+				continue
+			}
 		}
 		if c.metrics != nil {
 			c.metrics.IncCounter(obs.MetricPlannerChangesTotal,
-				"PD planner role changes applied.",
+				"PD planner changes applied, including capacity requests.",
 				[]string{"kind", "role"}, "kind", string(action.Kind), "role", string(action.Role))
 		}
 		c.audit(ctx, auditForAction(action))
@@ -128,6 +150,105 @@ func auditForAction(action planner.Action) store.AuditEntry {
 			"reason":    action.Reason,
 		},
 	}
+}
+
+// provisionCapacity carries out a PROVISION decision.
+//
+// The planner only decides: creating a container needs the partner credentials
+// and the SSH onboarding intake, both of which belong to the API server. The
+// call is fire-and-forget on purpose - on a full pool the platform can hold the
+// creation in QUEUED for hours, so the controller tracks it through
+// OutstandingCapacity instead of waiting for it.
+func (c *Controller) provisionCapacity(ctx context.Context, action planner.Action) bool {
+	if c.capacity == nil {
+		c.log().Warn("planner asked for capacity but no provisioner is configured",
+			"role", string(action.Role), "count", action.Count, "reason", action.Reason)
+		return false
+	}
+	partnerID, ok := c.capacityPartner(ctx)
+	if !ok {
+		c.log().Warn("planner asked for capacity but no instance names a partner", "reason", action.Reason)
+		return false
+	}
+	requestID, err := c.capacity.RequestCapacity(ctx, partnerID)
+	if err != nil {
+		c.log().Warn("planner capacity request failed", "partner", partnerID, "error", err.Error())
+		return false
+	}
+	c.log().Info("planner requested capacity", "partner", partnerID, "role", string(action.Role),
+		"count", action.Count, "request", requestID, "reason", action.Reason)
+	return true
+}
+
+// capacityPartner names the partner to ask for more capacity. Provisioning
+// grows the pool we already run, so the pool is the authority on who to ask:
+// the partner of the instances that hold a role, and only failing that the
+// partner of any instance at all.
+func (c *Controller) capacityPartner(ctx context.Context) (string, bool) {
+	instances, err := c.store.ListInstances(ctx)
+	if err != nil {
+		return "", false
+	}
+	serving := map[string]int{}
+	any := map[string]int{}
+	for _, instance := range instances {
+		if instance.PartnerID == "" {
+			continue
+		}
+		any[instance.PartnerID]++
+		if instance.Role.Valid() {
+			serving[instance.PartnerID]++
+		}
+	}
+	if partnerID := mostFrequent(serving); partnerID != "" {
+		return partnerID, true
+	}
+	if partnerID := mostFrequent(any); partnerID != "" {
+		return partnerID, true
+	}
+	return "", false
+}
+
+// mostFrequent returns the highest scoring key, breaking ties by name so the
+// choice is stable across rounds.
+func mostFrequent(counts map[string]int) string {
+	best, bestCount := "", 0
+	for name, count := range counts {
+		if count > bestCount || (count == bestCount && name < best) {
+			best, bestCount = name, count
+		}
+	}
+	return best
+}
+
+// recordGearChange puts an automatic gear change in the audit trail. Auto mode
+// can move the target ratio without any instance changing role - the pool may
+// already fit the new rung - and a capacity decision that leaves no trace is
+// impossible to review later.
+func (c *Controller) recordGearChange(ctx context.Context, decision planner.Decision) {
+	if decision.EffectiveGear == "" {
+		return
+	}
+	c.mu.Lock()
+	previous := c.lastEffectiveGear
+	c.lastEffectiveGear = decision.EffectiveGear
+	c.mu.Unlock()
+	if previous == "" || previous == decision.EffectiveGear {
+		return
+	}
+	c.logger.Info("planner gear changed",
+		"mode", decision.Mode, "from", previous, "to", decision.EffectiveGear,
+		"configured_gear", decision.Gear, "reason", strings.Join(decision.Notes, "; "))
+	c.audit(ctx, store.AuditEntry{
+		Action: "planner_gear_change",
+		Details: map[string]string{
+			"mode":            decision.Mode,
+			"from_gear":       previous,
+			"to_gear":         decision.EffectiveGear,
+			"configured_gear": decision.Gear,
+			"reason":          strings.Join(decision.Notes, "; "),
+		},
+	})
 }
 
 // hasLiveService reports whether the instance carries a service state that the
@@ -206,6 +327,7 @@ func (c *Controller) checkRatioDrift(ctx context.Context, decision planner.Decis
 		Message:  "observed P/D ratio has been off target for several planner rounds",
 		Details: map[string]string{
 			"gear":           decision.Gear,
+			"effective_gear": decision.EffectiveGear,
 			"target_prefill": fmt.Sprintf("%d", decision.TargetPrefill),
 			"target_decode":  fmt.Sprintf("%d", decision.TargetDecode),
 			"serving_count":  fmt.Sprintf("%d", decision.ServingCount),

@@ -54,6 +54,13 @@ func (t *provisionTracker) list() []ProvisionRecord {
 	return out
 }
 
+func (t *provisionTracker) add(record ProvisionRecord) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	stored := record
+	t.byName[record.Name] = &stored
+}
+
 func (t *provisionTracker) update(name, state, stage string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -107,24 +114,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"message": "缺少 partner_id"})
 		return
 	}
-	adapter, ok := s.opts.Partners.Adapter(payload.PartnerID)
-	if !ok {
-		writeJSON(w, 400, map[string]string{"message": "未配置的合作商"})
-		return
-	}
-	// Two shapes of on-demand creation exist. A partner whose containers carry
-	// the bootstrap only needs creating; a partner that hands over a bare
-	// container needs the SSH pipeline behind it.
-	selfProvisioner, selfOK := adapter.(partner.SelfProvisioningAdapter)
-	sshProvisioner, sshOK := adapter.(partner.ProvisioningAdapter)
-	if !selfOK && !sshOK {
-		writeJSON(w, 400, map[string]string{"message": "该合作商不支持按需创建实例"})
-		return
-	}
-	if sshOK && s.opts.Onboarding == nil {
-		writeJSON(w, 503, map[string]string{"message": "控制节点尚未配置自动安装制品"})
-		return
-	}
 	if payload.Count < 1 {
 		payload.Count = 1
 	}
@@ -134,29 +123,92 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accepted := make([]ProvisionRecord, 0, payload.Count)
+	baseName := payload.Name
 	for i := 0; i < payload.Count; i++ {
-		name := payload.Name
-		if payload.Count > 1 || name == "" {
-			name = fmt.Sprintf("talea-%s-%s", payload.PartnerID, s.now().UTC().Format("0102-150405"))
-			if i > 0 {
-				name = fmt.Sprintf("%s-%d", name, i)
-			}
+		name := baseName
+		if i > 0 {
+			name = fmt.Sprintf("%s-%d", baseName, i)
 		}
-		if _, exists := provisionJobs.snapshot(name); exists {
-			writeJSON(w, 409, map[string]string{"message": "实例名已在创建中: " + name})
+		record, err := s.RequestCapacity(r.Context(), payload.PartnerID, name)
+		if err != nil {
+			writeJSON(w, provisionErrorStatus(err), map[string]string{"message": err.Error()})
 			return
 		}
-		now := s.now().UTC()
-		record := &ProvisionRecord{Name: name, PartnerID: payload.PartnerID, State: "QUEUED", CreatedAt: now, UpdatedAt: now}
-		provisionJobs.byName[name] = record
-		accepted = append(accepted, *record)
-		if selfOK {
-			go s.runSelfProvision(r.Context(), selfProvisioner, payload.PartnerID, name)
-		} else {
-			go s.runProvision(r.Context(), sshProvisioner, payload.PartnerID, name)
+		if baseName == "" {
+			baseName = record.Name
 		}
+		accepted = append(accepted, record)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "jobs": accepted})
+}
+
+// provisionErrorStatus maps a creation failure to the status the console shows.
+func provisionErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, errProvisionUnsupportedPartner):
+		return http.StatusBadRequest
+	case errors.Is(err, errProvisionNoOnboarding):
+		return http.StatusServiceUnavailable
+	case errors.Is(err, errProvisionNameInUse):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// RequestCapacity starts one on-demand creation without an HTTP request behind
+// it, so the console and the automatic capacity loop go through exactly one
+// provisioning path. It returns as soon as the job is recorded: creating a
+// container on a full pool can stay QUEUED for hours.
+func (s *Server) RequestCapacity(ctx context.Context, partnerID, name string) (ProvisionRecord, error) {
+	adapter, ok := s.opts.Partners.Adapter(partnerID)
+	if !ok {
+		return ProvisionRecord{}, fmt.Errorf("%w: %s", errProvisionUnsupportedPartner, partnerID)
+	}
+	// Two shapes of on-demand creation exist. A partner whose containers carry
+	// the bootstrap only needs creating; a partner that hands over a bare
+	// container needs the SSH pipeline behind it.
+	selfProvisioner, selfOK := adapter.(partner.SelfProvisioningAdapter)
+	sshProvisioner, sshOK := adapter.(partner.ProvisioningAdapter)
+	if !selfOK && !sshOK {
+		return ProvisionRecord{}, fmt.Errorf("%w: %s", errProvisionUnsupportedPartner, partnerID)
+	}
+	if sshOK && s.opts.Onboarding == nil {
+		return ProvisionRecord{}, errProvisionNoOnboarding
+	}
+	if name == "" {
+		name = fmt.Sprintf("talea-%s-%s", partnerID, s.now().UTC().Format("0102-150405"))
+	}
+	if _, exists := provisionJobs.snapshot(name); exists {
+		return ProvisionRecord{}, fmt.Errorf("%w: %s", errProvisionNameInUse, name)
+	}
+	now := s.now().UTC()
+	record := ProvisionRecord{
+		Name: name, PartnerID: partnerID, State: "QUEUED", CreatedAt: now, UpdatedAt: now,
+	}
+	provisionJobs.add(record)
+	if selfOK {
+		go s.runSelfProvision(ctx, selfProvisioner, partnerID, name)
+	} else {
+		go s.runProvision(ctx, sshProvisioner, partnerID, name)
+	}
+	return record, nil
+}
+
+// OutstandingProvisions counts creations that have not reached a terminal
+// state. The planner uses it to avoid asking again while the platform is still
+// deciding whether to hand over a container, which is the difference between
+// one request and one request every planner round for hours.
+func OutstandingProvisions() int {
+	outstanding := 0
+	for _, record := range provisionJobs.list() {
+		switch record.State {
+		case "MANAGED", "FAILED":
+		default:
+			outstanding++
+		}
+	}
+	return outstanding
 }
 
 // provisionTimeout bounds one end-to-end creation. A partner whose pool is
@@ -296,4 +348,10 @@ func (s *Server) runProvision(parent context.Context, provisioner partner.Provis
 	logger.Info("provisioned instance handed to onboarding", "host", access.Host, "port", access.Port, "enrol_id", enrolID)
 }
 
-var errProvisionNotFound = errors.New("provision job not found")
+var (
+	errProvisionNotFound = errors.New("provision job not found")
+	// The three creation failures the console reports with a specific status.
+	errProvisionUnsupportedPartner = errors.New("未配置或不支持按需创建的合作商")
+	errProvisionNoOnboarding       = errors.New("控制节点尚未配置自动安装制品")
+	errProvisionNameInUse          = errors.New("实例名已在创建中")
+)

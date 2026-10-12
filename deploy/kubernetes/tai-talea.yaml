@@ -122,12 +122,26 @@ router:
   prefill_bootstrap_port: 8998
 
 planner:
+  # fixed: apply the gear below. auto: walk the gear ladder towards the role
+  # that reports the higher scheduler pressure, one step per cooldown window.
+  mode: fixed
   # One prefill to one decode. Raise only after measuring the prefill share.
+  # In auto mode this is the anchor the ladder starts from.
   gear: "1:1"
   max_change_per_round: 1
   min_hold: 120s
   cooldown: 60s
   max_serving: 0
+  # auto mode only: the pressure gap that justifies a step. 0.2 matches the
+  # threshold the sampler uses before it advises adding capacity.
+  auto_dead_band: 0.2
+  # The planner may ask the partner for one more instance when the gear ladder is
+  # saturated and requests are still queueing, and hand one back when the pool is
+  # idle. Off by default: a released container's name cannot be created again on
+  # AlayaNeW (status 212035) and a create request can stay QUEUED for hours.
+  capacity_actions: false
+  # capacity_actions only: how idle both roles must be before one is handed back.
+  auto_release_below: 0.1
 
 # The namespace itself is the source of truth: every Pod carrying this
 # partner's labels is capacity. Leaving pull disabled means new Pods are only

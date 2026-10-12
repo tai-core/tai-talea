@@ -70,7 +70,10 @@ router:
   prefill_bootstrap_port: 8998
 
 planner:
-  # §11 manual gear. Supported: 1:1, 2:1, 1:2.
+  # fixed: §11 manual gear. auto: follow the measured P/D pressure, one rung per
+  # cooldown window (milestone 3).
+  mode: fixed
+  # Supported: 1:1, 2:1, 1:2. In auto mode the ladder starts here.
   gear: "1:1"
   max_change_per_round: 1
   min_hold: 120s
@@ -78,6 +81,12 @@ planner:
   # 0 means "use every available instance": we never invent capacity the partner
   # did not offer.
   max_serving: 0
+  # auto mode only: the pressure gap that justifies a step.
+  auto_dead_band: 0.2
+  # Capacity verbs (milestone 3): PROVISION when the ladder is saturated and
+  # requests are still queueing, RELEASE when the pool is idle everywhere.
+  capacity_actions: false
+  auto_release_below: 0.1
 
 # Enable after validating the partner's complete snapshot/release contract.
 # Both HTTP queries must provide a consistent, complete, unpaginated view.

@@ -373,12 +373,14 @@ func (s *Server) handleListEvents(writer http.ResponseWriter, request *http.Requ
 }
 
 func (s *Server) handleGetPlanner(writer http.ResponseWriter, request *http.Request) {
+	instance := s.opts.Controller.Planner()
 	writeJSON(writer, http.StatusOK, map[string]any{
-		"mode":               "fixed",
-		"last_observed_load": s.opts.Controller.Planner().LastObservedLoad(),
-		"gear":               s.opts.Controller.Planner().Config().Gear,
+		"mode":               instance.Mode(),
+		"last_observed_load": instance.LastObservedLoad(),
+		"gear":               instance.Config().Gear,
+		"effective_gear":     instance.EffectiveGear(),
 		"gears":              planner.GearNames(),
-		"last_change":        s.opts.Controller.Planner().LastChangeAt(),
+		"last_change":        instance.LastChangeAt(),
 	})
 }
 
@@ -390,16 +392,37 @@ func (s *Server) handleSetPlannerGear(writer http.ResponseWriter, request *http.
 	}
 	var payload struct {
 		Gear string `json:"gear"`
+		// Mode is optional: omitting it leaves the running mode alone, so the
+		// existing caller that only sets a gear keeps working unchanged.
+		Mode *string `json:"mode"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid_payload", "message": err.Error()})
 		return
 	}
-	if err := s.opts.Controller.Planner().SetGear(payload.Gear); err != nil {
-		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid_gear", "message": err.Error()})
-		return
+	instance := s.opts.Controller.Planner()
+	// An omitted gear means "leave the gear alone", so a caller that only wants
+	// to switch modes does not have to repeat the current gear.
+	if payload.Gear != "" {
+		if err := instance.SetGear(payload.Gear); err != nil {
+			writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid_gear", "message": err.Error()})
+			return
+		}
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"gear": payload.Gear, "gears": planner.GearNames()})
+	if payload.Mode != nil {
+		// The gear is applied first so switching to auto starts the ladder from
+		// the gear this request just asked for, not from a stale rung.
+		if err := instance.SetMode(*payload.Mode); err != nil {
+			writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "invalid_mode", "message": err.Error()})
+			return
+		}
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"mode":           instance.Mode(),
+		"gear":           instance.Config().Gear,
+		"gears":          planner.GearNames(),
+		"effective_gear": instance.EffectiveGear(),
+	})
 }
 
 func (s *Server) handleReconcile(writer http.ResponseWriter, request *http.Request) {

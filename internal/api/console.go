@@ -35,7 +35,13 @@ func (s *Server) registerConsole(mux *http.ServeMux) {
 	mux.Handle("GET /ui/", secure(http.StripPrefix("/ui/", assets)))
 	s.registerOnboarding(mux)
 	mux.HandleFunc("GET /v1/capacity/console/telemetry", s.consoleAuth(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"telemetry": s.opts.Controller.Telemetry(consolePartner(r)), "planner_mode": "fixed", "gear": s.opts.Controller.Planner().Config().Gear})
+		instance := s.opts.Controller.Planner()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"telemetry":      s.opts.Controller.Telemetry(consolePartner(r)),
+			"planner_mode":   instance.Mode(),
+			"gear":           instance.Config().Gear,
+			"effective_gear": instance.EffectiveGear(),
+		})
 	}))
 	mux.HandleFunc("GET /v1/capacity/console", s.consoleAuth(func(w http.ResponseWriter, r *http.Request) {
 		modes := map[string]string{}
@@ -50,6 +56,10 @@ func (s *Server) registerConsole(mux *http.ServeMux) {
 			"partner_id": consolePartner(r), "onboarding_enabled": s.opts.Onboarding != nil,
 			"drain_grace_seconds": int(s.opts.Controller.DefaultDrainGrace().Seconds()),
 			"reconcile_seconds":   int(s.opts.Config.Controller.ReconcileInterval.Duration().Seconds()),
+			// Whether the planner may ask the platform for capacity, so the
+			// console never claims a switch is on when it is not.
+			"planner_mode":     s.opts.Controller.Planner().Mode(),
+			"capacity_actions": s.opts.Config.Planner.CapacityActions,
 		})
 	}))
 }

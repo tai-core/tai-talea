@@ -134,6 +134,84 @@ func TestCollectionRoleMismatchAndMissingMetrics(t *testing.T) {
 		t.Fatal("failure reported as zero or old data")
 	}
 }
+
+// TestPrefillGaugeRenameIsAccepted pins the rename that silently disabled the
+// load input in the deployed cluster: SGLang 0.5.20 exports
+// num_prefill_bootstrap_queue_reqs and no longer exports
+// num_prefill_prealloc_queue_reqs at all. Only the old name was read, so
+// Prealloc stayed nil, the availability gate failed, and Snapshot.Complete went
+// false on every round - which switched off the very input capacity decisions
+// are supposed to rest on, with a symptom ("缺少调度指标") that named nothing.
+func TestPrefillGaugeRenameIsAccepted(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		prealloc string
+	}{
+		{"legacy prealloc gauge", "num_prefill_prealloc_queue_reqs"},
+		{"renamed bootstrap gauge", "num_prefill_bootstrap_queue_reqs"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/server_info" {
+					fmt.Fprint(w, `{"disaggregation_mode":"prefill","tp_size":1,"dp_size":1,"internal_states":[{"effective_max_running_requests_per_dp":8}]}`)
+					return
+				}
+				fmt.Fprintf(w, "sglang:num_running_reqs 2\nsglang:num_queue_reqs 1\nsglang:%s 1\nsglang:num_prefill_inflight_queue_reqs 0\n",
+					testCase.prealloc)
+			}))
+			defer worker.Close()
+			c := New(fakeInventory{{
+				ID: "p", PartnerID: "owner", ServiceEndpoint: worker.URL,
+				Role: domain.RolePrefill, ServiceState: domain.ServiceServing,
+			}}, fakeRouter{{Worker: worker.URL, Load: 0}})
+			c.Sample(t.Context())
+			n := c.Snapshot("owner").Nodes[0]
+			if !n.Available || n.Error != "" {
+				t.Fatalf("prefill sample must be usable with %s: %+v", testCase.prealloc, n)
+			}
+			if n.Prealloc == nil || *n.Prealloc != 1 {
+				t.Fatalf("prealloc not read from %s: %+v", testCase.prealloc, n)
+			}
+			if n.Pressure == nil || *n.Pressure != .5 {
+				t.Fatalf("pressure from (2 running + 1 queue + 1 prealloc) / 8: %+v", n)
+			}
+		})
+	}
+}
+
+// TestMissingGaugeIsNamedInTheError: when the gate does fail, the error has to
+// name the gauge. "缺少调度指标" on its own is what sent one investigation
+// through three wrong hypotheses before the actual metric name was found by
+// comparing raw exports by hand.
+func TestMissingGaugeIsNamedInTheError(t *testing.T) {
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/server_info" {
+			fmt.Fprint(w, `{"disaggregation_mode":"prefill","tp_size":1,"dp_size":1,"internal_states":[{"effective_max_running_requests_per_dp":8}]}`)
+			return
+		}
+		// No prealloc gauge under either name, and no transfer gauge.
+		fmt.Fprintln(w, "sglang:num_running_reqs 2\nsglang:num_queue_reqs 1")
+	}))
+	defer worker.Close()
+	c := New(fakeInventory{{
+		ID: "p", PartnerID: "owner", ServiceEndpoint: worker.URL,
+		Role: domain.RolePrefill, ServiceState: domain.ServiceServing,
+	}}, fakeRouter{{Worker: worker.URL, Load: 0}})
+	c.Sample(t.Context())
+	n := c.Snapshot("owner").Nodes[0]
+	if n.Available {
+		t.Fatalf("a missing gauge must not report as available: %+v", n)
+	}
+	for _, want := range []string{"num_prefill_bootstrap_queue_reqs", "num_prefill_inflight_queue_reqs"} {
+		if !strings.Contains(n.Error, want) {
+			t.Fatalf("error must name %s, got %q", want, n.Error)
+		}
+	}
+	if strings.Contains(n.Error, "num_running_reqs") {
+		t.Fatalf("error must not name gauges that were present: %q", n.Error)
+	}
+}
+
 func TestStaleAndPartialAggregates(t *testing.T) {
 	at := time.Now().UTC()
 	n := Node{ID: "p", Role: domain.RolePrefill, Available: true, SampledAt: at, Running: number(2), Queue: number(1), Prealloc: number(0), Transfer: number(0), MaxRunning: number(8), InputRate: number(20)}

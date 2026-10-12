@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/tai-core/tai-talea/internal/domain"
 	"github.com/tai-core/tai-talea/internal/launcher"
 	"github.com/tai-core/tai-talea/internal/partner"
+	"github.com/tai-core/tai-talea/internal/planner"
 	"github.com/tai-core/tai-talea/internal/routeradapter"
 	"github.com/tai-core/tai-talea/internal/store"
 )
@@ -303,16 +305,124 @@ func TestReconcileDoesNotInterruptAnOwnedStart(t *testing.T) {
 	}
 }
 
-func TestPlannerReassignmentHonorsDrainGrace(t *testing.T) {
+type fakeCapacityRequester struct {
+	requests    []string
+	outstanding int
+	err         error
+}
+
+func (f *fakeCapacityRequester) RequestCapacity(_ context.Context, partnerID string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	f.requests = append(f.requests, partnerID)
+	return "request-1", nil
+}
+
+func (f *fakeCapacityRequester) OutstandingCapacity() int { return f.outstanding }
+
+// TestPlannerProvisionReachesTheRequester: the planner decides that the pool is
+// too small, the executor asks the partner. The request has to name the partner
+// of the pool we already run, because that is the only one we can grow.
+func TestPlannerProvisionReachesTheRequester(t *testing.T) {
 	h := servingHarness(t)
-	h.router.setLoad(h.bootstrap.Endpoint(), 3)
-	// A single P worker needs conversion to the configured one-worker D target.
-	decision, err := h.ctrl.Rebalance(t.Context())
+	requester := &fakeCapacityRequester{}
+	h.ctrl.capacity = requester
+	action := planner.Action{
+		Kind: planner.ActionProvision, Role: domain.RolePrefill, Count: 1,
+		Reason: "the gear ladder is already at its prefill end and prefill is still queueing",
+	}
+	if !h.ctrl.provisionCapacity(context.Background(), action) {
+		t.Fatal("a wired requester must carry the request out")
+	}
+	if len(requester.requests) != 1 || requester.requests[0] != "partner-a" {
+		t.Fatalf("requests=%v, want one for partner-a", requester.requests)
+	}
+}
+
+// TestPlannerProvisionWithoutARequesterIsReported: an executor that cannot carry
+// a request out must report that, rather than let the round look successful.
+func TestPlannerProvisionWithoutARequesterIsReported(t *testing.T) {
+	h := newHarness(t)
+	if h.ctrl.provisionCapacity(context.Background(), planner.Action{Kind: planner.ActionProvision, Count: 1}) {
+		t.Fatal("without a provisioner the request cannot be carried out")
+	}
+}
+
+// Auto mode can move the target ratio without any instance changing role,
+// because the pool may already fit the new rung. That is still a capacity
+// decision, so it has to be reviewable afterwards.
+func TestAutomaticGearChangeIsAuditedOnce(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.ctrl.recordGearChange(ctx, planner.Decision{Mode: planner.ModeAuto, Gear: "1:1", EffectiveGear: "1:1"})
+	moved := planner.Decision{
+		Mode: planner.ModeAuto, Gear: "1:1", EffectiveGear: "2:1",
+		Notes: []string{"auto mode moves 1:1 -> 2:1: prefill pressure 0.900 and decode pressure 0.100 with 3 queued (gap +0.800)"},
+	}
+	h.ctrl.recordGearChange(ctx, moved)
+	// Repeating the same gear is not a change.
+	h.ctrl.recordGearChange(ctx, moved)
+
+	entries, err := h.store.ListAudit(ctx, "", 50)
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	changes := 0
+	for _, entry := range entries {
+		if entry.Action != "planner_gear_change" {
+			continue
+		}
+		changes++
+		if entry.Details["from_gear"] != "1:1" || entry.Details["to_gear"] != "2:1" {
+			t.Fatalf("gear change details=%v", entry.Details)
+		}
+		if entry.Details["reason"] == "" {
+			t.Fatal("a gear change must record the load that caused it")
+		}
+	}
+	if changes != 1 {
+		t.Fatalf("gear change audit entries=%d, want 1", changes)
+	}
+}
+
+// The planner refuses to move the last worker out of a role, so the smallest
+// pool that can legally be rebalanced is two Prefills under a 1:1 gear: one
+// converts to Decode and the other keeps serving. The point of the test is the
+// second half - the drain opened by that conversion must wait for the requests
+// already in flight instead of stopping the service immediately.
+func TestPlannerReassignmentHonorsDrainGrace(t *testing.T) {
+	h := newHarness(t,
+		partner.CapacityInstance{ID: "container-1", Endpoint: "http://10.0.0.1:8080", LeaseID: "lease-1"},
+		partner.CapacityInstance{ID: "container-2", Endpoint: "http://10.0.0.2:8080", LeaseID: "lease-2"},
+	)
+	for _, id := range []string{"container-1", "container-2"} {
+		suffix := strings.TrimPrefix(id, "container-")
+		endpoint := "http://10.0.0." + suffix + ":8080"
+		h.handle(h.addedEvent(id, endpoint, "lease-"+suffix, h.clock.Now()))
+		if err := h.ctrl.StartService(context.Background(), id, domain.RolePrefill); err != nil {
+			t.Fatalf("start %s: %v", id, err)
+		}
+	}
+	// Two Prefills need one Decode, and container-1 sorts first, so it is the
+	// worker the round will convert.
+	if !h.router.setLoad("http://10.0.0.1:8080", 3) {
+		t.Fatal("the router must know the address of the worker about to be converted")
+	}
+	decision, err := h.ctrl.Rebalance(context.Background())
 	if err != nil || len(decision.Actions) != 1 {
 		t.Fatalf("expected role change: %+v %v", decision, err)
+	}
+	action := decision.Actions[0]
+	if action.Kind != planner.ActionReassign || action.FromRole != domain.RolePrefill || action.Role != domain.RoleDecode {
+		t.Fatalf("want a prefill -> decode reassignment, got %+v", action)
 	}
 	h.reconcile()
 	if _, stops, _ := h.bootstrap.counts(); stops != 0 {
 		t.Fatal("planner immediately killed outstanding requests")
+	}
+	if h.instance("container-1").ServiceState != domain.ServiceDraining {
+		t.Fatalf("a worker with 3 requests in flight must stay DRAINING, got %s",
+			h.instance("container-1").ServiceState)
 	}
 }

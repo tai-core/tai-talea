@@ -120,7 +120,8 @@ function renderJobs() {
 
 function fmt(value,digits=0) {return typeof value==="number"&&Number.isFinite(value)?value.toFixed(digits):"—";}
 function renderTelemetry(result) {
-  const t=result.telemetry; $("planner-mode").textContent="固定配比 "+result.gear;
+  const t=result.telemetry;
+  $("planner-mode").textContent=result.planner_mode==="auto"?"自动配比 "+result.effective_gear+"（基准 "+result.gear+"）":"固定配比 "+result.gear;
   $("metrics-time").textContent=t.at&&!t.at.startsWith("0001")?"采样于 "+new Date(t.at).toLocaleTimeString("zh-CN")+" · 每 3 秒采集 · 最近 5 分钟":"等待采样";
   for(const [prefix,r] of [["p",t.prefill],["d",t.decode]]) {
     $(prefix+"-rate").textContent=typeof r.tokens_per_second==="number"?r.tokens_per_second.toLocaleString("zh-CN",{minimumFractionDigits:1,maximumFractionDigits:1}):"—";

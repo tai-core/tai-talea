@@ -58,6 +58,21 @@ type PartnerResolver interface {
 	Adapter(partnerID string) (partner.PartnerAdapter, bool)
 }
 
+// CapacityRequester asks the partner for one more instance and reports how many
+// requests are still open.
+//
+// It exists because the planner may decide *that* capacity is needed, but it
+// must not hold the credentials or the SSH onboarding intake that actually
+// create a container: those live on the API server. The implementation is
+// expected to be asynchronous, because a create request on a full pool can sit
+// QUEUED in the platform for hours and must never block a planner round.
+type CapacityRequester interface {
+	// RequestCapacity starts one creation and returns its identifier.
+	RequestCapacity(ctx context.Context, partnerID string) (string, error)
+	// OutstandingCapacity counts creations that have not finished yet.
+	OutstandingCapacity() int
+}
+
 // Deps are the controller collaborators.
 type Deps struct {
 	Config   config.Config
@@ -71,6 +86,9 @@ type Deps struct {
 	Alerter  *obs.Alerter
 	Logger   *slog.Logger
 	Now      func() time.Time
+	// Capacity is optional. Without it the controller still records the
+	// planner's PROVISION decisions, but cannot carry them out.
+	Capacity CapacityRequester
 }
 
 // Controller owns the dual-layer state machine.
@@ -83,13 +101,17 @@ type Controller struct {
 	manager   InstanceManager
 	partners  PartnerResolver
 	planner   *planner.Planner
+	capacity  CapacityRequester
 	metrics   *obs.Registry
 	alerts    *obs.Alerter
 	logger    *slog.Logger
 	now       func() time.Time
 
-	mu                 sync.Mutex
-	ratioStreak        int
+	mu          sync.Mutex
+	ratioStreak int
+	// lastEffectiveGear records the gear the planner actually applied, so an
+	// automatic change can be audited even when it produced no role change.
+	lastEffectiveGear  string
 	instanceOperations sync.Map
 	eventOperations    [64]sync.Mutex
 	capacityAdmissions sync.Mutex
@@ -154,6 +176,7 @@ func New(deps Deps) (*Controller, error) {
 		manager:   deps.Manager,
 		partners:  deps.Partners,
 		planner:   deps.Planner,
+		capacity:  deps.Capacity,
 		metrics:   deps.Metrics,
 		alerts:    deps.Alerter,
 		logger:    logger,

@@ -141,21 +141,29 @@ func (c RouterConfig) ToAdapter() routeradapter.Config {
 
 // PlannerConfig wraps the planner configuration.
 type PlannerConfig struct {
+	Mode              string   `yaml:"mode" json:"mode"`
 	Gear              string   `yaml:"gear" json:"gear"`
 	MaxChangePerRound int      `yaml:"max_change_per_round" json:"max_change_per_round"`
 	MinHold           Duration `yaml:"min_hold" json:"min_hold"`
 	Cooldown          Duration `yaml:"cooldown" json:"cooldown"`
 	MaxServing        int      `yaml:"max_serving" json:"max_serving"`
+	AutoDeadBand      float64  `yaml:"auto_dead_band" json:"auto_dead_band"`
+	CapacityActions   bool     `yaml:"capacity_actions" json:"capacity_actions"`
+	AutoReleaseBelow  float64  `yaml:"auto_release_below" json:"auto_release_below"`
 }
 
 // ToPlanner converts the configuration into a planner configuration.
 func (c PlannerConfig) ToPlanner() planner.Config {
 	return planner.Config{
+		Mode:              c.Mode,
 		Gear:              c.Gear,
 		MaxChangePerRound: c.MaxChangePerRound,
 		MinHold:           c.MinHold.Duration(),
 		Cooldown:          c.Cooldown.Duration(),
 		MaxServing:        c.MaxServing,
+		AutoDeadBand:      c.AutoDeadBand,
+		CapacityActions:   c.CapacityActions,
+		AutoReleaseBelow:  c.AutoReleaseBelow,
 	}
 }
 
@@ -406,10 +414,13 @@ func Default() Config {
 			Timeout: Duration(10 * time.Second),
 		},
 		Planner: PlannerConfig{
+			Mode:              planner.ModeFixed,
 			Gear:              "1:1",
 			MaxChangePerRound: 1,
 			MinHold:           Duration(120 * time.Second),
 			Cooldown:          Duration(60 * time.Second),
+			AutoDeadBand:      planner.DefaultDeadBand,
+			AutoReleaseBelow:  planner.DefaultReleaseBelow,
 		},
 		Pull: PullConfig{
 			Enabled:          false,

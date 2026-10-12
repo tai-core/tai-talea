@@ -133,13 +133,24 @@ func (c *Collector) scrape(ctx context.Context, instance domain.Instance, old No
 	n.Running = value(n.counters, "num_running_reqs")
 	n.Queue = value(n.counters, "num_queue_reqs")
 	n.Cache = value(n.counters, "token_usage")
+	// The prefill gauge was renamed: the 0.5.20 build exports
+	// num_prefill_bootstrap_queue_reqs and no longer exports
+	// num_prefill_prealloc_queue_reqs at all. Reading only the old name left
+	// Prealloc nil, which failed the gate below and made the entire P/D sample
+	// incomplete - so one renamed counter quietly switched off the load input
+	// that every capacity decision is supposed to rest on. Both names are
+	// accepted now, old first so a rollback keeps working.
+	var preallocKeys []string
+	var transferKey string
 	if n.Role == domain.RolePrefill {
-		n.Prealloc = value(n.counters, "num_prefill_prealloc_queue_reqs")
-		n.Transfer = value(n.counters, "num_prefill_inflight_queue_reqs")
+		preallocKeys = []string{"num_prefill_prealloc_queue_reqs", "num_prefill_bootstrap_queue_reqs"}
+		transferKey = "num_prefill_inflight_queue_reqs"
 	} else {
-		n.Prealloc = value(n.counters, "num_decode_prealloc_queue_reqs")
-		n.Transfer = value(n.counters, "num_decode_transfer_queue_reqs")
+		preallocKeys = []string{"num_decode_prealloc_queue_reqs"}
+		transferKey = "num_decode_transfer_queue_reqs"
 	}
+	n.Prealloc = valueAny(n.counters, preallocKeys...)
+	n.Transfer = value(n.counters, transferKey)
 	raw, err = c.get(ctx, strings.TrimRight(instance.ServiceURL(), "/")+"/server_info")
 	var info struct {
 		Role   domain.Role `json:"disaggregation_mode"`
@@ -194,7 +205,25 @@ func (c *Collector) scrape(ctx context.Context, instance domain.Instance, old No
 	}
 	n.Available = n.Running != nil && n.Queue != nil && n.MaxRunning != nil && n.Prealloc != nil && n.Transfer != nil
 	if !n.Available {
-		n.Error = "缺少调度指标或有效并发上限"
+		// Name what is missing. "缺少调度指标" alone sent one investigation
+		// through three wrong hypotheses; the metric name would have ended it.
+		missing := make([]string, 0, 5)
+		if n.Running == nil {
+			missing = append(missing, "num_running_reqs")
+		}
+		if n.Queue == nil {
+			missing = append(missing, "num_queue_reqs")
+		}
+		if n.MaxRunning == nil {
+			missing = append(missing, "effective_max_running_requests_per_dp")
+		}
+		if n.Prealloc == nil {
+			missing = append(missing, strings.Join(preallocKeys, "|"))
+		}
+		if n.Transfer == nil {
+			missing = append(missing, transferKey)
+		}
+		n.Error = "缺少调度指标或有效并发上限（缺 " + strings.Join(missing, ", ") + "）"
 		return n
 	}
 	n.Pressure = number((*n.Running + *n.Queue + *n.Prealloc) / *n.MaxRunning)

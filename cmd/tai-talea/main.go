@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -141,6 +142,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("planner: %w", err)
 	}
+	// The planner can ask for capacity, but the creation pipeline needs the SSH
+	// onboarding intake, which is built after the controller. The bridge is
+	// bound to the API server as soon as it exists.
+	capacity := &capacityBridge{}
 
 	ctrl, err := controller.New(controller.Deps{
 		Config:   cfg,
@@ -150,6 +155,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Manager:  manager,
 		Partners: registry,
 		Planner:  plannerInstance,
+		Capacity: capacity,
 		Metrics:  metrics,
 		Alerter:  alerter,
 		Logger:   logger,
@@ -182,6 +188,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	capacity.bind(apiServer)
+	logger.Info("planner configuration",
+		"mode", plannerInstance.Mode(), "gear", cfg.Planner.Gear,
+		"capacity_actions", cfg.Planner.CapacityActions,
+		"provision_timeout", cfg.Controller.ProvisionTimeout.Duration().String())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -254,6 +265,41 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 // bootstrapVersion is the runtime launcher contract the control plane requires
 // from a container (development document §9 and §10).
 const bootstrapVersion = "tai-talea-bootstrap/1"
+
+// capacityBridge hands the controller a way to ask for capacity without giving
+// it the provisioning pipeline. The pipeline needs the SSH onboarding intake,
+// which is created after the controller, so the bridge is bound once the API
+// server exists and stays empty until then.
+//
+// The count comes from the API server's own job tracker: a creation the platform
+// has queued is invisible everywhere else, so that tracker is the only place
+// that knows capacity is already on its way.
+type capacityBridge struct {
+	mu     sync.RWMutex
+	server *api.Server
+}
+
+func (b *capacityBridge) bind(server *api.Server) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.server = server
+}
+
+func (b *capacityBridge) RequestCapacity(ctx context.Context, partnerID string) (string, error) {
+	b.mu.RLock()
+	server := b.server
+	b.mu.RUnlock()
+	if server == nil {
+		return "", errors.New("provisioning pipeline is not available yet")
+	}
+	record, err := server.RequestCapacity(ctx, partnerID, "")
+	if err != nil {
+		return "", err
+	}
+	return record.Name, nil
+}
+
+func (b *capacityBridge) OutstandingCapacity() int { return api.OutstandingProvisions() }
 
 func newLogger(level string) *slog.Logger {
 	var parsed slog.Level

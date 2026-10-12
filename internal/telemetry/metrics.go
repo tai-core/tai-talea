@@ -65,6 +65,22 @@ func value(m map[string]float64, key string) *float64 {
 	}
 	return number(v)
 }
+
+// valueAny returns the first key that is present, in order.
+//
+// SGLang renames scheduler gauges between releases, and a missing gauge is not
+// a soft degradation here: the availability gate requires every gauge in the
+// set, so one rename makes the whole P/D sample incomplete and silently turns
+// off the load input. Reading a list of acceptable names keeps a rename from
+// being indistinguishable from "the worker is unwell".
+func valueAny(m map[string]float64, keys ...string) *float64 {
+	for _, key := range keys {
+		if v, ok := m[key]; ok {
+			return number(v)
+		}
+	}
+	return nil
+}
 func delta(now, before map[string]float64, key string, seconds float64) *float64 {
 	a, aok := now[key]
 	b, bok := before[key]
