@@ -4,19 +4,37 @@ This image packages the repository's Python bootstrap on top of a partner suppli
 
 ## Build
 
-The base image is intentionally supplied by the partner. It must contain the
-validated CUDA/Torch/SGLang/NIXL runtime, `/opt/tai-talea/venv/bin/python` and
-the locked wheelhouse:
+Two shapes are supported. Which one applies is decided by whether the base
+image already carries a runtime.
+
+**The base image supplies the runtime.** It must contain the validated
+CUDA/Torch/SGLang runtime, `/opt/tai-talea/venv/bin/python` and the locked
+wheelhouse:
 
 ```sh
 docker build \
   --build-arg BASE_IMAGE=<partner-registry>/<approved-sglang-runtime>:<immutable-tag> \
-  --build-arg TALEA_CUDA=12.8 \
-  --build-arg TALEA_PYTHON=3.10 \
-  --build-arg TALEA_SGLANG='<validated-sglang-version>' \
   -t <your-registry>/tai-talea-worker:<tag> \
   -f deploy/container/Dockerfile .
 ```
+
+**This repository supplies the runtime.** Pass `WHEELHOUSE_DIR` -- a path inside
+the build context, produced and verified by `provision/wheelhouse` -- and the
+image installs the locked runtime from it with no package index in reach:
+
+```sh
+# cwd is the repository root
+docker build \
+  --build-arg BASE_IMAGE=<bare cuda image> \
+  --build-arg WHEELHOUSE_DIR=provision/wheelhouse/out \
+  -t <your-registry>/tai-talea-worker:<tag> \
+  -f deploy/container/Dockerfile .
+```
+
+The install itself is `deploy/container/runtime-layer.sh`, which also asserts
+the postconditions, writes the loader configuration the CUDA 12 mooncake wheels
+need, and restores the `lib64`/versionless `.so` links SGLang's JIT asks the
+linker for. Read that script before changing the base image.
 
 `<your-registry>` and the runtime tag are placeholders; this repository does not assume a partner's registry or publish an image on its behalf.
 
@@ -27,8 +45,8 @@ The bootstrap refuses to start without a secret. The control plane must use the 
 ```sh
 docker run --rm --gpus all \
   -e TAI_TALEA_BOOTSTRAP_TOKEN='<random-secret-at-least-16-chars>' \
-  -e TALEA_MODEL_ID='glm5.2' \
-  -e TALEA_MODEL_PATH='/models/glm5.2' \
+  -e TALEA_MODEL_ID='zai-org/GLM-5.3-Flash' \
+  -e TALEA_MODEL_PATH='/models/GLM-5.3-Flash' \
   -v /path/to/models:/models:ro \
   -p 9001:9001 -p 9002:9002 -p 8998:8998 \
   <your-registry>/tai-talea-worker:<tag>

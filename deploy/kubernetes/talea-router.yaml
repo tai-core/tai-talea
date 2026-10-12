@@ -1,0 +1,98 @@
+# The Router, in the same cluster as the workers.
+#
+# It has to be able to resolve worker Pod addresses, so it cannot live outside
+# the cluster. It also has to have a stable address, and the namespace grants no
+# Service permission to give it one. hostNetwork solves both: the Router binds
+# the node's port 8000 directly, and its address is that node's IP, which
+# survives a Pod restart and is reachable from the control plane and from the
+# worker Pods.
+#
+# The address must match router.url in the control plane configuration
+# (deploy/kubernetes/tai-talea.yaml), which is http://10.214.81.70:8000.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: talea-router
+  namespace: nightshift
+  labels:
+    app.kubernetes.io/name: talea-router
+    app.kubernetes.io/component: router
+spec:
+  restartPolicy: Always
+  # Pins the address to one node. Either H100 node would do; h100-04 is the one
+  # the control plane runs on, so both live on the same /etc/hosts and the same
+  # registry mapping.
+  hostNetwork: true
+  # Required, not optional: a host-network Pod cannot use the default
+  # ClusterFirst policy, and the fallback hides every cluster name.
+  dnsPolicy: ClusterFirstWithHostNet
+  nodeSelector:
+    kubernetes.io/hostname: h100-04
+  containers:
+    - name: router
+      # The Rust gateway (sgl-model-gateway). The image carries the binary as
+      # its entrypoint, so `args` is the whole command line.
+      #
+      # v0.2 replaced the Python sglang_router, whose /state/workers answered
+      # 404 and which had no notion of per-worker readiness. The control
+      # plane's RouterAdapter speaks readiness-v1, so the two only work
+      # together.
+      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/talea-router:v0.2
+      imagePullPolicy: Always
+      # PD disaggregation is on from the start, with an empty pool. Workers
+      # arrive through POST /workers, each carrying its own role, which is what
+      # makes the prefill and decode pools.
+      args:
+        - --host=0.0.0.0
+        - --port=8000
+        - --pd-disaggregation
+        - --prefill-policy=session_aware
+        - --decode-policy=round_robin
+        # The health cadence is not a Router-local preference; the control plane
+        # blocks on it. A worker that has just been started cannot be routed to
+        # until the Router's own probe has called it healthy again, and the
+        # control plane only waits a bounded time for that verdict before it
+        # counts the start as failed. The defaults (probe every 60s, two
+        # consecutive successes required) put that convergence at up to two
+        # minutes - four times the controller's readiness window - so a start
+        # that had in fact succeeded was routinely failed and retried, burning
+        # the whole start budget and reloading the model each round.
+        #
+        # Five seconds with a single confirming success finishes well inside the
+        # window. The failure threshold stays at three so a slow probe does not
+        # flap a working worker out of the pool.
+        - --health-check-interval-secs=5
+        - --health-check-timeout-secs=3
+        - --health-success-threshold=1
+      env:
+        - name: RUST_LOG
+          value: info
+      ports:
+        - name: http
+          containerPort: 8000
+          hostPort: 8000
+      readinessProbe:
+        httpGet:
+          path: /liveness
+          port: 8000
+        initialDelaySeconds: 3
+        periodSeconds: 5
+        timeoutSeconds: 1
+        failureThreshold: 12
+      resources:
+        requests:
+          cpu: "250m"
+          memory: 256Mi
+        limits:
+          cpu: "2"
+          memory: 1Gi
+  # No volumes. The worker pool lives in memory only, which is deliberate: a
+  # worker that no longer exists must not survive as a routing target. It is
+  # also why a restarted Router comes up empty and waits to be told again.
+  #
+  # This matters more than it looks. Under hostNetwork a worker's URL is the
+  # node's address, so a worker on h100-04 is always http://<h100-04>:9002. A
+  # Router that persisted its pool would hold that URL after the Pod behind it
+  # is gone, and the next worker on the same node would collide with the stale
+  # entry instead of registering cleanly.

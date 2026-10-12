@@ -6,3 +6,26 @@ bin/
 __pycache__/
 *.pyc
 *.exe
+
+# Cross-compiled control-plane binaries. They are build products (GOOS=linux
+# go build, see deploy/kubernetes/tai-talea-control-plane.yaml) that get
+# pushed as an image, roughly 19 MB each. Anchored to the repository root so a
+# future script that merely starts with the same prefix is not swallowed.
+/tai-talea-linux
+/tai-talea-linux-*
+
+# The assembled offline runtime bundle is a build product, several gigabytes
+# each, and several of its members are past the per-file limit a git host
+# allows. The recipe that produces and verifies it lives in
+# provision/wheelhouse, and the bundle itself belongs in an artifact store.
+provision/wheelhouse/out/
+provision/wheelhouse/dist/
+
+# The local wheel slot holds artifacts that no public index can serve -- the
+# internal sglang fork, wheels built from a source-only pin. They stay out of
+# the repository on purpose: tai-talea is public and that fork is not, so
+# committing them would publish internal patches. Point local_wheels.paths at
+# an artifact store instead; the reasoning is in provision/wheelhouse/README.md.
+provision/wheelhouse/wheels/*.whl
+provision/wheelhouse/wheels/*.tar.gz
+provision/wheelhouse/wheels/*.zip

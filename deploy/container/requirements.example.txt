@@ -1,3 +1,13 @@
-# This is a contract placeholder, not a production lockfile. The approved
-# runtime base image must contain the locked Torch, SGLang fork, sgl_kernel,
-# NIXL and UCX wheels validated on the partner H20/H200 driver.
+# This is a contract placeholder, not a production lockfile.
+#
+# The real lockfile is produced, never hand-edited:
+#
+#   1. provision/wheelhouse/build-env.sh builds the reference environment.
+#   2. provision/wheelhouse/build.py freezes it into an offline wheelhouse
+#      (requirements.txt + manifest.json, wheels only).
+#   3. provision/wheelhouse/verify.py re-checks that wheelhouse against the
+#      gate provision/ssh_install.py will apply to it.
+#
+# Copy the frozen requirements.txt next to the image, not a hand-written list:
+# a lockfile that does not match the wheels in the wheelhouse is rejected by the
+# control node before any byte reaches a worker.

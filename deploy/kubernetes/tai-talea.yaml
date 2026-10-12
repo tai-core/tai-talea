@@ -1,0 +1,321 @@
+# tai-talea control plane configuration for a Kubernetes namespace.
+#
+# This is the deploy/tai-talea.example.yaml shape with the partner section
+# swapped for a Kubernetes namespace. The control plane runs as a Pod in the
+# same namespace it provisions into: worker Pod addresses are only routable
+# from inside the cluster, so an out-of-cluster control plane could create
+# containers but never drive the bootstrap inside them.
+#
+# Every value below is the one that was actually running on the nightshift
+# cluster on 2026-10-09/10. Where it differs from what the platform would
+# ideally look like, the comment says why - docs/control-plane-nightshift-2026-10-09.md
+# lists the same corrections with their failure modes.
+
+server:
+  # The console and admin API. Reaching it from outside is a separate problem:
+  # with no Service and no port-forward the operator talks to it from a client
+  # Pod, or reads the state through the control plane's own logs.
+  listen: 0.0.0.0:8787
+  admin_token: change-me-admin-token-32-characters
+  max_push_body_bytes: 1048576
+  read_timeout: 15s
+  write_timeout: 30s
+  shutdown_timeout: 10s
+
+storage:
+  # Mounted from a host path: the namespace has no PersistentVolumeClaim.
+  sqlite_path: /var/lib/tai-talea/tai-talea.db
+
+# No onboarding block. SSH installation is not merely unavailable on this
+# platform, it is unnecessary: the worker image carries the bootstrap and the
+# entrypoint starts it. Leave the whole section out and the API reports that
+# the SSH route is unconfigured while the Kubernetes route keeps working.
+
+controller:
+  reconcile_interval: 10s
+  prepare_max_attempts: 3
+  start_max_attempts: 3
+  release_max_attempts: 3
+  drain_grace: 300s
+  operation_retry: 15s
+  call_timeout: 10s
+  # Loading 306 GB of weights from the node takes minutes; the bootstrap only
+  # answers /bootstrap/health long before SGLang is ready.
+  start_timeout: 15m
+  # One end-to-end on-demand creation. Must stay above the partner's
+  # wait_timeout (30m below), which bounds the RUNNING wait inside it.
+  provision_timeout: 45m
+  # Injected into every worker Pod as TAI_TALEA_BOOTSTRAP_TOKEN. Must match
+  # what the image entrypoint expects; both read this one value.
+  bootstrap_token: change-me-bootstrap-token-32-chars
+  model_id: zai-org/GLM-5.3-Flash
+  model_path: /models/GLM-5.3-Flash
+  # Handed to the bootstrap through /bootstrap/start, then validated against
+  # the allowlist in bootstrap/tai_talea_bootstrap/roles.py.
+  #
+  # Deliberately absent: --disaggregation-transfer-backend. The internal
+  # SGLang fork hardcodes Mooncake over RDMA and rejects the TCP variant, so
+  # sending it at all is a guaranteed startup failure.
+  extra_sglang_args:
+    - --disaggregation-bootstrap-port=8998
+    - --tp-size=8
+    - --ep-size=8
+    - --kv-cache-dtype=bfloat16
+    - --dsa-prefill-backend=tilelang
+    - --dsa-decode-backend=tilelang
+    - --moe-runner-backend=deep_gemm
+    - --disable-shared-experts-fusion
+    - --attention-backend=dsa
+    - --reasoning-parser=glm45
+    - --tool-call-parser=glm47
+    - --served-model-name=glm-5.3-flash
+    - --disable-custom-all-reduce
+    - --disable-flashinfer-autotune
+    # 0.85 is the value the 1P1D pair actually ran with. The 0.60 that the
+    # aggregated layout needs is not interchangeable: under PD each worker
+    # holds half the work, and the aggregate figure leaves the KV pool far too
+    # small. Getting this wrong surfaces as an illegal memory access during
+    # warmup rather than as an out-of-memory error.
+    - --mem-fraction-static=0.85
+    - --load-format=runai_streamer
+    # Both roles chunk long prompts; only the batch-size caps differ.
+    - --chunked-prefill-size=512
+    - --enable-metrics
+    - --enable-cache-report
+    - --chat-template=/models/GLM-5.3-Flash/chat_template.jinja
+
+  # The arguments that are not shared. They are merged over the list above one
+  # flag at a time, with the role winning, and each flag ends up in the command
+  # exactly once.
+  #
+  # This layer is for what is genuinely a property of the role. A flag whose
+  # correct value is a property of the *hardware* does not belong here, however
+  # much it looks like it does: the planner picks the role and the placement
+  # rotation picks the machine, and neither decision is visible to the other, so
+  # a role-keyed value is correct only by accident. --disaggregation-ib-device
+  # used to live here for exactly that reason and the deployment failed twice
+  # with one node holding the other node's card names. It belongs in
+  # `kubernetes.nodes[].extra_sglang_args`, which is merged last and wins.
+  #
+  # Values are the ones the 1P1D pair was validated with on 2026-10-08/09
+  # (.workbuddy/tmp/alayanew/glm53-pd-{prefill,decode}.yaml).
+  extra_sglang_args_by_role:
+    decode:
+      # The decode bucket is the one that has to be bounded when graph capture
+      # competes with the KV pool for memory. Prefill chunks its work instead
+      # and has no equivalent bound.
+      - --max-running-requests=128
+      - --cuda-graph-max-bs-decode=128
+
+  lease_warning: 120s
+  lost_rate_threshold: 0.2
+
+router:
+  name: primary
+  # The Router has to live in the same cluster and reach worker Pod IPs. With
+  # no Service permission it runs with hostNetwork pinned to one node, so its
+  # address is that node's IP and survives a Pod restart. This is the address
+  # the 1P1D pair was validated against.
+  url: http://10.214.81.70:8000
+  mode: readiness-v1
+  timeout: 10s
+  prefill_bootstrap_port: 8998
+
+planner:
+  # One prefill to one decode. Raise only after measuring the prefill share.
+  gear: "1:1"
+  max_change_per_round: 1
+  min_hold: 120s
+  cooldown: 60s
+  max_serving: 0
+
+# The namespace itself is the source of truth: every Pod carrying this
+# partner's labels is capacity. Leaving pull disabled means new Pods are only
+# noticed when they arrive through the provisioning entry.
+pull:
+  enabled: true
+  interval: 30s
+  failure_threshold: 3
+
+alerts:
+  webhook_url: ""
+  cooldown: 5m
+  ratio_tolerance: 0.15
+
+image_profile:
+  # The controlled image the workers are built from. It has to match what the
+  # worker Pods actually run, because the bootstrap compares them and refuses
+  # to start on a mismatch (exit 29, and the instance is released). CUDA is
+  # wildcarded across the CUDA 13 family: the node driver is 13.2 while the
+  # toolchain in the image is 13.0, and the kernels link against the wheels
+  # in the wheelhouse anyway.
+  os: ubuntu-24.04
+  cuda: "13.x"
+  python: "3.12"
+  sglang: "0.5.20"
+  wheelhouse: /opt/tai-talea/wheelhouse
+  virtualenv: /opt/tai-talea/venv
+
+partners:
+  - id: cmcc-k8s
+    adapter: kubernetes
+    push_token: cmcc-k8s-push-token
+    push_secret: cmcc-k8s-push-secret-0123456789
+    hmac_tolerance: 5m
+    replay_cache_size: 4096
+    kubernetes:
+      # Credential. Empty means in-cluster, which requires the platform to
+      # grant the control plane's ServiceAccount the same Pod permissions the
+      # operator holds. A mounted kubeconfig is the path that works today.
+      #
+      # It is mounted at the top level, not under /etc/tai-talea: nesting a
+      # file mount inside an already mounted directory makes the result depend
+      # on mount ordering.
+      kubeconfig: /etc/tai-talea-kubeconfig
+      context: nightshift
+      namespace: nightshift
+
+      # The worker image: the CUDA runtime plus sglang plus the bundle at
+      # deploy/container. It has to be reachable from inside the cluster,
+      # because the nodes cannot pull from the public internet.
+      #
+      # v0.2 exists because v0.1 baked a bootstrap from 2026-09-30, whose
+      # flag allowlist rejected --ep-size and --load-format. Any change to
+      # bootstrap/ means a new tag, not a re-push: imagePullPolicy Always only
+      # guarantees the newest digest, never that a tag still means the same
+      # bytes.
+      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/talea-worker:v0.2
+      # Always, not IfNotPresent: no node has this image cached, so a
+      # conditional pull would go looking for a local copy and find nothing.
+      image_pull_policy: Always
+      entrypoint:
+        - /opt/tai-talea/entrypoint.sh
+        - serve
+
+      # One worker occupies a whole node: eight H100s, one tensor-parallel rank
+      # per card. The extended resource may only be claimed through limits.
+      gpu_resource: nvidia.com/gpu
+      gpu_count: 8
+      # Pinned by the built-in hostname label, not by a GPU pool label. The
+      # tenant token cannot read Node objects at all on this cluster, so no
+      # custom label can be verified to exist, and a selector that matches
+      # nothing leaves the Pod Pending forever.
+      #
+      # This is the fallback for a partner with no `nodes` list. With one, each
+      # entry below supplies its own pin and this selector is not consulted.
+      node_selector:
+        kubernetes.io/hostname: h100-04
+
+      # The two H100 machines, in rotation order: the first worker created goes
+      # to the first entry, the second to the next, and a third wraps around.
+      # Rotating is what makes a two-node 1P1D deployment possible at all -
+      # without it both workers would claim the same eight cards.
+      #
+      # The environment is per machine because the hardware differs. NCCL_IB_HCA
+      # and NCCL_IB_TC are read before the first collective runs, and the wrong
+      # list fails in a way that looks like a model problem rather than a
+      # networking one.
+      #
+      # `extra_sglang_args` is the same idea for the flags that only reach
+      # SGLang: they are appended to whatever the shared list and the role's
+      # exceptions produced, per flag, so the machine has the last word. The two
+      # machines do not share a card namespace - both have a card called mlx5_6
+      # and they are different physical devices - so a list that travels with
+      # the role rather than the machine is wrong on whichever node it was not
+      # written for.
+      #
+      # h100-01 used to be unusable: it lacked the ecis registry entry in the
+      # node's /etc/hosts, so a Pod placed there could not pull the worker
+      # image. That entry is in place now and a pull from this node has been
+      # verified, so both machines are listed.
+      #
+      # Expect the first worker on a given node to take minutes longer than the
+      # second. Neither node caches the worker image, and it is 13.1 GB: the
+      # pull alone measured 7m24s on h100-01. That is the machine pulling, not
+      # the control plane waiting on anything it can influence.
+      #
+      # Each list is the machine's eight 400 Gb/s NDR cards. Both machines also
+      # carry one 200 Gb/s HDR card - mlx5_4 on h100-04, mlx5_6 on h100-01 -
+      # and it is left out of both: a device list is only as fast as its slowest
+      # member once a KV transfer spans all of them.
+      nodes:
+        - host: h100-04
+          env:
+            # Traffic class, and the cards this node's peer path actually
+            # carries traffic on.
+            NCCL_IB_TC: "106"
+            NCCL_IB_HCA: "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
+          extra_sglang_args:
+            - --disaggregation-ib-device=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_5,mlx5_6,mlx5_7,mlx5_8
+        - host: h100-01
+          # No environment of its own: the validated prefill manifest left both
+          # NCCL variables unset on this machine.
+          #
+          # The device list is not a preference, it is a workaround, and it is
+          # this machine's alone. On h100-01 the card whose name is mlx5_6
+          # reports an active link to the peer and then carries nothing; leaving
+          # it in the list hangs the first KV transfer with no error to read.
+          # The remaining eight names are the node's own - note that they start
+          # at mlx5_2, so the h100-04 list above names three devices this
+          # machine does not have.
+          extra_sglang_args:
+            - --disaggregation-ib-device=mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9,mlx5_10
+
+      # Weights arrive over a host path. The namespace grants no
+      # PersistentVolumeClaim, and the model is already on the node.
+      volumes:
+        - name: models
+          host_path: /apps/models
+          mount_path: /models
+          read_only: true
+        # The RDMA device nodes. Without this mount the container starts and
+        # then fails at the first KV transfer. Not read-only: a device node on
+        # a read-only mount cannot be opened for writing, which is exactly what
+        # a verbs call does.
+        - name: infiniband
+          host_path: /dev/infiniband
+          mount_path: /dev/infiniband
+
+      # Replaces the container default of 64 MB. Eight tensor-parallel ranks
+      # exchange activations here, and the node has 1008 GB of it.
+      shm_size: 512Gi
+
+      # What an H100 worker needs to reach the fabric. hostNetwork puts the
+      # container in the node's network namespace, which is where the RDMA
+      # devices are addressed; hostIPC lets the tensor-parallel ranks share
+      # the CUDA IPC handles they pass between each other; privileged opens
+      # the device cgroup so those devices can actually be opened. All three
+      # are what the manually validated 1P1D manifests used.
+      host_network: true
+      host_ipc: true
+      privileged: true
+
+      bootstrap_port: 9001
+      service_port: 9002
+      # Must be the path inside the *worker image*, not the entrypoint's
+      # default. The adapter injects this as TAI_TALEA_PROFILE, and the
+      # injected value overrides the env the image already carries - so a
+      # wrong path means the container self-check cannot read the cuda
+      # version, exits 29, and the instance is released minutes later for no
+      # visible reason.
+      profile_path: /opt/tai-talea/profile.json
+
+      # No run_as_user / run_as_group. The image has no account by that id to
+      # run as, and overriding the group drops the supplementary video group
+      # through which the GPU device nodes are reachable.
+
+      env:
+        TAI_TALEA_START_WAIT_SECONDS: "120"
+        # Both machines were reached over the same bonded interface. Left
+        # unset, NCCL and Gloo choose by heuristic, and on a host that carries
+        # a management bond, two IP-over-IB interfaces and eight RDMA devices,
+        # the guess can be wrong in a way that surfaces only as a hang inside a
+        # collective.
+        GLOO_SOCKET_IFNAME: bond1.1081
+        NCCL_SOCKET_IFNAME: bond1.1081
+
+      model_support:
+        - zai-org/GLM-5.3-Flash
+
+      timeout: 30s
+      wait_timeout: 30m

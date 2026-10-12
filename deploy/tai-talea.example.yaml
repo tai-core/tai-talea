@@ -41,6 +41,11 @@ controller:
   # Waiting for a freshly started SGLang to answer health checks - model
   # loading takes minutes, so this is not call_timeout.
   start_timeout: 10m
+  # Bounds one end-to-end on-demand creation (create -> RUNNING -> install ->
+  # hand over). A partner whose pool is full can leave a creation queued for
+  # hours and the platform never cancels it, so this is the dial between giving
+  # up and waiting for capacity. It must stay above the partner's wait_timeout.
+  provision_timeout: 45m
   # Shared secret the container bootstrap requires on every /bootstrap call.
   # The same value must be provisioned inside the container via
   # TAI_TALEA_BOOTSTRAP_TOKEN. Required: the bootstrap has no unauthenticated
@@ -87,12 +92,15 @@ alerts:
   # Allowed distance between the observed and the target Prefill share.
   ratio_tolerance: 0.15
 
-# §10 M1 controlled baseline image contract.
+# §10 M1 controlled baseline image contract. Replace with the profile of the
+# image you actually run; deploy/container/profile.json carries the same values
+# and the node compares them field by field. A ".x" in a version is a wildcard
+# accepted on both sides of that comparison.
 image_profile:
-  os: ubuntu-22.04
-  cuda: "12.4"
-  python: "3.11"
-  sglang: "0.4.x"
+  os: ubuntu-24.04
+  cuda: "13.x"
+  python: "3.12"
+  sglang: "0.5.20"
   wheelhouse: /opt/tai-talea/wheelhouse
   virtualenv: /opt/tai-talea/venv
 

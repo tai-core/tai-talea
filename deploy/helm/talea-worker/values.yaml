@@ -22,9 +22,9 @@ bootstrap:
   tokenSecretName: ""
   tokenSecretKey: token
 runtime:
-  cuda: "12.8"
-  python: "3.10"
-  sglang: "0.0.0+g5a26fc1f.cu12"
+  cuda: "13.x"
+  python: "3.12"
+  sglang: "0.5.20"
 gpu:
   count: 1
   architecture: ""

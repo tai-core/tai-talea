@@ -1,0 +1,116 @@
+# tai-talea control plane, running inside the tenant namespace.
+#
+# Why it has to be here and not on a management host:
+#
+#   Worker Pod addresses (10.222.x.x) are only routable inside the cluster. A
+#   control plane outside it can create Pods through the API server, but it can
+#   never call /bootstrap/health or /bootstrap/start on them, so it could never
+#   turn a running container into a serving model.
+#
+# What it needs from the platform, in order of preference:
+#
+#   1. The same Pod permissions the operator holds, granted to this Pod's
+#      ServiceAccount. Then delete the volumes.kubeconfig volume and the
+#      kubernetes.kubeconfig setting, and set kubernetes.service_account.
+#   2. Failing that, the operator kubeconfig mounted read-only from a host path,
+#      which is what this manifest does. It works today and needs no new RBAC.
+#
+# Adjust every value marked CHANGE before applying.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tai-talea
+  namespace: nightshift
+  labels:
+    app.kubernetes.io/name: tai-talea
+    app.kubernetes.io/component: control-plane
+spec:
+  restartPolicy: Always
+  # Pinned to one node. Not because the control plane needs a GPU, but because
+  # this is the node whose /etc/hosts carries the registry mapping and whose
+  # containerd has the image. Scheduling onto the other node means a pull that
+  # never resolves. Remove the selector once every node is prepared.
+  nodeSelector:
+    kubernetes.io/hostname: h100-04
+  containers:
+    - name: control-plane
+      # Built by .workbuddy/tmp/alayanew/talea-control-image.py: a static Go
+      # binary plus a minimal rootfs, no shell at all. The nodes cannot reach a
+      # public registry, so it lives in the cluster-reachable Harbor.
+      #
+      # v0.2 is the build that understands host_network / host_ipc / privileged
+      # in the partner section. v0.3 adds the per-role and per-node argument
+      # overrides, and logs the argv it dispatches. The config decoder is
+      # strict, so an older binary refuses a config that carries them.
+      #
+      # v0.4 carries the AlayaNeW partner fixes from 2026-10-12 - the release
+      # loop, the SSH host key pinned to the container identity rather than the
+      # address, partner priority, and a configurable provision budget
+      # (controller.provision_timeout).
+      #
+      # v0.5 is about waits that cross a process boundary. The Router registers
+      # a membership asynchronously and drops it through its own workflow, so
+      # both directions have to poll; a tight loop spent the whole call budget
+      # on one endpoint and then reported the transport timeout, which named an
+      # endpoint and hid the reason. Both now back off, and both say what they
+      # were waiting for and what they last saw instead.
+      #
+      # A tag is not a version: imagePullPolicy Always only guarantees the
+      # newest digest behind the tag, so every bundle change takes a new tag.
+      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/tai-talea:v0.5
+      # Always: the image is not preloaded into any node's containerd, so a
+      # conditional pull would hunt for a local copy and give up.
+      imagePullPolicy: Always
+      command:
+        - /usr/local/bin/tai-talea
+        - --config
+        - /etc/tai-talea/tai-talea.yaml
+      ports:
+        - name: api
+          containerPort: 8787
+      volumeMounts:
+        - name: config
+          mountPath: /etc/tai-talea
+        - name: state
+          mountPath: /var/lib/tai-talea
+        # Mounted beside the config directory, never inside it: a file mount
+        # nested in an already mounted directory resolves by mount order.
+        #
+        # No subPath. The volume below is already the single file, so naming a
+        # subPath would make the kubelet look for a directory member called
+        # "config" and fail the container with CreateContainerConfigError.
+        - name: kubeconfig
+          mountPath: /etc/tai-talea-kubeconfig
+          readOnly: true
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 512Mi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+  volumes:
+    # CHANGE: the directory holding tai-talea.yaml and kubeconfig. On the
+    # nightshift node these were placed by a privileged Pod with the host
+    # filesystem mounted; kubeconfig must be 0600 and root-owned there.
+    - name: config
+      hostPath:
+        path: /data/tai-talea/config
+        type: Directory
+    # The SQLite file and the onboarding state. A host path rather than a
+    # PersistentVolumeClaim, because the tenant cannot create one.
+    - name: state
+      hostPath:
+        path: /data/tai-talea/state
+        type: DirectoryOrCreate
+    # The operator kubeconfig, mounted as a file. Remove this volume and the
+    # matching volumeMount once the ServiceAccount route is available.
+    #
+    # It sits in the config directory, not /root/.kube/config: both paths are
+    # prepared by the same privileged Pod that seeds the config, and keeping
+    # them together means one host path to stage rather than two.
+    - name: kubeconfig
+      hostPath:
+        path: /data/tai-talea/config/kubeconfig
+        type: File
