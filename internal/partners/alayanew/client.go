@@ -95,8 +95,8 @@ func (c *Client) call(ctx context.Context, method, path, query string, body any,
 		return err
 	}
 	var envelope struct {
-		Status int             `json:"status"`
-		Message string         `json:"message"`
+		Status  int             `json:"status"`
+		Message string          `json:"message"`
 		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
@@ -211,9 +211,9 @@ func (c *Client) createInstance(ctx context.Context, productCode string, cciPara
 
 // subscriptionResult is one poll of the subscription result.
 type subscriptionResult struct {
-	Result      string `json:"result"`
-	Message     string `json:"message"`
-	InstanceID  string `json:"instanceId"`
+	Result     string `json:"result"`
+	Message    string `json:"message"`
+	InstanceID string `json:"instanceId"`
 }
 
 func (c *Client) subscriptionResultOnce(ctx context.Context, key string) (subscriptionResult, error) {

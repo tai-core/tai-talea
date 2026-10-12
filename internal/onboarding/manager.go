@@ -305,17 +305,17 @@ func (m *Manager) RunOnce(ctx context.Context) error {
 		}
 		if err == nil {
 			var instance domain.Instance
-				instance, err = m.run(ctx, r, progress)
-				if err == nil {
-					instance.ID, instance.PartnerID = r.ID, r.PartnerID
-					instance.LeaseID = r.LeaseID
-					if instance.LeaseID == "" {
-						instance.LeaseID = "ssh-" + r.RequestID
-					}
-					rec.Result = &instance
-					rec.Secret = nil
-					err = progress("环境就绪，提交纳管")
+			instance, err = m.run(ctx, r, progress)
+			if err == nil {
+				instance.ID, instance.PartnerID = r.ID, r.PartnerID
+				instance.LeaseID = r.LeaseID
+				if instance.LeaseID == "" {
+					instance.LeaseID = "ssh-" + r.RequestID
 				}
+				rec.Result = &instance
+				rec.Secret = nil
+				err = progress("环境就绪，提交纳管")
+			}
 		}
 	}
 	if err == nil {
