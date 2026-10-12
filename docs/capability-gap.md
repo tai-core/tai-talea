@@ -173,7 +173,13 @@ SGLang **强制要求 `mooncake-transfer-engine`**，没有就 abort（已在容
    外部测试走它暴露的公网端口（尚未映射，暂从容器内 curl 验证）。
 
 **部署要点**：`mooncake-transfer-engine` 必须装（PD 模式强制）；传输后端用默认 `mooncake`
-（容器无 IB 设备时 mooncake 自动走 TCP），`mooncake_tcp` 已加入 bootstrap 白名单作备选。
+（容器无 IB 设备时 mooncake 自动走 TCP）。
+
+> **2026-10-10 修正**：这里原本写着「`mooncake_tcp` 已加入 bootstrap 白名单作备选」，
+> 是错的。`--disaggregation-transfer-backend` **这个旗标**在白名单里（白名单匹配的是旗标而不是
+> 取值），但内部 sglang fork 把协议**硬编码成 RDMA**，取值 `mooncake_tcp` 会被 sglang 直接拒绝。
+> 因此 `deploy/kubernetes/tai-talea.yaml` 里那行 `--disaggregation-transfer-backend=mooncake_tcp`
+> 已删除——它一旦真的下发到 worker，会变成一次必然的启动失败。
 
 ### 仍未验证
 

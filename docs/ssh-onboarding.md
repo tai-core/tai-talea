@@ -52,6 +52,12 @@ onboarding:
 
 `wheelhouse_source/manifest.json` 包含 `files: [{name,size,sha256}, ...]`，轮子必须与锁文件匹配。安装器核对控制端文件哈希后，经 SSH/SFTP 分发至节点，再核对目标端哈希；已缓存且一致的文件直接复用。pip 使用 `--no-index` 从已验证 wheelhouse 安装。模型与 bootstrap 从管理员配置的本地源分发，也做传输哈希验证。当前实现逐个执行任务，避免同时铺装挤占带宽。
 
+> 上面这段清单里的 `profile` 是示例值，不要照抄。当前基线的真实取值（os/cuda/python/sglang）在
+> `provision/wheelhouse/spec.json`，同一份值也在 `deploy/container/profile.json` 和控制面配置的
+> `image_profile` 里；三处必须一致，否则容器自检会判不兼容并释放实例。
+> `wheelhouse_source`、`wheel_manifest_sha256`、`requirements_sha256` 三个值由
+> `provision/wheelhouse/build.py` 结束时直接打印，别手算。
+
 模型目录需要包含真实权重，`model_target` 与控制器 `model_path` 保持一致。当前固定运行环境目录为 `/opt/tai-talea/{venv,wheelhouse}`。容器系统依赖通过 apt 安装，因此首次系统依赖安装仍需要其 Ubuntu 包源可用。
 
 ## 接口与恢复
