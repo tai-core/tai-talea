@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,5 +362,73 @@ func TestQueuedIdentityReservesEndpointsAgainstAdmissions(t *testing.T) {
 	err := h.ctrl.EnrollPrepared(t.Context(), domain.Instance{ID: "ssh-node", PartnerID: row.PartnerID, Endpoint: "http://other:9001", ServiceEndpoint: "http://reserved:9002", LeaseID: "ssh-new"})
 	if err == nil {
 		t.Fatal("SSH enrollment stole queued service endpoint")
+	}
+}
+
+// A pull round re-asserts every instance it sees, because the snapshot is
+// reconciled against current intent and not only against the previous snapshot
+// (pull_reconcile.go). "Nothing changed" is therefore the ordinary case, and
+// the reason string is the only thing that separates it from a real change.
+//
+// The spec was the field that broke it: it was reported as changed whenever the
+// event carried one, which is always. Every 30s poll then wrote an audit entry
+// claiming a spec change that had not happened - into the file that gets read
+// as evidence whenever an instance does something unexpected.
+func TestCapacityUpdateNamesOnlyTheFieldsThatActuallyMoved(t *testing.T) {
+	h := newHarness(t)
+	h.handle(h.addedEvent("container-1", h.bootstrap.Endpoint(), "lease-1", h.clock.Now()))
+
+	// Same identity, same spec, a later observation: the lease is renewed and
+	// nothing else is. The lease write is deliberate - a partner saying the
+	// container is alive is worth persisting - so only the label is at stake.
+	h.clock.Advance(time.Minute)
+	same := h.addedEvent("container-1", h.bootstrap.Endpoint(), "lease-1", h.clock.Now())
+	same.Type = domain.EventCapacityUpdated
+	same.EventID = "partner-a:update:container-1:unchanged"
+	outcome := h.handle(same)
+	if outcome.Result != domain.ResultApplied {
+		t.Fatalf("result=%s, want APPLIED: %+v", outcome.Result, outcome)
+	}
+	if outcome.Reason != "instance metadata re-confirmed, nothing changed" {
+		t.Fatalf("an unchanged instance was reported as %q", outcome.Reason)
+	}
+
+	// A spec that did move still has to be named, and stored.
+	h.clock.Advance(time.Minute)
+	grown := h.addedEvent("container-1", h.bootstrap.Endpoint(), "lease-1", h.clock.Now())
+	grown.Type = domain.EventCapacityUpdated
+	grown.EventID = "partner-a:update:container-1:grown"
+	grown.Instance.Spec = &domain.InstanceSpec{GPU: "H100", GPUCount: 2, ModelSupport: []string{testModelID}}
+	outcome = h.handle(grown)
+	if !strings.Contains(outcome.Reason, "spec") {
+		t.Fatalf("a real spec change was not reported: %q", outcome.Reason)
+	}
+	if row := h.instance("container-1"); row.Spec.GPUCount != 2 {
+		t.Fatalf("the new spec was not stored: %+v", row.Spec)
+	}
+
+	// The audit trail is what gets read, so assert on it directly rather than
+	// trusting the string the caller happened to receive.
+	entries, err := h.store.ListAudit(context.Background(), "container-1", 20)
+	if err != nil {
+		t.Fatalf("audit: %v", err)
+	}
+	seen := 0
+	for _, entry := range entries {
+		if entry.Action != "capacity_updated" {
+			continue
+		}
+		seen++
+		switch entry.Details["changed"] {
+		case "":
+			// The re-confirmation. Correct: it named no field.
+		case "spec":
+			// The real change. Correct too.
+		default:
+			t.Fatalf("audit entry claims changed=%q, which was not a changed field", entry.Details["changed"])
+		}
+	}
+	if seen < 2 {
+		t.Fatalf("expected both rounds to be audited, saw %d capacity_updated entries", seen)
 	}
 }

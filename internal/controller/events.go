@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -334,7 +335,7 @@ func (c *Controller) handleCapacityUpdated(ctx context.Context, event domain.Cap
 		updated.LeaseID = event.Instance.LeaseID
 		changed = append(changed, "lease_id")
 	}
-	if event.Instance.Spec != nil {
+	if event.Instance.Spec != nil && !reflect.DeepEqual(*event.Instance.Spec, updated.Spec) {
 		updated.Spec = *event.Instance.Spec
 		changed = append(changed, "spec")
 	}
@@ -387,6 +388,16 @@ func (c *Controller) handleCapacityUpdated(ctx context.Context, event domain.Cap
 		},
 	}); err != nil {
 		return domain.ResultFailed, "", err
+	}
+	if len(changed) == 0 {
+		// The pull path reconciles the snapshot against current intent, not
+		// only against the previous snapshot, so it re-asserts instances that
+		// have not moved - that is the point of it. Naming a field here would
+		// be a claim the next reader has to go and disprove, and this line is
+		// read as evidence. The lease observation above still lands: a partner
+		// saying "this container is alive" is a fact worth persisting even when
+		// nothing about it changed.
+		return domain.ResultApplied, "instance metadata re-confirmed, nothing changed", nil
 	}
 	return domain.ResultApplied, "instance metadata updated: " + strings.Join(changed, ","), nil
 }
