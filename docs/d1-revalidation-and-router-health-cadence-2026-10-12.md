@@ -210,3 +210,77 @@ GET /state/workers -> 两条都 state=ready（无残留的 manual 摘流）
 
 `nightshift-automation-gap-2026-10-09.md` §2 的 D2（摘流 / 恢复场景）仍未验收。
 现在有稳定的 1P1D，是做它的时机。
+
+### 5.5 每轮 poll 都在重写实例行（设计如此，但标签曾经说谎）
+
+`pullAuthoritative`（`internal/controller/pull_reconcile.go`）把快照与**当前意图**对齐，
+不是只与上一份快照对齐——这正是它"能修一次漏掉的 Push、一份被回退的快照、
+以及本地漂移之后没变过的快照"的原因。所以**每一轮它都会为每个实例重发一次
+`CAPACITY_UPDATED`**，"什么都没变"才是常规情况。
+
+代价已经量过：nightshift 上每 30s 写 2 行实例 + 2 行审计，`updated_at` 一直在前进
+（`LEASE_UPDATED_AT`/`LastSeenAt` 每轮刷新是**有意的**：合作方说"这个容器还活着"
+本身就是值得落盘的事实）。
+
+但 `handleCapacityUpdated` 里 `changed` 曾经**无条件**追加 `"spec"`
+（只要事件带 spec——而 poll 每轮都带），于是每轮都写一条"spec 变了"的审计。
+**已修**（`d366f57`）：改成 `reflect.DeepEqual` 与已存值比较，并在无变化时把 reason 改成
+`instance metadata re-confirmed, nothing changed`。没有任何决策读 `"spec"`
+（摘流/重注册只看 endpoint/service_endpoint/lease_id），所以行为不变，只是审计不再说谎。
+
+**这个修复尚未进镜像**：新镜像（v0.6）才包含它。
+
+## 6. 控制面 v0.5 的上线与「重启接管」验证
+
+`d1` 原始记录（§4）用的是 v0.4，且那次是**重启 Router**（成员表清空）才恢复的。
+本轮把 §3 的代码修复打成 v0.5 并上线，顺便补上了此前**从未验证过**的一条路径。
+
+### 6.1 部署三步曲
+
+| 步 | 做法 | 为什么必须这样 |
+| --- | --- | --- |
+| 预检 | 用一个 Pod 跑**新镜像**自己的 `--check-config`，挂宿主真实配置（只读、**不挂 state 卷**） | 二进制没有 shell，`kubectl exec` 进不去也跑不了命令；唯一能执行它的办法是让 Pod 的 command 就是它本身。输出：`configuration /etc/tai-talea/tai-talea.yaml is valid (1 partners, router http://10.214.81.70:8000)` |
+| 滚动 | `ns-deploy-cp.py <manifest> --digest sha256:<推送的 manifest>`：**先删旧 Pod 并等它真的消失**，再 apply，再等 Ready | 控制面是 Pod 不是 Deployment。`--wait=false` 紧接着 apply 会和 terminating 对象打架；而一个容器在跑并不说明它跑的是新构建——`imagePullPolicy: Always` 只保证拿到 tag 背后最新的 digest，所以必须把 `imageID` 与推送的 manifest digest **逐字比对** |
+| 验收 | `ns-accept-d1.py` | 同 §4 |
+
+本次 `imageID` = `sha256:d49f06920660e0e0d443b76617128cd1b30e9810b8f6299dedebadbffebb3b12`，
+与推送的 manifest digest 一致。
+
+### 6.2 重启接管：干净
+
+```
+control plane recovery finished  checked=10 lost=0 recovered=0
+                                 reregistered=0 resumed_operations=0 resumed_events=0
+```
+
+两个实例都保持 `IDLE/SERVING`，角色未动（`172229`=prefill、`172229-1`=decode），
+**`start_attempts` 仍是 0**，而且 **`router_worker_id` 与重启前逐字相同**
+（`0f953c25` / `038e3175`）——没有重注册、没有 drain、没有换角色。
+Router 侧 `prefill_count:1 decode_count:1`、两条 `is_healthy:true`、`/readiness` 200，
+经 Router 的推理 3/3 返回带 `usage` 的真实输出。
+
+**但 §5.2 那条路径这次仍然没撞上**：Router 没有重启，成员表与数据库一致，
+`settleService` 在第一个分支就返回 `ok`。代码侧已确认顺序是
+`FindWorkerByURL` → 角色不符则 `SetReadiness(false)` → `RemoveStaleMembership` → 重注册，
+v0.5 的退避与错误信息覆盖的正是这一段——也就是说，**修复在那条路上是"准备好了"，
+但还没有被真实触发过**。
+
+### 6.3 一个操作上的坑：控制面地址每滚动一次就变
+
+控制面 Pod **没有 hostNetwork**（Router 有），所以它的地址是集群 IP，
+**每次重启都换**：`10.222.49.89` → `10.222.49.107`。
+把 IP 写进探针脚本，就会在滚动之后**静默地探测一个已经不存在的地址**
+（上一轮留下的常驻观察者就是这样开始打印 `(none)`，而连接超时还把它从 30s 拖到 50s）。
+
+两条纪律：
+
+- 探针一律用 `nsrun.py <driver> --ctrl-pod tai-talea`，运行前用 kubectl 解析 Pod IP
+  并注入 `CTRL`；driver 里读 `os.environ["CTRL"]`，**缺失即报错**，不留一个"看起来能用"的旧默认值。
+- 长驻观察者**跨不过滚动**（地址在启动时解析一次）。滚动后重启它。
+  `ns-watch.py` 现在会在控制面不可达时明确打印 `CONTROL PLANE UNREACHABLE code=…`——
+  "问不到"和"没有实例"是两件事，不该都显示成 `(none)`。
+
+若要让地址稳定：h100-04 的 8787 实测空闲（读宿主 `/proc/net/tcp`），
+控制面改用 hostNetwork 即可（与 Router 同理）。**本次没改拓扑**，
+因为那个地址只被我们自己的探针使用——nightshift 走 pull 模式，
+**不存在 worker 回连控制面的路径**。
