@@ -1,10 +1,47 @@
 package controller
 
 import (
+	"strings"
+	"testing"
+	"time"
+
 	"github.com/tai-core/tai-talea/internal/domain"
 	"github.com/tai-core/tai-talea/internal/routeradapter"
-	"testing"
 )
+
+// A membership that is registered but never reports the requested role used to
+// spend the whole call budget on a 100ms poll and then fail with the transport
+// deadline it happened to trip over - "Get http://.../workers/<id>: context
+// deadline exceeded", which names an endpoint and hides the cause. Both halves
+// are pinned here: the wait must back off, and the error must name the role and
+// what the Router kept reporting instead.
+func TestMembershipWaitBacksOffAndNamesTheRoleItNeverSaw(t *testing.T) {
+	h := newHarness(t)
+	h.handle(h.addedEvent("node", h.bootstrap.Endpoint(), "lease", h.clock.Now()))
+	// The Router accepts the registration and then keeps answering with the
+	// other role, which is what a replacement it refuses to apply looks like.
+	h.router.typeReportedByGet = string(domain.RoleDecode)
+
+	before := h.router.getsByID
+	started := time.Now()
+	err := h.ctrl.StartService(t.Context(), "node", domain.RolePrefill)
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("a membership that never acquires the role cannot start")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "did not acquire role prefill") ||
+		!strings.Contains(message, `lists it as "decode"`) {
+		t.Fatalf("error must name the role and what the Router reported: %s", message)
+	}
+	if elapsed < 2*time.Second {
+		t.Fatalf("gave up after %s, before the call budget expired", elapsed)
+	}
+	// CallTimeout is 3s in the harness; a fixed 100ms cadence reads thirty times.
+	if polls := h.router.getsByID - before; polls > 10 {
+		t.Fatalf("polled %d times; the cadence must back off", polls)
+	}
+}
 
 func TestRoleRecoveryClosesIdleStaleMembershipBeforeReplacement(t *testing.T) {
 	h := newHarness(t)

@@ -51,6 +51,7 @@ func (s *Server) registerOnboarding(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/capacity/console/instances/{id}", s.ownConsoleInstance(s.handleGetInstance))
 	mux.HandleFunc("GET /v1/capacity/console/instances/{id}/audit", s.ownConsoleInstance(s.handleInstanceAudit))
 	mux.HandleFunc("POST /v1/capacity/console/instances/{id}/reclaim", s.ownConsoleInstance(s.handleReclaimInstance))
+	mux.HandleFunc("POST /v1/capacity/console/instances/{id}/requeue", s.ownConsoleInstance(s.handleRequeueInstance))
 	mux.HandleFunc("GET /v1/capacity/console/onboarding", s.consoleAuth(func(w http.ResponseWriter, r *http.Request) {
 		jobs := []onboarding.Job{}
 		if s.opts.Onboarding != nil {

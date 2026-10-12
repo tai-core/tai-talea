@@ -3,12 +3,15 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/tai-core/tai-talea/internal/config"
 	"github.com/tai-core/tai-talea/internal/domain"
 	"github.com/tai-core/tai-talea/internal/launcher"
+	"github.com/tai-core/tai-talea/internal/obs"
+	"github.com/tai-core/tai-talea/internal/partner"
 	"github.com/tai-core/tai-talea/internal/routeradapter"
 	"github.com/tai-core/tai-talea/internal/store"
 )
@@ -224,5 +227,128 @@ func TestReclaimDuringStartCannotReleaseBeforeTheStartCallReturns(t *testing.T) 
 	starts, stops, _ := h.bootstrap.counts()
 	if starts != 1 || stops != 1 {
 		t.Fatalf("unexpected process lifecycle: starts=%d stops=%d", starts, stops)
+	}
+}
+
+// A container that stopped answering can never satisfy /bootstrap/stop, so a
+// reclaim that insisted on draining it first would retry the stop forever and
+// keep the partner's quota pinned. Once its grace expired the drain completes,
+// the service is recorded as stopped and the container goes back.
+func TestReclaimOfAnUnreachableContainerReleasesWithoutStopping(t *testing.T) {
+	h := servingHarness(t)
+	ctx := t.Context()
+	id := "container-1"
+
+	h.bootstrap.SetDown(true)
+	h.reconcile()
+	if got := h.instance(id); got.InstanceState != domain.InstanceLost {
+		t.Fatalf("an unreachable container must be LOST first: %+v", got)
+	}
+	if err := h.ctrl.RequestReclaim(ctx, id, "operator", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// Recording the intent is all the request handler does; the reconciler owns
+	// the network calls, so nothing has been stopped yet.
+	if h.instance(id).InstanceState == domain.InstanceReleased {
+		t.Fatal("the request handler must not release on its own")
+	}
+	_, stopsBefore, _ := h.bootstrap.counts()
+
+	h.clock.Advance(time.Second)
+	h.reconcile()
+
+	got := h.instance(id)
+	if got.InstanceState != domain.InstanceReleased {
+		t.Fatalf("unreachable container was not released: %+v (last_error=%q)", got, got.LastError)
+	}
+	if _, stopsAfter, _ := h.bootstrap.counts(); stopsAfter != stopsBefore {
+		t.Fatalf("an unreachable container must not be asked to stop: %d -> %d", stopsBefore, stopsAfter)
+	}
+	if !h.adapter.Released(id) {
+		t.Fatal("the container was not handed back to the partner")
+	}
+}
+
+// absentReleaseAdapter answers every release with partner.ErrInstanceNotFound,
+// which is what the platform says about a container it has already recycled.
+type absentReleaseAdapter struct {
+	partner.PartnerAdapter
+	calls int
+}
+
+func (a *absentReleaseAdapter) ReleaseInstance(_ context.Context, instanceID string) error {
+	a.calls++
+	return fmt.Errorf("release %s: %w", instanceID, partner.ErrInstanceNotFound)
+}
+
+// A container can vanish from the platform before the control plane gives it
+// back: the poll stops reporting it, the console deletes it, the platform
+// recycles it. The release call then answers "I do not have that container",
+// which is not a failure — it is the release postcondition, already true. A
+// controller that retried it would keep the row in RELEASING and the partner's
+// quota charged forever, so the release has to complete on the spot, once.
+func TestReleaseOfAVanishedContainerCompletesWithoutRetrying(t *testing.T) {
+	h := servingHarness(t)
+	ctx := t.Context()
+	id := "container-1"
+
+	adapter := &absentReleaseAdapter{PartnerAdapter: h.adapter}
+	h.ctrl = buildController(t, h.cfg, h.store, h.router, h.bootstrap, adapter, h.metrics, h.recorder, h.clock)
+
+	if err := h.ctrl.RequestReclaim(ctx, id, "capacity revoked", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(time.Minute)
+	h.reconcile()
+	// A second pass proves nothing is left queued for retry.
+	h.reconcile()
+
+	got := h.instance(id)
+	if got.InstanceState != domain.InstanceReleased {
+		t.Fatalf("a container the partner no longer has must still be released: %+v", got)
+	}
+	if got.PendingRelease || !got.DrainDeadlineAt.IsZero() {
+		t.Fatalf("release intent survived the release: %+v", got)
+	}
+	if got.LastError != "" {
+		t.Fatalf("a vanished container is not an error: %q", got.LastError)
+	}
+	if adapter.calls != 1 {
+		t.Fatalf("the release call must not be retried, called %d times", adapter.calls)
+	}
+	if open, err := h.store.ListOpenOperations(ctx, 50); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, operation := range open {
+			if operation.InstanceID == id {
+				t.Fatalf("release operation left open: %+v", operation)
+			}
+		}
+	}
+	if h.recorder.has(obs.AlertOperationRetryExhausted) {
+		t.Fatal("a vanished container must not raise a retry alert")
+	}
+
+	// The audit has to say which of the two releases happened: "the partner
+	// took it back" or "the partner had already lost it".
+	entries, err := h.store.ListAudit(ctx, id, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actions []string
+	for _, entry := range entries {
+		actions = append(actions, entry.Action)
+	}
+	found := false
+	for _, action := range actions {
+		if action == "instance_release_absent_from_partner" {
+			found = true
+		}
+		if action == "instance_released" {
+			t.Fatalf("a vanished container must not be audited as a normal release: %v", actions)
+		}
+	}
+	if !found {
+		t.Fatalf("missing the absent-from-partner audit entry: %v", actions)
 	}
 }

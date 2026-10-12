@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"github.com/tai-core/tai-talea/internal/buildinfo"
 	"github.com/tai-core/tai-talea/internal/config"
 	"github.com/tai-core/tai-talea/internal/controller"
+	"github.com/tai-core/tai-talea/internal/domain"
 	"github.com/tai-core/tai-talea/internal/instancemanager"
 	"github.com/tai-core/tai-talea/internal/launcher"
 	"github.com/tai-core/tai-talea/internal/obs"
@@ -114,7 +116,24 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("instance manager: %w", err)
 	}
-	registry, err := partners.Build(cfg)
+	// CCI maps only the container's HTTP ports onto a public ingress, and the PD
+	// transfer handshake listens on a port it never publishes at all, so peers
+	// have to be told the container's own address. That address exists nowhere
+	// in the platform API: the install pipeline measures it from inside and the
+	// enrolled row is where it is kept. An unknown or released instance has
+	// none, and then the adapter keeps the published endpoint.
+	resolveAdvertiseHost := func(name string) string {
+		row, err := persistence.GetInstance(context.Background(), name)
+		if err != nil || !row.Active() {
+			return ""
+		}
+		parsed, err := url.Parse(domain.NormalizeEndpoint(row.Endpoint))
+		if err != nil {
+			return ""
+		}
+		return parsed.Hostname()
+	}
+	registry, err := partners.Build(cfg, resolveAdvertiseHost)
 	if err != nil {
 		return err
 	}

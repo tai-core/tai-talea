@@ -193,6 +193,14 @@ type routerFake struct {
 	registerCalls int
 	readinessSets []string
 	server        *httptest.Server
+
+	// typeReportedByGet, when set, is the worker_type GET /workers/{id} answers
+	// with regardless of what was registered. It models a Router that keeps
+	// serving the pre-replacement role, which is what a caller waiting for a new
+	// role can never observe.
+	typeReportedByGet string
+	// getsByID counts GET /workers/{id}, so a test can observe the poll cadence.
+	getsByID int
 }
 
 func newRouterFake() *routerFake {
@@ -276,6 +284,13 @@ func (f *routerFake) workerHandler(writer http.ResponseWriter, request *http.Req
 	worker, ok := f.workers[id]
 	if !ok {
 		writeTestJSON(writer, http.StatusNotFound, map[string]string{"error": "worker_not_found"})
+		return
+	}
+	f.getsByID++
+	if f.typeReportedByGet != "" && f.typeReportedByGet != worker.WorkerType {
+		reported := *worker
+		reported.WorkerType = f.typeReportedByGet
+		writeTestJSON(writer, http.StatusOK, reported)
 		return
 	}
 	writeTestJSON(writer, http.StatusOK, worker)

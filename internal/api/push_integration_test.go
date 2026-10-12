@@ -184,7 +184,7 @@ func newServer(t *testing.T, configure ...func(*api.Options)) (*httptest.Server,
 	}
 	t.Cleanup(func() { persistence.Close() })
 
-	registry, err := partners.Build(cfg)
+	registry, err := partners.Build(cfg, nil)
 	if err != nil {
 		t.Fatalf("partner registry: %v", err)
 	}

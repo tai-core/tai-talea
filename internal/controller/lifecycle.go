@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/tai-core/tai-talea/internal/domain"
@@ -218,9 +219,36 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 		Role:      role,
 		ModelID:   c.cfg.Controller.ModelID,
 		ModelPath: c.cfg.Controller.ModelPath,
-		ExtraArgs: c.cfg.Controller.ExtraSGLangArgs,
-		Port:      servicePort(instance),
+		// Three layers, each narrower than the last. The shared list carries
+		// what every worker needs, the role's exceptions carry what prefill and
+		// decode disagree on (batch-size bounds, mainly), and the instance's
+		// own override carries what only its machine can accept.
+		//
+		// That last layer is not a convenience. The machine is chosen by the
+		// partner's placement rotation and the role by the planner, and neither
+		// decision is visible to the other, so any flag whose correct value is
+		// a property of the hardware cannot live under a role: --disaggregation-
+		// ib-device in particular names the node's HCAs, and a role-keyed copy
+		// of it feeds one machine the other machine's device names. SGLang then
+		// exits at start-up and everything on the control plane's side still
+		// looks correct, because it is.
+		ExtraArgs: mergeSGLangArgs(
+			mergeSGLangArgs(c.cfg.Controller.ExtraSGLangArgs, c.cfg.Controller.ExtraSGLangArgsByRole[string(role)]),
+			instance.Spec.SGLangArgsOverride),
+		Port: servicePort(instance),
 	}
+	// Record the command the control plane is about to hand over. Neither side
+	// logs it today: the bootstrap keeps the rendered command in its own
+	// /bootstrap/status history, which lives inside the worker and disappears
+	// with it. When a PD pair comes up asymmetric - one side carrying the other
+	// side's RDMA device list, say - this line is the only place the two
+	// vectors can be compared without attaching to a container.
+	c.log().Info("dispatching start to the bootstrap",
+		"instance_id", instanceID,
+		"role", string(role),
+		"endpoint", instance.Endpoint,
+		"model_id", request.ModelID,
+		"extra_args", strings.Join(request.ExtraArgs, " "))
 	callCtx, cancel := c.callContext(ctx)
 	startErr := c.launcher.Start(callCtx, instance.Endpoint, request)
 	cancel()
@@ -430,59 +458,149 @@ func (c *Controller) register(ctx context.Context, instance domain.Instance, rol
 	return routeradapter.Registration{WorkerID: existing.ID, WorkerURL: existing.URL}, nil
 }
 
+// Membership polling cadence. Registration is asynchronous on the Router side,
+// so the control plane has to wait for the new role to appear - but the wait is
+// bounded by the call timeout, and a tight loop spends that whole budget
+// hammering a single endpoint. Backing off turns a hundred requests per call
+// into a handful without making the common case (the role lands on the first
+// or second look) any slower.
+const (
+	membershipPollFloor = 250 * time.Millisecond
+	membershipPollCap   = 2 * time.Second
+)
+
+func nextMembershipDelay(delay time.Duration) time.Duration {
+	delay *= 2
+	if delay > membershipPollCap {
+		return membershipPollCap
+	}
+	return delay
+}
+
 func (c *Controller) waitMembership(ctx context.Context, registration routeradapter.Registration, role domain.Role) (routeradapter.Registration, error) {
 	call, cancel := c.callContext(ctx)
 	defer cancel()
+	delay := membershipPollFloor
+	observed := ""
 	for {
 		worker, err := c.router.GetWorker(call, registration.WorkerID)
-		if err == nil && worker.URL == registration.WorkerURL && worker.WorkerType == string(role) {
+		switch {
+		case err == nil && worker.URL == registration.WorkerURL && worker.WorkerType == string(role):
 			return registration, nil
-		}
-		if err != nil && !errors.Is(err, routeradapter.ErrWorkerNotFound) {
-			return routeradapter.Registration{}, err
+		case err == nil:
+			observed = worker.WorkerType
+		case errors.Is(err, routeradapter.ErrWorkerNotFound):
+			observed = ""
+		default:
+			return routeradapter.Registration{}, c.membershipError(role, registration, observed, err)
 		}
 		select {
 		case <-call.Done():
-			return routeradapter.Registration{}, fmt.Errorf("router membership did not acquire role %s: %w", role, call.Err())
-		case <-time.After(100 * time.Millisecond):
+			return routeradapter.Registration{}, c.membershipError(role, registration, observed, call.Err())
+		case <-time.After(delay):
 		}
+		delay = nextMembershipDelay(delay)
 	}
 }
 
+// membershipError explains a membership that never settled.
+//
+// The transport error alone is not an explanation. When the budget expires
+// mid-poll the Router client reports the deadline it was handed, which surfaces
+// in the logs as "Get http://.../workers/<id>: context deadline exceeded" - a
+// sentence that names an endpoint and no reason, and that costs an operator an
+// hour when the real cause is a stale role the Router refuses to replace. Say
+// what was asked for and what the Router last showed instead.
+func (c *Controller) membershipError(role domain.Role, registration routeradapter.Registration, observed string, cause error) error {
+	state := "the Router never listed the worker"
+	if observed != "" {
+		state = fmt.Sprintf("the Router lists it as %q", observed)
+	}
+	return fmt.Errorf("router membership for %s did not acquire role %s within %s: %s: %w",
+		registration.WorkerURL, role, c.CallTimeout(), state, cause)
+}
+
 // ensureReadiness makes sure readiness is routable and returns the generation.
+//
+// A worker identity survives a redeploy: the router derives it from the worker
+// URL, so an instance that restarts its service re-registers onto the same
+// identity whose recorded health still reflects the previous, now dead process.
+// The router's own probe needs one interval to observe the new process before
+// Healthy flips back, so the unhealthy verdict is retried briefly instead of
+// failing the start on the first observation.
 func (c *Controller) ensureReadiness(ctx context.Context, workerID string) (int64, bool, error) {
+	const probes = 6
+	var lastErr error
+	for attempt := 0; attempt < probes; attempt++ {
+		if attempt > 0 {
+			wait := time.NewTimer(5 * time.Second)
+			select {
+			case <-ctx.Done():
+				wait.Stop()
+				return 0, false, ctx.Err()
+			case <-wait.C:
+			}
+		}
+		ready, err := c.readinessOnce(ctx, workerID)
+		if err == nil {
+			return ready, true, nil
+		}
+		lastErr = err
+		var fatal *permanentReadinessError
+		if errors.As(err, &fatal) {
+			return 0, false, err
+		}
+	}
+	return 0, false, lastErr
+}
+
+// readinessOnce runs one observation of the worker's routability. A
+// permanentReadinessError marks conditions no amount of waiting fixes.
+func (c *Controller) readinessOnce(ctx context.Context, workerID string) (int64, error) {
 	callCtx, cancel := c.callContext(ctx)
 	defer cancel()
 	worker, err := c.router.GetWorker(callCtx, workerID)
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
-	if !worker.Healthy || worker.Metadata["__pd_state"] == "draining" {
+	if worker.Metadata["__pd_state"] == "draining" {
 		_, closeErr := c.router.SetReadiness(callCtx, workerID, false)
 		if closeErr != nil {
-			return 0, false, closeErr
+			return 0, closeErr
 		}
-		return 0, false, fmt.Errorf("router worker is not routable: healthy=%t pd_state=%s", worker.Healthy, worker.Metadata["__pd_state"])
+		return 0, &permanentReadinessError{reason: fmt.Sprintf("pd_state=draining (healthy=%t)", worker.Healthy)}
+	}
+	if !worker.Healthy {
+		return 0, fmt.Errorf("router worker is not routable: healthy=false pd_state=%s", worker.Metadata["__pd_state"])
 	}
 	record, err := c.router.GetReadiness(callCtx, workerID)
 	if err != nil {
 		if !errors.Is(err, routeradapter.ErrReadinessNotVisible) {
-			return 0, false, err
+			return 0, err
 		}
 		transition, setErr := c.router.SetReadiness(callCtx, workerID, true)
 		if setErr != nil {
-			return 0, false, setErr
+			return 0, setErr
 		}
-		return int64(transition.Record.Generation), transition.Record.Ready(), nil
+		return int64(transition.Record.Generation), nil
 	}
 	if record.Ready() {
-		return int64(record.Generation), true, nil
+		return int64(record.Generation), nil
 	}
 	transition, err := c.router.SetReadiness(callCtx, workerID, true)
 	if err != nil {
-		return 0, false, err
+		return 0, err
 	}
-	return int64(transition.Record.Generation), transition.Record.Ready(), nil
+	return int64(transition.Record.Generation), nil
+}
+
+// permanentReadinessError is a readiness condition that retrying cannot fix.
+type permanentReadinessError struct {
+	reason string
+}
+
+func (e *permanentReadinessError) Error() string {
+	return "router worker is permanently unroutable: " + e.reason
 }
 
 // servicePort is the port SGLang must bind for this instance: the one its
@@ -567,6 +685,94 @@ func (c *Controller) failStart(ctx context.Context, instance domain.Instance, op
 		},
 	})
 	return fmt.Errorf("%s: %w", message, cause)
+}
+
+// RequeueService gives one parked instance a fresh start budget.
+//
+// The reconciler retries a failed start until start_max_attempts is spent and
+// then stops. Stopping by itself is right: a control plane that keeps hammering
+// a broken launch hides the problem instead of escalating it, and failStart
+// raises the alert that does the escalating. What was missing is the other half
+// of that bargain - the operator's answer to the escalation. Without it the
+// instance is stranded for good, and not merely retry-less: the reconciler
+// refuses to start it (the budget is gone) while the planner cannot see it
+// either, because the row still holds a valid role (so it is not idle) and
+// FAILED is not a live service (so it is not serving). Both halves of the state
+// machine are closed at once, and the only remaining verbs - drain, release,
+// reclaim - destroy something the operator may want to keep.
+//
+// The cause is usually outside the control plane: the machine's cards were held
+// by another tenant, the registry was unreachable, the weights were still being
+// written. In those cases "try again" is a real answer rather than optimism,
+// which is why this exists instead of an automatic retry loop that would never
+// stop.
+//
+// It is deliberately narrow. Only an IDLE/FAILED instance whose budget is
+// already spent qualifies: a row that still has attempts left is being retried
+// by the reconciler, and letting the operator spend its budget early would turn
+// this into a way to hammer a broken launch by hand. A row without a role is
+// the planner's business, and every other state has a more specific verb, so
+// accepting them here would quietly turn a drain or a reassignment into
+// something else.
+func (c *Controller) RequeueService(ctx context.Context, instanceID, reason string) error {
+	lock := c.instanceOperation(instanceID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	instance, err := c.store.GetInstance(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	if instance.InstanceState != domain.InstanceIdle || instance.ServiceState != domain.ServiceFailed {
+		return fmt.Errorf("instance %s is %s/%s; only a parked IDLE/FAILED service can be requeued",
+			instanceID, instance.InstanceState, instance.ServiceState)
+	}
+	if !instance.Role.Valid() {
+		return fmt.Errorf("instance %s has no assigned role; idle capacity belongs to the planner", instanceID)
+	}
+	if instance.StartAttempts < c.cfg.Controller.StartMaxAttempts {
+		return fmt.Errorf("instance %s still has %d of %d start attempts left; the reconciler retries it on its own",
+			instanceID, c.cfg.Controller.StartMaxAttempts-instance.StartAttempts, c.cfg.Controller.StartMaxAttempts)
+	}
+
+	next := instance
+	next.StartAttempts = 0
+	next.LastError = ""
+	next.LastSeenAt = c.now()
+	// Rewrite the operation row rather than relying on the failed one already
+	// having no retry gate. The reconciler asks operationRetryDue before it
+	// retries, so a pending row with no NextRetryAt is what makes the next
+	// round take the attempt; leaving the gate to chance would give an operator
+	// a requeue that silently does nothing.
+	operation := &store.Operation{
+		OperationID: lifecycleOperationID(instance, store.OpStart),
+		InstanceID:  instanceID,
+		Type:        store.OpStart,
+		Status:      store.OpPending,
+		CreatedAt:   c.now(),
+	}
+	if err := c.transition(ctx, store.Transition{
+		InstanceID: instanceID,
+		Next:       next,
+		Operation:  operation,
+		Audit: store.AuditEntry{
+			Action:     "service_requeued",
+			InstanceID: instanceID,
+			PartnerID:  instance.PartnerID,
+			Details: map[string]string{
+				"role":           string(instance.Role),
+				"reason":         reason,
+				"attempts_spent": fmt.Sprintf("%d", instance.StartAttempts),
+				"last_error":     instance.LastError,
+			},
+		},
+	}); err != nil {
+		return err
+	}
+	c.log().Info("service requeued by the operator",
+		"instance_id", instanceID, "role", string(instance.Role),
+		"attempts_spent", instance.StartAttempts, "reason", reason)
+	return nil
 }
 
 // BeginDrain implements §7.3: close Router readiness, enter DRAINING and let the
@@ -776,17 +982,32 @@ func (c *Controller) finishDrain(ctx context.Context, instance domain.Instance) 
 		})
 	}
 
-	callCtx, cancel := c.callContext(ctx)
-	result, stopErr := c.launcher.Stop(callCtx, instance.Endpoint, launcher.StopRequest{
-		Force:  force,
-		Reason: "drain complete",
-	})
-	cancel()
-	if stopErr != nil {
-		return c.failDrain(ctx, instance, stopErr)
-	}
-	if result.Phase != launcher.PhaseStopped {
-		return c.failDrain(ctx, instance, fmt.Errorf("bootstrap stop did not confirm process exit: phase=%s detail=%s", result.Phase, result.Detail))
+	// Stopping is the only step that needs a live container, and a LOST one has
+	// none: its endpoint stopped answering inside its own network, so the
+	// bootstrap that would serve /stop died with it. Retrying that call fails
+	// on every round and wedges the drain in DRAINING for good — which also
+	// means the container is never handed back and keeps costing quota. Once
+	// the grace has expired there is nothing left to wait for, so the drain
+	// records the service as stopped.
+	var result launcher.StopResult
+	if instance.InstanceState == domain.InstanceLost {
+		result = launcher.StopResult{Phase: launcher.PhaseStopped}
+		c.log().Info("service drain skipped the stop call", "instance_id", instance.ID,
+			"reason", "container is LOST")
+	} else {
+		callCtx, cancel := c.callContext(ctx)
+		var stopErr error
+		result, stopErr = c.launcher.Stop(callCtx, instance.Endpoint, launcher.StopRequest{
+			Force:  force,
+			Reason: "drain complete",
+		})
+		cancel()
+		if stopErr != nil {
+			return c.failDrain(ctx, instance, stopErr)
+		}
+		if result.Phase != launcher.PhaseStopped {
+			return c.failDrain(ctx, instance, fmt.Errorf("bootstrap stop did not confirm process exit: phase=%s detail=%s", result.Phase, result.Detail))
+		}
 	}
 
 	next := instance
@@ -964,6 +1185,17 @@ func (c *Controller) BeginRelease(ctx context.Context, instanceID, reason string
 	callCtx, cancel := c.callContext(ctx)
 	releaseErr := adapter.ReleaseInstance(callCtx, instanceID)
 	cancel()
+	// A partner that does not list the container at all has nothing left to
+	// reclaim: the release postcondition already holds. This is how a node that
+	// died on the platform side ends (the poll stopped reporting it, the console
+	// deleted it, the platform recycled it), and retrying cannot make it more
+	// released — the row would stay in RELEASING with the quota charged forever.
+	absentFromPartner := errors.Is(releaseErr, partner.ErrInstanceNotFound)
+	if absentFromPartner {
+		c.log().Info("release already held", "instance_id", instanceID,
+			"reason", "partner no longer lists the container")
+		releaseErr = nil
+	}
 	if releaseErr != nil {
 		operation.Status = store.OpPending
 		operation.NextRetryAt = c.now().Add(c.cfg.Controller.OperationRetry.Duration())
@@ -998,18 +1230,27 @@ func (c *Controller) BeginRelease(ctx context.Context, instanceID, reason string
 	next.RoleAssignedAt = time.Time{}
 	next.LastError = ""
 	operation.Status = store.OpSucceeded
+	// The audit distinguishes "the partner took the container back" from "the
+	// partner had already lost it", because only the first one means quota was
+	// returned by this call.
+	auditAction := "instance_released"
+	if absentFromPartner {
+		auditAction = "instance_release_absent_from_partner"
+	}
 	if err := c.transition(ctx, store.Transition{
 		InstanceID: instanceID,
 		Next:       next,
 		Operation:  operation,
 		Audit: store.AuditEntry{
-			Action: "instance_released", InstanceID: instanceID, PartnerID: instance.PartnerID,
-			Details: map[string]string{"reason": reason, "router_worker_id": instance.RouterWorkerID},
+			Action: auditAction, InstanceID: instanceID, PartnerID: instance.PartnerID,
+			Details: map[string]string{"reason": reason, "router_worker_id": instance.RouterWorkerID,
+				"absent_from_partner": fmt.Sprintf("%t", absentFromPartner)},
 		},
 	}); err != nil {
 		return err
 	}
-	c.log().Info("instance released", "instance_id", instanceID, "partner_id", instance.PartnerID, "reason", reason)
+	c.log().Info("instance released", "instance_id", instanceID, "partner_id", instance.PartnerID,
+		"reason", reason, "absent_from_partner", absentFromPartner)
 	return nil
 }
 

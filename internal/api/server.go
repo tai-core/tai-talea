@@ -73,6 +73,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/capacity/instances", s.admin(s.handleListInstances))
 	mux.HandleFunc("GET /v1/capacity/instances/{id}", s.admin(s.handleGetInstance))
 	mux.HandleFunc("POST /v1/capacity/instances/{id}/drain", s.admin(s.handleDrainInstance))
+	mux.HandleFunc("POST /v1/capacity/instances/{id}/requeue", s.admin(s.handleRequeueInstance))
 	mux.HandleFunc("POST /v1/capacity/instances/{id}/release", s.admin(s.handleReleaseInstance))
 	mux.HandleFunc("POST /v1/capacity/instances/{id}/reclaim", s.admin(s.handleReclaimInstance))
 	mux.HandleFunc("GET /v1/capacity/instances/{id}/audit", s.admin(s.handleInstanceAudit))
@@ -317,6 +318,27 @@ func (s *Server) handleDrainInstance(writer http.ResponseWriter, request *http.R
 	writeJSON(writer, http.StatusAccepted, map[string]string{
 		"instance_id": id,
 		"result":      "readiness closed; instance is draining",
+	})
+}
+
+// handleRequeueInstance answers the escalation for an instance whose start
+// attempts are spent. It is the only verb that keeps the container, the
+// placement and the assigned role: drain stops the model and clears the role,
+// release and reclaim hand the machine back.
+func (s *Server) handleRequeueInstance(writer http.ResponseWriter, request *http.Request) {
+	id := request.PathValue("id")
+	err := s.opts.Controller.RequeueService(request.Context(), id, "operator requeued the start budget")
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeStoreError(writer, err)
+			return
+		}
+		writeJSON(writer, http.StatusConflict, map[string]string{"error": "requeue_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(writer, http.StatusAccepted, map[string]string{
+		"instance_id": id,
+		"result":      "start budget restored; the next reconcile round retries the assigned role",
 	})
 }
 

@@ -433,20 +433,48 @@ func (c *Client) RemoveStaleMembership(ctx context.Context, id, endpoint string,
 	if err = c.doJSON(req, http.StatusAccepted, &accepted); err != nil {
 		return err
 	}
+	// The Router drops a membership through its own workflow, so the entry is
+	// still listed when the delete is accepted. Poll until it disappears,
+	// backing off: a tight loop spends the whole call budget on one endpoint
+	// without learning anything the first few looks did not already show.
+	delay := staleRemovalPollFloor
+	started := time.Now()
 	for {
 		_, err = c.GetWorker(ctx, id)
 		if errors.Is(err, ErrWorkerNotFound) {
 			return nil
 		}
-		if err != nil {
+		if err != nil && ctx.Err() == nil {
 			return err
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+			// Reporting the raw transport error here ("Get http://.../workers/<id>:
+			// context deadline exceeded") names an endpoint and hides the reason.
+			// The Router accepted the delete; what failed is the membership
+			// actually going away. Measure the wait rather than restating the
+			// client's per-request timeout, which is a different number.
+			return fmt.Errorf("router accepted the removal of %s but still lists it as %q after %s; "+
+				"the stale membership was not dropped: %w",
+				endpoint, worker.WorkerType, time.Since(started).Round(time.Second), ctx.Err())
+		case <-time.After(delay):
 		}
+		delay = nextStaleRemovalDelay(delay)
 	}
+}
+
+// Stale-removal polling cadence. See RemoveStaleMembership.
+const (
+	staleRemovalPollFloor = 250 * time.Millisecond
+	staleRemovalPollCap   = 2 * time.Second
+)
+
+func nextStaleRemovalDelay(delay time.Duration) time.Duration {
+	delay *= 2
+	if delay > staleRemovalPollCap {
+		return staleRemovalPollCap
+	}
+	return delay
 }
 
 func (c *Client) validateWorkerID(workerID string) error {

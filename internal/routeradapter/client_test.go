@@ -26,12 +26,25 @@ type routerStub struct {
 	deletes    int
 	conflict   bool
 	server     *httptest.Server
+
+	// load is the in-flight request count /get_loads reports for every worker.
+	load int64
+	// gets counts GET /workers/{id}, so a test can observe the poll cadence.
+	gets int
+	// removalDelay is how many reads of a deleted membership still find it.
+	// The Router drops a membership through its own workflow, so the delete is
+	// acknowledged long before the entry disappears; a negative value models a
+	// Router whose removal never lands at all.
+	removalDelay int
+	// pendingDrop holds the countdown per deleted worker id.
+	pendingDrop map[string]int
 }
 
 func newRouterStub() *routerStub {
 	stub := &routerStub{
 		workers: map[string]string{}, types: map[string]string{},
 		bootstrap: map[string]int{}, readiness: map[string]string{}, generation: 1,
+		load: 3, removalDelay: 1, pendingDrop: map[string]int{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/workers", stub.workersHandler)
@@ -47,8 +60,13 @@ func (s *routerStub) Close() { s.server.Close() }
 
 func (s *routerStub) clients(t *testing.T) *routeradapter.Client {
 	t.Helper()
+	return s.clientWithTimeout(t, 5*time.Second)
+}
+
+func (s *routerStub) clientWithTimeout(t *testing.T, timeout time.Duration) *routeradapter.Client {
+	t.Helper()
 	client, err := routeradapter.New(routeradapter.Config{
-		Name: "primary", URL: s.server.URL, Mode: routeradapter.ModeReadinessV1, Timeout: 5 * time.Second,
+		Name: "primary", URL: s.server.URL, Mode: routeradapter.ModeReadinessV1, Timeout: timeout,
 	})
 	if err != nil {
 		t.Fatalf("router adapter: %v", err)
@@ -95,8 +113,24 @@ func (s *routerStub) worker(writer http.ResponseWriter, request *http.Request) {
 	switch request.Method {
 	case http.MethodDelete:
 		s.deletes++
+		s.pendingDrop[id] = s.removalDelay
 		writeStubJSON(writer, http.StatusAccepted, map[string]string{"worker_id": id})
 	case http.MethodGet:
+		s.gets++
+		if remaining, waiting := s.pendingDrop[id]; waiting {
+			switch {
+			case remaining < 0:
+				// The workflow never drops the membership.
+			case remaining <= 1:
+				delete(s.pendingDrop, id)
+				delete(s.workers, id)
+				delete(s.types, id)
+				delete(s.bootstrap, id)
+				delete(s.readiness, id)
+			default:
+				s.pendingDrop[id] = remaining - 1
+			}
+		}
 		url, ok := s.workers[id]
 		if !ok {
 			writeStubJSON(writer, http.StatusNotFound, map[string]string{"error": "worker_not_found"})
@@ -144,7 +178,7 @@ func (s *routerStub) readinessItem(writer http.ResponseWriter, request *http.Req
 func (s *routerStub) loads(writer http.ResponseWriter, _ *http.Request) {
 	loads := make([]map[string]any, 0, len(s.workers))
 	for id, url := range s.workers {
-		loads = append(loads, map[string]any{"worker": url, "worker_type": s.types[id], "load": 3})
+		loads = append(loads, map[string]any{"worker": url, "worker_type": s.types[id], "load": s.load})
 	}
 	writeStubJSON(writer, http.StatusOK, map[string]any{"loads": loads, "total_workers": len(s.workers)})
 }
@@ -342,5 +376,99 @@ func TestLoadsWireFormats(t *testing.T) {
 				t.Fatal(loads)
 			}
 		})
+	}
+}
+
+// A stale role cannot be replaced in place: the Router has no update path for a
+// worker's type, so recovery is delete-then-add. The Router performs the delete
+// through its own workflow, which means the membership is still listed when the
+// delete is acknowledged, and the two tests below pin both halves of that: the
+// wait must outlast the workflow without hammering the endpoint, and when the
+// removal never lands the error must say so instead of reporting the transport
+// deadline it happened to trip over.
+func TestRemoveStaleMembershipWaitsWithoutHammeringTheRouter(t *testing.T) {
+	stub := newRouterStub()
+	defer stub.Close()
+	stub.load = 0
+	stub.removalDelay = 3 // the workflow needs two more reads to drop the entry
+	client := stub.clients(t)
+	// The budget lives on the context, not on the client: Config.Timeout bounds
+	// one request, and only a deadline on ctx bounds the wait for a membership.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	registration, err := client.RegisterWorker(ctx, routeradapter.RegisterRequest{
+		WorkerURL: "http://decode-a:32000", WorkerType: domain.RoleDecode, ModelID: "model-a",
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := client.SetReadiness(ctx, registration.WorkerID, false); err != nil {
+		t.Fatalf("close readiness: %v", err)
+	}
+
+	before := stub.gets
+	if err := client.RemoveStaleMembership(ctx, registration.WorkerID,
+		"http://decode-a:32000", domain.RolePrefill); err != nil {
+		t.Fatalf("a replacement that lands must succeed: %v", err)
+	}
+	polls := stub.gets - before
+	if stub.deletes != 1 {
+		t.Fatalf("deletes=%d, want exactly one", stub.deletes)
+	}
+	// One type check, one read per remaining removalDelay, one confirming read.
+	// A fixed 100ms cadence over the same window would spend thirty.
+	if polls > 8 {
+		t.Fatalf("replacement polled %d times; the cadence must back off", polls)
+	}
+	if _, found, err := client.FindWorkerByURL(ctx, "http://decode-a:32000"); err != nil || found {
+		t.Fatalf("membership must be gone: found=%v err=%v", found, err)
+	}
+}
+
+func TestRemoveStaleMembershipNamesAMembershipThatNeverDrops(t *testing.T) {
+	stub := newRouterStub()
+	defer stub.Close()
+	stub.load = 0
+	stub.removalDelay = -1 // accepted, then listed forever
+	client := stub.clients(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	registration, err := client.RegisterWorker(ctx, routeradapter.RegisterRequest{
+		WorkerURL: "http://decode-a:32000", WorkerType: domain.RoleDecode, ModelID: "model-a",
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := client.SetReadiness(ctx, registration.WorkerID, false); err != nil {
+		t.Fatalf("close readiness: %v", err)
+	}
+
+	before := stub.gets
+	started := time.Now()
+	err = client.RemoveStaleMembership(ctx, registration.WorkerID,
+		"http://decode-a:32000", domain.RolePrefill)
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("a membership the Router never drops must not report success")
+	}
+	if elapsed < time.Second {
+		t.Fatalf("gave up after %s; the Router's workflow needs the whole budget", elapsed)
+	}
+	// The diagnostic, not the transport. "Get http://.../workers/w-...: context
+	// deadline exceeded" is what this used to say, and it sent an operator
+	// looking for a slow endpoint instead of a membership that would not move.
+	message := err.Error()
+	if !strings.Contains(message, "was not dropped") ||
+		!strings.Contains(message, `as "decode"`) ||
+		!strings.Contains(message, "http://decode-a:32000") {
+		t.Fatalf("error must name the endpoint and the stale role: %s", message)
+	}
+	if polls := stub.gets - before; polls > 8 {
+		t.Fatalf("gave up after %d polls; the cadence must back off", polls)
+	}
+	if stub.deletes != 1 {
+		t.Fatalf("deletes=%d, want exactly one", stub.deletes)
 	}
 }

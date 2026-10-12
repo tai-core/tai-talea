@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,7 @@ type fakePlatform struct {
 	results    map[string]map[string]string // key -> result/instanceId
 	signedOK   int
 	lastCreate map[string]any
+	released   []string
 }
 
 func (f *fakePlatform) handler(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +74,9 @@ func (f *fakePlatform) handler(w http.ResponseWriter, r *http.Request) {
 			"status": 200, "message": "OK",
 			"data": map[string]any{"ports": list, "customPorts": []any{}},
 		})
+	case strings.HasSuffix(r.URL.Path, "/release"):
+		f.released = append(f.released, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/osm/v1/cci/instance/"), "/release"))
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": 200, "message": "OK", "data": true})
 	case r.URL.Path == "/api/osm/v1/subscription/CCI/create":
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -212,6 +217,49 @@ func TestCreateAndWait(t *testing.T) {
 	}
 }
 
+// The platform queues a create when the product's pool has no free node and
+// drains the queue by priority, so an operator has to be able to ask for a
+// better position than the platform's default.
+func TestCreateForwardsTheRequestedPriority(t *testing.T) {
+	newFake := func() *fakePlatform {
+		return &fakePlatform{
+			t: t, secret: "sk-test",
+			results: map[string]map[string]string{
+				"CCI:SUBSCRIBE:p:1": {"result": "SUCCESS", "instanceId": "inst-new"},
+			},
+		}
+	}
+
+	priority := 1
+	fake := newFake()
+	adapter := newTestAdapter(t, fake)
+	adapter.cfg.ProductCode = "PRD-CCI-5-208"
+	adapter.cfg.Image = "registry.test/ubuntu:24.04"
+	adapter.cfg.Priority = &priority
+	if _, err := adapter.CreateInstance(context.Background(), "glm53-auto4"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	params, _ := fake.lastCreate["cciParams"].(map[string]any)
+	// The fake decodes the request body from JSON, so every number arrives as
+	// float64 rather than the int the adapter put in the map.
+	if got, ok := params["priority"].(float64); !ok || got != 1 {
+		t.Fatalf("priority not forwarded: %+v", params)
+	}
+
+	// An unset priority must stay unset so the platform's default applies.
+	unset := newFake()
+	withoutPriority := newTestAdapter(t, unset)
+	withoutPriority.cfg.ProductCode = "PRD-CCI-5-208"
+	withoutPriority.cfg.Image = "registry.test/ubuntu:24.04"
+	if _, err := withoutPriority.CreateInstance(context.Background(), "glm53-auto5"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	params, _ = unset.lastCreate["cciParams"].(map[string]any)
+	if _, present := params["priority"]; present {
+		t.Fatalf("an unset priority must not be sent: %+v", params)
+	}
+}
+
 func TestWaitCreationReportsFailure(t *testing.T) {
 	fake := &fakePlatform{
 		t: t, secret: "sk-test",
@@ -226,5 +274,110 @@ func TestWaitCreationReportsFailure(t *testing.T) {
 	}
 }
 
-// Compile-time interface check against the real adapter contract.
-var _ partner.PartnerAdapter = (*Adapter)(nil)
+// Compile-time interface checks against the real adapter contract. The
+// identity capability in particular must stay wired: without it the
+// enrolment falls back to the platform id and the poll stops recognising
+// the node it just installed.
+var (
+	_ partner.PartnerAdapter      = (*Adapter)(nil)
+	_ partner.ProvisioningAdapter = (*Adapter)(nil)
+	_ partner.InstanceIdentity    = (*Adapter)(nil)
+)
+
+// The platform publishes only a public ingress, and it does not publish the PD
+// transfer port at all, so a container Talea installed has to advertise the
+// address the installation verified from inside it. Operators keep the static
+// mapping for containers that were never provisioned through Talea.
+func TestAdvertiseHostPrefersStaticThenVerifiedAddress(t *testing.T) {
+	fake := &fakePlatform{
+		t:      t,
+		secret: "sk-test",
+		instances: []map[string]any{
+			{"id": "inst-a", "name": "node-a", "status": "RUNNING", "aidcId": 2,
+				"resource": map[string]any{"gpuName": "NVIDIA-H800A-NV-80G", "gpuCount": 8}},
+			{"id": "inst-b", "name": "node-b", "status": "RUNNING", "aidcId": 2,
+				"resource": map[string]any{"gpuName": "NVIDIA-H800A-NV-80G", "gpuCount": 8}},
+			{"id": "inst-c", "name": "node-c", "status": "RUNNING", "aidcId": 2,
+				"resource": map[string]any{"gpuName": "NVIDIA-H800A-NV-80G", "gpuCount": 8}},
+		},
+		ports: map[string]map[int]string{
+			"inst-a": {9001: "30028", 9002: "30029"},
+			"inst-b": {9001: "30086", 9002: "30093"},
+			"inst-c": {9001: "30011", 9002: "30012"},
+		},
+	}
+	adapter := newTestAdapter(t, fake)
+	adapter.cfg.AdvertiseHosts = map[string]string{"node-a": "172.19.192.134"}
+	adapter.cfg.AdvertiseResolver = func(name string) string {
+		if name == "node-b" {
+			return "172.19.119.194"
+		}
+		return ""
+	}
+
+	snapshot, err := partner.CollectSnapshot(context.Background(), adapter)
+	if err != nil {
+		t.Fatalf("collect snapshot: %v", err)
+	}
+	byID := map[string]partner.CapacityInstance{}
+	for _, instance := range snapshot.Instances {
+		byID[instance.ID] = instance
+	}
+	if got := byID["node-a"]; got.Endpoint != "http://172.19.192.134:9001" || got.ServiceEndpoint != "http://172.19.192.134:9002" {
+		t.Fatalf("the static mapping must win: %+v", got)
+	}
+	if got := byID["node-b"]; got.Endpoint != "http://172.19.119.194:9001" || got.ServiceEndpoint != "http://172.19.119.194:9002" {
+		t.Fatalf("the verified address must be used: %+v", got)
+	}
+	if got := byID["node-c"]; got.Endpoint != "http://203.0.113.9:30011" || got.ServiceEndpoint != "http://203.0.113.9:30012" {
+		t.Fatalf("an unknown container keeps the published endpoint untouched: %+v", got)
+	}
+}
+
+// The pull snapshot keys containers by name while the platform mints a UUID,
+// and the lease has to follow the same convention the snapshot publishes.
+func TestProvisionIdentityMatchesTheSnapshotKey(t *testing.T) {
+	adapter := &Adapter{}
+	id, lease := adapter.ProvisionIdentity("talea-alayanew-1012-090050-1")
+	if id != "talea-alayanew-1012-090050-1" {
+		t.Fatalf("enrolment must reuse the snapshot key, got %q", id)
+	}
+	if lease != "cci-talea-alayanew-1012-090050-1" {
+		t.Fatalf("unexpected lease %q", lease)
+	}
+}
+
+// Releasing a container the platform no longer lists is not a transport
+// failure: the list call succeeded and answered "not here" — the console
+// deleted it, or the platform recycled it after the node died. Reporting that
+// as a plain error makes the controller retry a release that can never
+// succeed, so the row stays in RELEASING with the quota charged. The sentinel
+// is what tells the two situations apart.
+func TestReleaseOfAVanishedContainerReportsNotFound(t *testing.T) {
+	// The fake platform answers every list with an empty record set.
+	fake := &fakePlatform{t: t, secret: "sk-test"}
+	adapter := newTestAdapter(t, fake)
+
+	err := adapter.ReleaseInstance(context.Background(), "glm53-decode2")
+	if !errors.Is(err, partner.ErrInstanceNotFound) {
+		t.Fatalf("a container the platform does not list must report the sentinel, got %v", err)
+	}
+}
+
+// The other half of the contract: a container the platform does list is
+// resolved to its UUID and released, and never reported as missing.
+func TestReleaseResolvesTheNameToThePlatformUUID(t *testing.T) {
+	fake := &fakePlatform{
+		t: t, secret: "sk-test",
+		instances: []map[string]any{
+			{"id": "uuid-1", "name": "glm53-decode4", "status": "RUNNING", "aidcId": 2},
+		},
+	}
+	adapter := newTestAdapter(t, fake)
+	if err := adapter.ReleaseInstance(context.Background(), "glm53-decode4"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if len(fake.released) != 1 || fake.released[0] != "uuid-1" {
+		t.Fatalf("release must be addressed by the platform UUID, got %v", fake.released)
+	}
+}

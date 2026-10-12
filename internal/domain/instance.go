@@ -69,6 +69,21 @@ type InstanceSpec struct {
 	GPU          string   `json:"gpu,omitempty" yaml:"gpu,omitempty"`
 	GPUCount     int      `json:"gpu_count,omitempty" yaml:"gpu_count,omitempty"`
 	ModelSupport []string `json:"model_support,omitempty" yaml:"model_support,omitempty"`
+
+	// SGLangArgsOverride carries the flags the machine this instance landed on
+	// requires, and it is the only place they can live: a partner that rotates
+	// workers over heterogeneous nodes decides the machine and the planner
+	// decides the role, and the two decisions are made without knowledge of
+	// each other. Anything indexed by role is therefore wrong for at least one
+	// of the assignments. --disaggregation-ib-device is the flag that proved
+	// it: the device names are a property of the node's HCAs, so a role-keyed
+	// list hands one machine the other machine's cards, SGLang fails at
+	// start-up, and nothing in the control plane's own state looks wrong.
+	//
+	// The controller merges it last, after the shared list and the role's
+	// exceptions, so a machine flag replaces the value it disagrees with
+	// instead of appending a second copy of it.
+	SGLangArgsOverride []string `json:"sglang_args_override,omitempty" yaml:"sglang_args_override,omitempty"`
 }
 
 // SupportsModel reports whether the spec advertises the model.

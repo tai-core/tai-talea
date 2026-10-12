@@ -64,6 +64,12 @@ var (
 	ErrSnapshotIncomplete = errors.New("partner snapshot is incomplete")
 	// ErrPartnerUnavailable means the partner API could not be reached.
 	ErrPartnerUnavailable = errors.New("partner api unavailable")
+	// ErrInstanceNotFound means the partner does not list the container at all.
+	// Unlike the other two it is not a transport failure but an authoritative
+	// answer about the world: the container has already been reclaimed, deleted
+	// from the console, or recycled by the platform. A release that gets this
+	// answer has reached its postcondition and must not be retried forever.
+	ErrInstanceNotFound = errors.New("partner does not list the container")
 )
 
 // SSHAccess describes how the control plane reaches one container over SSH for
@@ -88,6 +94,61 @@ type ProvisioningAdapter interface {
 	// AwaitSSHAccess waits until the instance is running and returns the SSH
 	// connection details needed by the provisioning pipeline.
 	AwaitSSHAccess(ctx context.Context, instanceID string) (SSHAccess, error)
+}
+
+// InstanceIdentity is implemented by SSH-provisioning partners whose pull
+// snapshot does not key containers by the id the platform assigns at creation.
+// The control plane discovers it with a type assertion, like the other
+// optional capabilities.
+//
+// The enrolment identity must be the one the snapshot reports. Enrolling under
+// the platform's own id instead leaves two rows for one container: the poll
+// creates the reported one, onboarding installs and enrols the other, and the
+// planner then schedules the same physical box twice.
+type InstanceIdentity interface {
+	// ProvisionIdentity returns the pull-snapshot identity and lease id for a
+	// container created under name.
+	ProvisionIdentity(name string) (id string, leaseID string)
+}
+
+// ProvisionedNode is a container that carries its own bootstrap: creating it is
+// already enough, so there is no follow-up installation step. It is what a
+// partner that owns the whole container lifecycle returns instead of an SSH leg.
+type ProvisionedNode struct {
+	// ID is the identity the control plane enrols. It must be the same value
+	// the pull snapshot reports for this container, otherwise the next poll
+	// reads the node as a replacement and drains it right after onboarding.
+	ID              string
+	Endpoint        string
+	ServiceEndpoint string
+	LeaseID         string
+	Spec            domain.InstanceSpec
+}
+
+// ToInstance converts the created container into the enrolable shape.
+func (n ProvisionedNode) ToInstance(partnerID string) domain.Instance {
+	return domain.Instance{
+		ID:              n.ID,
+		PartnerID:       partnerID,
+		Endpoint:        domain.NormalizeEndpoint(n.Endpoint),
+		ServiceEndpoint: domain.NormalizeEndpoint(n.ServiceEndpoint),
+		LeaseID:         n.LeaseID,
+		Spec:            n.Spec,
+	}
+}
+
+// SelfProvisioningAdapter is implemented by partners whose containers carry the
+// bootstrap themselves: the image entrypoint starts it with the shared secret,
+// so creation already yields a reachable control interface and service
+// endpoint. It replaces the SSH leg of the provisioning pipeline, which needs a
+// login the container platform may not offer at all.
+//
+// Like ProvisioningAdapter it is discovered with a type assertion on the
+// PartnerAdapter, so the read-mostly contract stays untouched.
+type SelfProvisioningAdapter interface {
+	// ProvisionNode creates one container and blocks until it is running and
+	// reachable, returning the endpoints it already serves.
+	ProvisionNode(ctx context.Context, name string) (ProvisionedNode, error)
 }
 
 // Snapshot is a validated, versioned view of one partner's capacity.

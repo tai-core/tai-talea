@@ -47,3 +47,40 @@ func TestSSHReofferReleasedNodeAndRestartEnrollment(t *testing.T) {
 		t.Fatal("duplicate active endpoint accepted")
 	}
 }
+
+// The poll creates the row as soon as the platform reports the container, which
+// is before the installation has run, so its first endpoint is whatever the
+// platform publishes. The installation then measures the container's own
+// address from the inside and verifies the control node can reach it — that is
+// the address PD disaggregation needs, because the transfer handshake has no
+// published port.
+func TestEnrollmentAdoptsTheAddressMeasuredInsideTheContainer(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+	id := "talea-node-1"
+	published := "http://203.0.113.9:30028"
+
+	h.handle(h.addedEvent(id, published, "cci-"+id, h.clock.Now()))
+	if got := h.instance(id); got.Endpoint != published {
+		t.Fatalf("unexpected published endpoint: %+v", got)
+	}
+
+	measured := domain.Instance{
+		ID: id, PartnerID: "partner-a", LeaseID: "cci-" + id,
+		Endpoint: "http://172.19.192.134:9001", ServiceEndpoint: "http://172.19.192.134:9002",
+	}
+	if err := h.ctrl.EnrollPrepared(ctx, measured); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ctrl.EnrollPrepared(ctx, measured); err != nil {
+		t.Fatal("repeated enrollment", err)
+	}
+
+	got := h.instance(id)
+	if got.Endpoint != "http://172.19.192.134:9001" || got.ServiceEndpoint != "http://172.19.192.134:9002" {
+		t.Fatalf("verified address not adopted: %+v", got)
+	}
+	if got.InstanceState != domain.InstancePreparing {
+		t.Fatalf("adoption must re-enter preparation: %+v", got)
+	}
+}

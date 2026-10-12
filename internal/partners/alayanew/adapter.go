@@ -33,6 +33,11 @@ type Config struct {
 	NASReadOnly      bool              `json:"nas_read_only"`
 	Env              map[string]string `json:"env"`
 	ComputeResource  string            `json:"compute_resource"`
+	// Priority is the scheduling priority asked for at creation. The platform
+	// queues a request when the pool has no free node and serves the queue by
+	// priority (observed default 3, lower wins). Nil leaves the platform's own
+	// default in place.
+	Priority *int `json:"priority"`
 	// BootstrapPort and ServicePort are the container ports published by CCI.
 	BootstrapPort int
 	ServicePort   int
@@ -40,8 +45,19 @@ type Config struct {
 	// intelligent computing center should use. CCI port mappings expose the
 	// public ingress IP, but cross-worker traffic (Router health checks, PD
 	// disaggregation) runs inside the same network, where the public IP is
-	// not reachable from the containers themselves.
+	// not reachable for the ports the containers do not publish — the PD
+	// transfer handshake in particular has no published port at all.
+	//
+	// It is the static half of the mapping: operators use it for instances
+	// that were never provisioned through Talea. Containers Talea created
+	// itself are covered by AdvertiseResolver instead, because their address
+	// only becomes known once the installation measured it from the inside.
 	AdvertiseHosts map[string]string `json:"advertise_hosts"`
+	// AdvertiseResolver supplies the address the control plane verified for an
+	// instance it installed, keyed by instance name. It is consulted only when
+	// AdvertiseHosts has no entry, and an empty result falls back to the
+	// address the platform publishes.
+	AdvertiseResolver func(name string) string `json:"-"`
 	// Timeout bounds one signed request.
 	Timeout time.Duration
 	// WaitTimeout bounds waiting for a created instance to reach RUNNING.
@@ -98,6 +114,19 @@ func (a *Adapter) ListActiveLeases(ctx context.Context) ([]partner.CapacityInsta
 	return a.listRunning(ctx)
 }
 
+// leaseIDFor is the lease identity the pull snapshot publishes for one
+// container. Sharing it with ProvisionIdentity keeps on-demand creation and
+// the poll describing the same node.
+func leaseIDFor(name string) string { return "cci-" + name }
+
+// ProvisionIdentity implements partner.InstanceIdentity. The snapshot keys
+// containers by the operator-chosen name (the platform UUID would read as a
+// brand new container on every poll and revoke the managed node instead), so
+// the enrolment must use the name too, together with the matching lease.
+func (a *Adapter) ProvisionIdentity(name string) (string, string) {
+	return name, leaseIDFor(name)
+}
+
 // ReleaseInstance implements partner.PartnerAdapter.
 func (a *Adapter) ReleaseInstance(ctx context.Context, instanceID string) error {
 	uuid, err := a.resolveUUID(ctx, instanceID)
@@ -113,6 +142,10 @@ func (a *Adapter) ReleaseInstance(ctx context.Context, instanceID string) error 
 // resolveUUID maps the control-plane identity (the operator-chosen instance
 // name, or an already-UUID instance from the provision flow) to the platform
 // instance ID that mutation endpoints require.
+//
+// A miss is reported as partner.ErrInstanceNotFound rather than as a plain
+// error: the list call succeeded and simply does not mention the container, so
+// the caller learns a fact about the world instead of a transient failure.
 func (a *Adapter) resolveUUID(ctx context.Context, nameOrID string) (string, error) {
 	records, err := a.client.listInstances(ctx, a.cfg.AIDCId, "")
 	if err != nil {
@@ -123,7 +156,7 @@ func (a *Adapter) resolveUUID(ctx context.Context, nameOrID string) (string, err
 			return record.ID, nil
 		}
 	}
-	return "", fmt.Errorf("instance not found on the platform")
+	return "", fmt.Errorf("instance %s: %w", nameOrID, partner.ErrInstanceNotFound)
 }
 
 // AwaitSSHAccess implements partner.ProvisioningAdapter: poll the instance
@@ -197,6 +230,9 @@ func (a *Adapter) CreateInstance(ctx context.Context, name string) (string, erro
 	if a.cfg.ComputeResource != "" {
 		cciParams["computeResourceType"] = a.cfg.ComputeResource
 	}
+	if a.cfg.Priority != nil {
+		cciParams["priority"] = *a.cfg.Priority
+	}
 	if a.cfg.NASStorageID != "" {
 		cciParams["storageConfigEnable"] = true
 		cciParams["storageConfigs"] = []map[string]any{{
@@ -263,6 +299,20 @@ func (a *Adapter) listRunning(ctx context.Context) ([]partner.CapacityInstance, 
 	return instances, nil
 }
 
+// advertiseHost picks the address peers should use for one container. The
+// static operator mapping wins; otherwise the control plane is asked for the
+// address it recorded when it installed the node, and an unknown container
+// keeps the address the platform published.
+func (a *Adapter) advertiseHost(name string) string {
+	if host, ok := a.cfg.AdvertiseHosts[name]; ok && host != "" {
+		return host
+	}
+	if a.cfg.AdvertiseResolver == nil {
+		return ""
+	}
+	return a.cfg.AdvertiseResolver(name)
+}
+
 func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord) (partner.CapacityInstance, error) {
 	mapped, err := a.client.portMappings(ctx, record.ID)
 	if err != nil {
@@ -286,8 +336,8 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 	// ingress port maps 1:1 to the container port, so inside the network
 	// peers reach the container port directly).
 	rewrite := func(endpoint string, containerPort int) string {
-		host, ok := a.cfg.AdvertiseHosts[name]
-		if !ok || host == "" {
+		host := a.advertiseHost(name)
+		if host == "" {
 			return endpoint
 		}
 		u, err := url.Parse(endpoint)
@@ -299,7 +349,7 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 	}
 	instance := partner.CapacityInstance{
 		ID:       name,
-		LeaseID:  "cci-" + name,
+		LeaseID:  leaseIDFor(name),
 		Endpoint: rewrite(bootstrap, a.cfg.BootstrapPort),
 		Spec: domain.InstanceSpec{
 			GPU:          record.Resource.GPUName,
