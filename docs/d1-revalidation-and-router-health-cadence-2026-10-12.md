@@ -394,10 +394,10 @@ D1 是新投一个容器（含镜像与权重加载）。**比较恢复耗时前
 
 ### 7.5 缺口（未做，不要在别处当成已验）
 
-1. **有在途流量时的摘流没做。** T4 的中间那条分支（"等请求跑完再停"、
-   以及 grace 到期后 `forced=true` 强制停）本轮**没有触发**，因为 drain 时恰好是 idle。
-   补法：在发 `POST /drain` 的同时打一个长请求（`max_tokens` 拉大），再看
-   `service_drained` 是 `forced:false` 且时间点落在请求结束之后。
+1. ~~**有在途流量时的摘流没做。**~~ **已补，见 §9。** 本节发布时 drain 恰好撞上 idle，
+   所以 T4 的中间那条分支（"等请求跑完再停"）没被压到。§9 用 4 个 2048-token 长请求
+   把 decode worker 打满后再摘，4/4 完整返回、等满 25.8 秒才移除。
+   （`forced=true` 强制停那条分支仍未触发——要触发它得让请求跑过 300s grace。）
 2. **归还（release / reclaim）那一半没做。** D2 的验收口径是「摘流 / **归还** /
    控制面重启恢复各一遍」，其中控制面重启恢复已在 §6.2 验过，摘流在本节，
    归还仍缺。它是三者中唯一**破坏性**的（实例真的没了，要靠 planner 重新投一个）。
@@ -616,3 +616,148 @@ let worker_id = if let Some(existing_id) = existing_id { existing_id } else { Wo
 所以正确的表述是：**URL 是"同一个 worker"的判据（进程内），id 是随机且只属于这一次注册**。
 两条容易被合并成一条记，而合并之后就会推出"重启后 id 不变"这种错误的预测——
 §7.2 初稿正是这么错的。
+
+## 9. 验证 v0.3：把没人跑的那一步跑起来（PASS，代价见 §9.1）
+
+驱动 `.workbuddy/tmp/alayanew/ns-v03-remove.py`，跑法
+`nsrun.py ns-v03-remove.py --ctrl-pod tai-talea --timeout 1200`。
+
+### 9.0 为什么必须人为触发
+
+§8 改的是 `drain_pd_workers`，而它是 Router `worker_removal` 工作流的一步
+（DAG：`find_workers_to_remove → drain_pd_workers → remove_from_policy_registry →
+remove_from_worker_registry → update_remaining_policies`）。这个工作流只由
+`DELETE /workers/{id}` / `DELETE /workers/by-url`（`server.rs:884-887`）启动，而
+**控制面刻意从不调用它们**：它摘流靠 `PUT /state/workers/{id}`，从不用 DELETE
+（`acceptance_test.go` 里有两条断言专门钉这一点："draining must not use DELETE /workers"）。
+
+⇒ **常规运行不会碰到这一步。** 部署一个没人跑的修复等于没验证，所以直接用 Router
+自己的删除 API 驱动它。方法：先起 4 个 2048-token 的真实长请求打 decode worker，
+等 Router 自己报 `load > 0`，再发 DELETE。
+
+### 9.1 证据一：Router 日志（v0.3 那行确实在执行）
+
+```
+17:14:35 WARN smg::core::steps::worker::local::drain_pd_workers:
+           src/core/steps/worker/local/drain_pd_workers.rs:254:
+           PD drain is waiting for in-flight requests
+           worker_url=http://10.214.81.67:9002 load=4 waited_secs=20
+17:14:40 ... Step succeeded step_id=drain_pd_workers duration_ms=25787
+17:14:40 ... Step started  step_id=remove_from_policy_registry
+17:14:40 ... Removed worker http://10.214.81.67:9002
+17:14:40 ... Step succeeded step_id=remove_from_worker_registry
+```
+
+`load=4` 正是探针并发的那 4 个请求；`duration_ms=25787` 是有界等待真的等满的时长；
+`:254` 是新代码里那条 `warn!`。**这行日志在 v0.2 里不存在**（那时是静默死等）。
+
+### 9.2 证据二：`job_status` —— §5.1 要求的新出口
+
+`GET /workers/{id}` 在 drain 期间逐次刷新（每次都刷新 `timestamp`，所以没被 5 分钟
+TTL 清掉）：
+
+```
+t+ 0.6s {"job_type":"RemoveWorker","status":"draining",
+         "message":"still serving 4 in-flight request(s) after 0s; the drain budget is 300s"}
+t+10.6s ... after 10s ...
+t+20.7s ... after 20s ...
+t+26.7s {}          ← 工作流完成，条目被清
+```
+
+**这是"把还在等这一状态暴露出去"真正落地的样子**：以前这里在 drain 期间是空的。
+
+### 9.3 证据三：在途请求本身 —— 顺带补上 §7.5 缺口①
+
+```
+#0 began=t+0.6s ended=t+26.3s code=200 completion_tokens=2048
+#1 began=t+0.6s ended=t+26.4s code=200 completion_tokens=2048
+#2 began=t+0.6s ended=t+26.4s code=200 completion_tokens=2048
+#3 began=t+0.6s ended=t+26.4s code=200 completion_tokens=2048
+removed at t+26.7s
+```
+
+4/4 返回 200 且 `completion_tokens=2048`（**全部写满，没被截断**），最后一个在
+`t+26.4s` 结束，worker 在 `t+26.7s`（0.3 秒后）才从池里消失。
+
+⇒ **T4 的中间主张「在途请求结束后才 Stop」这次真的被压到了。** §7 那次因为恰好 idle
+而没测到，`forced:false` 只能证明没被 grace 掐断；这次是"等满 25.8 秒、4 个请求全部
+完整返回、然后才摘"。
+
+（机制上正确：`drain_pd_workers` 先把 worker 移出 PD 策略再等，所以等待期间不会有新
+请求进去——它等的是已经发出的工作，不是新流量。）
+
+### 9.4 ⚠️ 这次触发暴露的真问题：planner 会把 1-of-2 的降级放大成全停
+
+**这是本轮唯一一次生产影响，必须写清楚。** 我删掉 decode worker 之后，planner 的反应
+不是等，而是**把唯一的 prefill 也改造成 decode**：
+
+```
+17:14:24.314 service_draining  {reason: "planner rebalance prefill -> decode", grace_seconds: 300}
+17:14:24.315 planner_REASSIGN  {from_role: "prefill", role: "decode",
+               reason: "no idle capacity left; rebalance a prefill worker to decode"}
+17:14:36.202 service_drained   {exit_code: 0, forced: "false"}
+```
+
+池子里没有第三个空闲实例，所以"补 decode 缺口"的唯一手段就是**拆掉 prefill**。完整时间线：
+
+```
+17:14:14  我发 DELETE /workers/by-url（decode）        ← 池子变成 1P0D
+17:14:14  drain_pd_workers 开始等在途（load=4）
+17:14:24  控制面发现 decode worker 不可路由（下一轮 reconcile）
+17:14:24  planner：no idle capacity left → rebalance prefill -> decode
+17:14:36  prefill 服务停（forced:false、exit 0；它此时已 idle）
+17:14:40  4 个请求全部 200 返回；decode worker 从 Router 移除  ← 池子变成 0P0D
+17:14:43  decode 重新注册（新 id ae8f3a63）
+17:15:32  prefill service_starting（attempt 1，角色又变回 prefill）
+17:18:23  prefill healthy → registering
+17:18:28  prefill service_serving（gen 13）
+17:18:28  planner_ASSIGN {reason: "idle instance preferred for the prefill deficit"}
+```
+
+**全停约 4 分 14 秒（17:14:14 → 17:18:28），然后完全自愈，无人干预。**
+恢复后两侧 `IDLE/SERVING` a=0、`prefill_count:1 / decode_count:1`、两条 `healthy=True`、
+`/state/workers` 两条 `ready`、`/readiness` 200、推理 3/3 `tokens=17/12`。
+
+一来一回的净效果是 **零收益 + 4 分钟停机**：等它把 prefill 停掉再启动时，decode 已经
+自己回来了，于是 planner 又把它排回 prefill。这是设计问题不是实现 bug——
+`no idle capacity left` 时"rebalance 另一个角色"，在一个没有富余的池子里等价于
+"**把当前唯一的另一种能力也拿掉**"。planner 缺的信息是"**这个缺口可能只是瞬时的**"
+（我们这次移除是刻意的、短命的动作，Router 成员表正在重建），它把瞬时缺口当成了稳态
+缺口。这与 §5.3 是同一类问题：瞬时条件被当成稳态条件处理。
+
+> 低风险的修法方向（未做）：池内只剩一个某角色实例时，禁止把它 rebalance 成另一种角色；
+> 或者先等一个 reconcile 周期确认缺口仍在。判据不是"要不要 rebalance"，
+> 而是"**rebalance 的代价是不是要拿掉最后一份已有能力**"。
+
+### 9.5 一个次要观察：`pd_state=draining` 会短暂粘到重新注册的 worker 上
+
+decode 实例的审计里有两条：
+
+```
+17:14:24.311 service_start_failed {attempt: "0", exhausted: "false",
+               error: "router worker is permanently unroutable: pd_state=draining (healthy=true)"}
+17:14:38.261 service_start_failed {同上}
+17:14:43.991 service_reregistered {readiness_generation: "12", router_worker_id: "ae8f3a63"}
+```
+
+worker 被移除后重新注册，`pd_state=draining` 一度还在（正是
+`test_same_url_register_preserves_draining_state` 钉住的语义），控制面把它判成
+"permanently unroutable"。**两点值得注意**：① 它几十秒后自己恢复了，所以
+"permanently" 这个词与事实不符；② `attempt: "0"` + `exhausted: "false"` 说明
+**没有烧启动预算**——这点设计是对的，否则一次瞬时的成员表重建就能烧掉 1/3 的预算。
+
+### 9.6 顺带证实 §8.5（又一次）
+
+* decode 重新注册后 id 从 `b32f747f` 变成 `ae8f3a63`（**新随机 UUID**）。
+* prefill 的 id `035c6795` **保持不变**——因为 Router 进程没重启、URL 也没变，
+  `register()` 只是把它重新排了一下角色。
+
+同一次运行里同时出现"id 变了"和"id 没变"，正好是 §8.5 那两条推论各自的一次实例。
+
+### 9.7 探针自己判 INCOMPLETE，是窗口给短了
+
+`ns-v03-remove.py` 的判据 6（恢复后能推理）报了 `False`：它的恢复窗口是
+`BUDGET + RECOVER_BUDGET = 420 + 240 = 660s`，于 `t+208.9s`（约 17:17:42）放弃，
+而 prefill 在 **17:18:28** 才回到 SERVING——**早了约 46 秒**。
+六条判据里前五条全 True（删除被接受、`job_status` 有界等待、4/4 完整、移除在请求之后、
+控制面重新注册）。下一次跑把 `RECOVER_BUDGET` 给到 420s 以上即可。
