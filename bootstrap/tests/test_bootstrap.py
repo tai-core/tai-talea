@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -153,6 +154,45 @@ class RoleTests(unittest.TestCase):
         for hostile in ("--model-path=/etc/passwd", "--host=evil", "--port=1", "; rm -rf /", "--api-key=x"):
             with self.assertRaises(ConfigurationError):
                 validate_extra_args([hostile])
+
+    def test_the_h100_worker_flag_set_is_allowed(self):
+        """Every flag the verified 1P1D deployment sends must survive the gate.
+
+        Each is load-bearing: the IB device list is what steers KV traffic
+        around a dead HCA, the decode bucket bound is a separate flag from the
+        aggregated one 0.5.20 removed, the shared-expert fusion is off because
+        the deep_gemm MoE runner does not exercise it, the cache report is what
+        the Router's readiness view is built from, and the served name has to
+        match on both roles or the Router sees two different models.
+        """
+        extra = [
+            "--disaggregation-ib-device=mlx5_0,mlx5_1,mlx5_3",
+            "--cuda-graph-max-bs-decode=128",
+            "--disable-shared-experts-fusion",
+            "--enable-cache-report",
+            "--served-model-name=glm-5.3-flash",
+        ]
+        command = build_sglang_command("decode", "model-a", extra_args=extra)
+        for argument in extra:
+            self.assertIn(argument, command)
+
+    def test_every_flag_in_the_deployment_template_is_allowed(self):
+        """The template and this allowlist are two halves of one contract.
+
+        The control plane forwards these values without inspecting them, so a
+        flag that the Kubernetes configuration sends and the allowlist does not
+        carry is a 422 that only appears after a worker Pod has been created
+        and started - which is exactly how the flag set drifted once already.
+        Reading the template keeps the two from separating again.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        path = os.path.join(root, "deploy", "kubernetes", "tai-talea.yaml")
+        with open(path, encoding="utf-8") as handle:
+            template = handle.read()
+        arguments = re.findall(r"^\s+- (--[A-Za-z0-9-]+(?:=\S+)?)\s*$", template, re.MULTILINE)
+        self.assertTrue(arguments, "no SGLang arguments found in the deployment template")
+        # Raises ConfigurationError naming the first flag the allowlist rejects.
+        validate_extra_args(arguments)
 
 
 class ProfileTests(unittest.TestCase):
@@ -458,12 +498,15 @@ class ServiceTests(unittest.TestCase):
         command = build_sglang_command(
             "prefill", "model-a",
             # The allowlist matches whole tokens, so values ride along with an
-            # equals sign - exactly how the control plane sends them.
+            # equals sign - exactly how the control plane sends them. The value
+            # itself is SGLang's business; the internal fork hardcodes Mooncake
+            # over RDMA and rejects the TCP variant, so the deployment does not
+            # send this flag at all.
             extra_args=["--tp-size=1",
-                        "--disaggregation-transfer-backend=mooncake_tcp",
+                        "--disaggregation-transfer-backend=mooncake",
                         "--disaggregation-bootstrap-port=5757"])
         self.assertIn("--tp-size=1", command, "extra args must still reach the command")
-        self.assertIn("--disaggregation-transfer-backend=mooncake_tcp", command)
+        self.assertIn("--disaggregation-transfer-backend=mooncake", command)
         self.assertIn("--disaggregation-bootstrap-port=5757", command)
         self.assertNotIn("--log-file", command)
 

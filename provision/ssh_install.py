@@ -8,6 +8,7 @@ commands, package sources, filesystem paths or environment variables.
 import base64
 import hashlib
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -36,16 +37,82 @@ def digest(path):
 
 
 class PinKey(paramiko.MissingHostKeyPolicy):
-    def __init__(self, path, expected):
-        self.path, self.expected = path, expected
+    """Trust on first use, pinned to the container rather than to its address.
+
+    CCI sells containers behind one shared SSH gateway and hands out
+    (gateway host, external port) pairs, recycling them as containers are
+    destroyed. A pin keyed by the address therefore outlives the container it
+    was made for: the next container that inherits the port presents its own
+    host key, the lookup finds the dead container's pin, and the connection is
+    rejected as a changed host key — which is what a freshly provisioned node
+    does every time it lands on a reused port.
+
+    The container identity is the stable anchor: the control plane names the
+    container, the platform vouches for the address it is reachable on, and a
+    key change under the same identity is still a real signal. Records are one
+    per identity in the known-hosts file; the operator can delete a line to
+    re-pin a container.
+    """
+
+    def __init__(self, path, identity, expected):
+        self.path, self.identity, self.expected = path, identity, expected
+
+    @staticmethod
+    def _legacy(host):
+        # Entries written before identity pinning are keyed by address
+        # ("[host]:port" or a bare IP). They describe a container that no longer
+        # exists, so they are dropped instead of migrated.
+        if host.startswith('['):
+            return True
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return True
+
+    def _load(self):
+        """Return {identity: (keytype, 'SHA256:...')}.
+
+        Address-keyed entries are skipped: they belong to containers that are
+        gone. They disappear from the file the next time it is written.
+        """
+        pinned = {}
+        try:
+            lines = self.path.read_text().splitlines()
+        except OSError:
+            return pinned
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 3 or fields[0].startswith('#'):
+                continue
+            if self._legacy(fields[0]):
+                continue
+            pinned[fields[0]] = (fields[1], 'SHA256:' + fields[2])
+        return pinned
+
+    def _store(self, pinned):
+        # Keep known-hosts syntax so an operator can read and edit the file with
+        # the usual tooling, and delete a line to forget a container.
+        body = ''.join('%s %s %s\n' % (name, keytype, fingerprint.split('SHA256:', 1)[1])
+                       for name, (keytype, fingerprint) in sorted(pinned.items()))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(body)
+        self.path.chmod(0o600)
 
     def missing_host_key(self, client, hostname, key):
         fingerprint = 'SHA256:' + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip('=')
+        # An explicit fingerprint is the operator's pin and is never bypassed.
         if self.expected and self.expected != fingerprint:
             raise InstallError('SSH 主机指纹不匹配，请核对容器地址和主机指纹')
+        pinned = self._load()
+        recorded = pinned.get(self.identity)
+        if recorded is not None and recorded[1] != fingerprint:
+            raise InstallError('SSH 主机密钥已变化，请管理员核对后更新控制节点记录')
+        # Seeded so this connection proceeds; the file is the durable record.
         client.get_host_keys().add(hostname, key.get_name(), key)
-        client.save_host_keys(str(self.path))
-        self.path.chmod(0o600)
+        if recorded is None or recorded != (key.get_name(), fingerprint):
+            pinned[self.identity] = (key.get_name(), fingerprint)
+            self._store(pinned)
 
 
 def remote(client, code, payload=None, timeout=120):
@@ -206,8 +273,10 @@ def install(payload):
     state_dir = Path(payload['state_dir'])
     hosts = state_dir / 'known_hosts'
     client = paramiko.SSHClient()
-    if hosts.exists(): client.load_host_keys(str(hosts))
-    client.set_missing_host_key_policy(PinKey(hosts, request.get('host_key', '')))
+    # The pin is keyed by the container, not by the address we reach it on: the
+    # platform recycles (gateway host, external port) pairs, so an address-keyed
+    # pin would reject the next container that inherits a destroyed one's port.
+    client.set_missing_host_key_policy(PinKey(hosts, request.get('id') or request['host'], request.get('host_key', '')))
     key = None
     if request.get('private_key'):
         for kind in [paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey]:

@@ -48,7 +48,12 @@ def install():
                 raise RuntimeError('环境安装或校验失败，请查看容器 /opt/tai-talea/logs/onboarding.log')
         emit(stage='安装系统依赖')
         run(['apt-get','update','-qq'],600)
-        run(['apt-get','install','-y','-qq','python3-venv','libnuma1','libibverbs1','libgomp1','rdma-core'],1200)
+        # ninja-build is not superfluous next to the ninja wheel in the
+        # wheelhouse: SGLang's tilelang and EAGLE paths shell out to ninja, and
+        # a runner without it fails inside JIT with a bare FileNotFoundError.
+        # On a platform with no package source the wheel is what covers it, so
+        # both are installed rather than either one.
+        run(['apt-get','install','-y','-qq','python3-venv','ninja-build','libnuma1','libibverbs1','libgomp1','rdma-core'],1200)
         emit(stage='安装 SGLang 运行环境')
         if not (ROOT/'venv/bin/python').is_file():
             run(['/usr/bin/python3','-m','venv',str(ROOT/'venv')])

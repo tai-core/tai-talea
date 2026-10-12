@@ -26,11 +26,17 @@ ALLOWED_EXTRA_FLAGS = (
     "--max-total-tokens",
     "--tp-size",
     "--dp-size",
-    # PD disaggregation (§8). The transfer backend has to match what the
-    # partner network supports - mooncake_tcp for overlays without RDMA - and
-    # the bootstrap port must be one the peer container can reach.
+    # PD disaggregation (§8). The bootstrap port must be one the peer
+    # container can reach. The transfer backend is deliberately NOT set here:
+    # the internal fork hardcodes Mooncake over RDMA, so the TCP variant this
+    # allowlist once carried was a value SGLang would reject outright.
     "--disaggregation-transfer-backend",
     "--disaggregation-bootstrap-port",
+    # The RDMA device list. It is how KV traffic is steered around an HCA whose
+    # path to the peer is dead: on the H100 nodes individual cards in an
+    # otherwise healthy subnet do not carry traffic, and removing those names
+    # is what took the 1P1D pair from a hanging transfer to a working one.
+    "--disaggregation-ib-device",
     "--trust-remote-code",
     "--disable-radix-cache",
     "--attention-backend",
@@ -46,6 +52,36 @@ ALLOWED_EXTRA_FLAGS = (
     "--disable-custom-all-reduce",
     "--reasoning-parser",
     "--tool-call-parser",
+    # GLM-5.3-Flash verified configuration (docs/glm53-sglang-recipes-2026-10-08.md,
+    # docs/glm53-layout-c-benchmark-2026-10-08.md). Every one of these is
+    # load-bearing on H100: the expert-parallel degree, the chat template
+    # (GLM ships it as a standalone chat_template.jinja, so without this flag
+    # warmup fails), and disabling the flashinfer autotuner, whose OOM is
+    # reported as an illegal memory access rather than an out-of-memory error.
+    "--ep-size",
+    "--chat-template",
+    "--context-length",
+    # What the client asks for by name. Prefill and decode have to advertise
+    # the same one or the Router treats them as two different models.
+    "--served-model-name",
+    # The KV cache report is what the Router's readiness view is built from;
+    # without it a worker can be serving and still be counted as unavailable.
+    "--enable-cache-report",
+    "--disable-flashinfer-autotune",
+    "--disable-cuda-graph",
+    # 0.5.20 split the aggregate batch-size bound into a per-role pair. The
+    # decode bucket is the one that has to be capped when graph capture eats
+    # the memory the KV pool needs.
+    "--cuda-graph-max-bs-decode",
+    # The shared-expert fusion path is not exercised by the deep_gemm MoE
+    # runner this model uses, and leaving it on changes the numerical path.
+    "--disable-shared-experts-fusion",
+    # Speculative decoding. Only usable in the aggregated layout: the upstream
+    # cookbook states it does not start under PD disaggregation at this cut.
+    "--speculative-algorithm",
+    "--speculative-num-steps",
+    "--speculative-eagle-topk",
+    "--speculative-num-draft-tokens",
 )
 
 

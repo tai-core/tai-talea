@@ -1,0 +1,139 @@
+{
+  "schema": "talea-wheelhouse-spec/1",
+  "comment": [
+    "从零搭建推理运行时所需的 wheelhouse 规格。",
+    "",
+    "Talea 的铺装链路只消费制品：ssh_install.py 拒绝任何非 .whl 的文件，并按",
+    "manifest.json 里的 SHA256 逐个核对后才上传；节点上的 install_node.py 只跑",
+    "pip install --no-index --find-links=<wheelhouse>。它从不解析依赖、从不下载、",
+    "从不编译。本目录提供这条链路缺的那一半：",
+    "",
+    "  build-env.sh  联网机器上把参考环境从零搭出来（造环境）",
+    "  build.py      把参考环境冻结成可搬运的离线 wheelhouse（造制品）",
+    "  verify.py     制品离手前，把消费端的每一条闸门先过一遍（核制品）",
+    "",
+    "profile 必须同时与 deploy/container/profile.json（打进镜像的那份）和控制面",
+    "配置里的 image_profile 一致。三处任一不一致，容器自检就会判定环境不匹配、",
+    "exit 29 并释放实例。`verify.py --profile` 会把这三者拉到一起比对。",
+    "",
+    "profile.cuda 写成 13.x 是有意的：基线镜像是 CUDA 13 系列——阿里云通道是",
+    "ubuntu-24.04-cuda-13.0.2，移动云 k8s 节点上唯一缓存的通用镜像是 13.1.1。",
+    "'x' 是 profile 的通配后缀，与 bootstrap/tai_talea_bootstrap/profile.py 的",
+    "匹配规则一致，13.0 与 13.1 都放行。profile.python 必须精确：24.04 镜像里的",
+    "/usr/bin/python3 就是 3.12，而 wheelhouse 里的轮子是按 cp312 挑的。"
+  ],
+  "profile": {
+    "os": "ubuntu-24.04",
+    "cuda": "13.x",
+    "python": "3.12",
+    "sglang": "0.5.20",
+    "wheelhouse": "/opt/tai-talea/wheelhouse",
+    "virtualenv": "/opt/tai-talea/venv"
+  },
+  "builder": {
+    "comment": [
+      "build.py 默认在参考环境所在的机器上原生下载，因此那台机器的 Python 次版本",
+      "必须等于 profile.python；跨机器构造改用 --cross。",
+      "原生模式允许 sdist（有些包只在 PyPI 上有源码包，例如构建缺 cutlass 子模块",
+      "之外的那些），由 build_sdists 在现场 pip wheel 成轮子后再进仓库——消费端",
+      "只认 .whl，这一步不能省。",
+      "cross.platforms 必须包含 manylinux_2_34：sglang 从 0.5.x 起就是按 glibc 2.34",
+      "构建的，漏掉这一项会让 --cross 直接解析不出 sglang（2026-10-08 实测）。"
+    ],
+    "python": "3.12",
+    "strip_local_version": false,
+    "build_sdists": true,
+    "exclude": [],
+    "cross": {
+      "comment": "只有 --cross 时才生效。跨平台下载必须 --only-binary，因此带本地版本标签或只有源码包的钉子会在这一步暴露出来。",
+      "platforms": [
+      "manylinux_2_34_x86_64",
+      "manylinux_2_28_x86_64",
+      "manylinux_2_17_x86_64",
+      "manylinux2014_x86_64"
+      ],
+      "abi": "cp312",
+      "only_binary": true
+    }
+  },
+  "indexes": {
+    "comment": [
+      "国内实测（2026-09-17，同一个 1GB 级轮子）：bfsu 73MB/s、腾讯 37MB/s、",
+      "nju 17MB/s；tuna 只有 324KB/s，不要用。",
+      "",
+      "三个 extra 都是必需的，不是顺手加的：",
+      "",
+      "pytorch：torch==2.13.0+cu130 这类带局部版本标签的钉子在公共 PyPI 上根本",
+      "不存在，而 PyPI 上同名的 torch 是另一份构建，静默换掉就等于换掉了整套 CUDA",
+      "运行时。",
+      "",
+      "nvidia：sglang==0.5.20 钉了 cuda-tile==1.6.0rc5，而 PyPI 上这个版本只有一份",
+      "7 KB 的 sdist——它是 wheel-stub，构建后端按 [tool.wheel_stub] index_url 去",
+      "NVIDIA 自己的索引下真正的轮子。pypi.nvidia.com 会 301 到 pypi.nvidia.cn。",
+      "少了这一条，pip install sglang==0.5.20 会直接死在",
+      "'No matching distribution found for cuda-tile==1.6.0rc5'（2026-10-08 实测），",
+      "而这看起来像 sglang 本身有问题，很容易查错方向。",
+      "",
+      "腾讯：备用镜像。"
+    ],
+    "primary": "https://mirrors.bfsu.edu.cn/pypi/web/simple",
+    "extra": [
+      "https://mirrors.cloud.tencent.com/pypi/simple",
+      "https://download.pytorch.org/whl/cu130",
+      "https://pypi.nvidia.com/"
+    ]
+  },
+  "local_wheels": {
+    "comment": [
+      "两个槽，都先于索引铺装：已命中的钉子不再从索引下载，所以这里是覆盖，不是补充。",
+      "支持 glob。",
+      "",
+      "paths（绝对路径或仓库外路径）：制品库 / NAS，放内部 fork 的 sglang 这类没有公网",
+      "出处的轮子。**不做任何审计**——它本来就在仓库外。",
+      "",
+      "search（本目录下的 wheels/）：仓库内的本地槽，内容被 .gitignore 挡着、不进 git。",
+      "唯一的硬规矩是只放裸 *.whl——build.py 拿 *.whl 去 glob 它，所以放个 .tar.gz 进去",
+      "既不报错也不生效，是无声的；wheelspec.check_local_slot() 把这种无声变成中止。",
+      "体积只报告、不拦。",
+      "",
+      "为什么制品字节一个都不进 git（2026-10-08 实测）：",
+      "① 体积。sglang==0.5.20 本体只有 27 MiB，但它的非可选直接依赖有 76 个包、合计",
+      "   1.22 GiB；其中 torch 529 MiB、sglang-kernel 354 MiB，双双越过 git 单文件",
+      "   100 MiB 的硬上限，push 会被服务端直接拒。它们都在公网索引上（torch 在 pytorch",
+      "   的 cu130 索引），按锁一条命令就能重新拿到同一份文件。注意那个 torch 构建不声明",
+      "   任何 nvidia-* 依赖——基础镜像自带的 CUDA 已经满足它；换成公共 PyPI 的 torch 会",
+      "   再拖进 cudnn/nccl 一整套。",
+      "② 权限。tai-talea 是 public 仓库，内部 fork 是 private 仓库。fork 编译出来的轮子",
+      "   正是最该被带走的东西，也恰恰最不该提交——等于把内部补丁公开。用户 2026-10-08",
+      "   明确确认过这条边界。"
+    ],
+    "paths": [],
+    "search": [
+      "wheels"
+    ]
+  },
+  "requirements": {
+    "comment": [
+      "整份锁来自参考环境（pip freeze --all），top 不是输入而是断言：",
+      "build.py 会核对参考环境里确实装了这几样，否则说明那台机器不是参考环境。",
+      "",
+      "ninja：基础镜像不带它，缺了它 sglang 的 tilelang/EAGLE JIT 会直接崩在",
+      "FileNotFoundError 上（两次事故，见 docs/glm53-*）。",
+      "mooncake-transfer-engine：PD 分离的传输引擎，prefill 侧必需。",
+      "runai-model-streamer + nvidia-cuda-runtime-cu12：这两样正是 2026-09-30 那次",
+      "事后手工往 wheelhouse 里补进去的（补轮子、重算两个哈希、再改控制节点的",
+      "安装清单）。手工补的原因就是参考环境本身不全，所以现在把它们纳入参考环境",
+      "的合同：谁重建参考环境，谁就必须装上，build.py 会挡住偷工减料的那种。",
+      "nvidia-cuda-runtime-cu12 夹在 cu13 里不是笔误：mooncake 的公开轮子是 cu12",
+      "构建的，import 时要 libcudart.so.12。"
+    ],
+    "top": [
+      "sglang==0.5.20",
+      "mooncake-transfer-engine",
+      "runai-model-streamer",
+      "nvidia-cuda-runtime-cu12",
+      "ninja"
+    ],
+    "exclude": []
+  }
+}
