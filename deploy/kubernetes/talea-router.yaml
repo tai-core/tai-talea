@@ -38,7 +38,16 @@ spec:
       # 404 and which had no notion of per-worker readiness. The control
       # plane's RouterAdapter speaks readiness-v1, so the two only work
       # together.
-      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/talea-router:v0.2
+      #
+      # v0.3 is a fork fix, not a version bump for its own sake:
+      # `drain_pd_workers` ran with `Duration::MAX` and waited silently, so a
+      # worker whose Prefill KV handoff was left uncertain (a cancelled request
+      # is enough - the latch that marks it has no clearing path) could never be
+      # removed. Its removal workflow owns it forever, later steps never run,
+      # DELETE keeps answering 202 and the member stays. v0.3 bounds both waits,
+      # reports why, and publishes the reason to `GET /workers/{id}` as
+      # `job_status`. See docs/d1-revalidation-and-router-health-cadence-2026-10-12.md.
+      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/talea-router:v0.3
       imagePullPolicy: Always
       # PD disaggregation is on from the start, with an empty pool. Workers
       # arrive through POST /workers, each carrying its own role, which is what
