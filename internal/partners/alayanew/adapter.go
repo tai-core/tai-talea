@@ -60,8 +60,14 @@ type Config struct {
 	AdvertiseResolver func(name string) string `json:"-"`
 	// Timeout bounds one signed request.
 	Timeout time.Duration
-	// WaitTimeout bounds waiting for a created instance to reach RUNNING.
+	// WaitTimeout bounds waiting for a created instance that already exists to
+	// reach RUNNING. It deliberately does not bound waiting for the platform to
+	// place a still-queued request: that phase has no container to give up.
 	WaitTimeout time.Duration
+	// PollInterval is how long the adapter waits between two status reads while
+	// waiting for a container. The platform answers in well under a second, so
+	// this is politeness rather than necessity.
+	PollInterval time.Duration
 }
 
 // Adapter implements partner.PartnerAdapter for Alaya NeW CCI. Semantics:
@@ -86,6 +92,9 @@ func New(partnerID string, cfg Config) (*Adapter, error) {
 	}
 	if cfg.WaitTimeout <= 0 {
 		cfg.WaitTimeout = 30 * time.Minute
+	}
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 15 * time.Second
 	}
 	if cfg.BootstrapPort == 0 {
 		cfg.BootstrapPort = 9001
@@ -159,28 +168,77 @@ func (a *Adapter) resolveUUID(ctx context.Context, nameOrID string) (string, err
 	return "", fmt.Errorf("instance %s: %w", nameOrID, partner.ErrInstanceNotFound)
 }
 
+// awaitingCapacity reports whether an instance status means "the platform
+// accepted the request but has not placed the container anywhere yet". No
+// container exists in these states, so no capacity is billed and the only asset
+// the request holds is its place in the scheduling queue.
+//
+// An unrecognised status is deliberately NOT treated as queued: a status we do
+// not know may well describe a container that already exists and is being
+// billed, and leaking that costs money, while holding a queue position costs
+// nothing. Unknown states therefore keep the strict behaviour of a timeout that
+// releases.
+func awaitingCapacity(status string) bool {
+	switch status {
+	case "QUEUED", "PENDING", "SCHEDULING":
+		return true
+	default:
+		return false
+	}
+}
+
 // AwaitSSHAccess implements partner.ProvisioningAdapter: poll the instance
 // until RUNNING, then fetch the SSH connection details.
+//
+// The wait budget covers exactly one situation: a container that exists and is
+// taking too long to come up. It deliberately does not cover "the platform has
+// not placed us yet". A queued request has no container, so nothing is being
+// billed and the only thing a local timeout could reclaim is the queue
+// position - the very thing the request was made for. Releasing there would
+// quietly move us to the back of the line, which is how a waiting provision
+// turns into a failed one. So the budget starts only once the instance leaves
+// the queued states, and a wait that ends while still queued reports
+// ErrAwaitingCapacity so the caller keeps the request.
 func (a *Adapter) AwaitSSHAccess(ctx context.Context, instanceID string) (partner.SSHAccess, error) {
-	deadline := time.Now().Add(a.cfg.WaitTimeout)
+	var deadline time.Time
+	var lastStatus string
+	// seenContainer records whether the platform ever described a container
+	// that exists. Until it does, we have no evidence that anything can be
+	// reclaimed, so failures report ErrAwaitingCapacity and the caller leaves
+	// the request alone.
+	seenContainer := false
 	for {
 		status, err := a.client.instanceStatus(ctx, instanceID)
 		if err != nil {
+			if !seenContainer {
+				return partner.SSHAccess{}, fmt.Errorf("instance %s status unreadable: %w: %w", instanceID, partner.ErrAwaitingCapacity, err)
+			}
 			return partner.SSHAccess{}, err
 		}
+		lastStatus = status
 		if status == "RUNNING" {
 			break
 		}
 		if status == "FAILED" || status == "ERROR" {
 			return partner.SSHAccess{}, fmt.Errorf("instance %s reached %s", instanceID, status)
 		}
-		if time.Now().After(deadline) {
+		switch {
+		case awaitingCapacity(status):
+			// Keep the budget stopped for as long as the container is absent.
+			deadline = time.Time{}
+		case deadline.IsZero():
+			seenContainer = true
+			deadline = time.Now().Add(a.cfg.WaitTimeout)
+		case time.Now().After(deadline):
 			return partner.SSHAccess{}, fmt.Errorf("instance %s not RUNNING within %s (last: %s)", instanceID, a.cfg.WaitTimeout, status)
 		}
 		select {
 		case <-ctx.Done():
+			if awaitingCapacity(lastStatus) {
+				return partner.SSHAccess{}, fmt.Errorf("instance %s is still %s: %w", instanceID, lastStatus, partner.ErrAwaitingCapacity)
+			}
 			return partner.SSHAccess{}, ctx.Err()
-		case <-time.After(15 * time.Second):
+		case <-time.After(a.cfg.PollInterval):
 		}
 	}
 	info, err := a.client.getSSH(ctx, instanceID)
@@ -245,6 +303,14 @@ func (a *Adapter) CreateInstance(ctx context.Context, name string) (string, erro
 	}
 	key, err := a.client.createInstance(ctx, a.cfg.ProductCode, cciParams)
 	if err != nil {
+		var apiErr *apiError
+		if errors.As(err, &apiErr) && apiErr.Status == statusNameInUse {
+			// A taken name is not a failure of the request but of the name:
+			// the platform never hands the name of a released container back.
+			// Nothing has been allocated, so the caller retries under a fresh
+			// name at no cost.
+			return "", fmt.Errorf("create instance %s: %w: %v", name, partner.ErrNameInUse, err)
+		}
 		return "", fmt.Errorf("create instance %s: %w", name, err)
 	}
 	return key, nil
@@ -274,7 +340,7 @@ func (a *Adapter) WaitCreation(ctx context.Context, key string) (string, error) 
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(10 * time.Second):
+		case <-time.After(a.cfg.PollInterval):
 		}
 	}
 }

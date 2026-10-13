@@ -541,10 +541,13 @@ func (c Config) Validate() error {
 		}
 		seen[partner.ID] = true
 		if partner.AlayaNeW != nil && partner.AlayaNeW.WaitTimeout.Duration() >= c.Controller.ProvisionTimeout.Duration() {
-			// A wait_timeout that reaches the provision budget would be cut off
-			// by the outer context mid-wait: the job would report a context
-			// deadline instead of "the container never reached RUNNING", and
-			// the operator would lose the reason. Keep them ordered.
+			// wait_timeout bounds the container phase (an instance exists and is
+			// coming up), not the queue phase: a request the platform has not
+			// scheduled yet has nothing to give up and is bounded by the
+			// provision budget alone. A wait_timeout that reaches that budget
+			// would still be cut off by the outer context mid-wait, and the job
+			// would report a context deadline instead of "the container never
+			// reached RUNNING", so the operator would lose the reason.
 			return fmt.Errorf("partners[%d]: alayanew.wait_timeout (%s) must be below controller.provision_timeout (%s)",
 				index, partner.AlayaNeW.WaitTimeout.Duration(), c.Controller.ProvisionTimeout.Duration())
 		}

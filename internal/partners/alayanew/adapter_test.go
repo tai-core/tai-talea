@@ -27,6 +27,41 @@ type fakePlatform struct {
 	signedOK   int
 	lastCreate map[string]any
 	released   []string
+
+	// statuses answers GET /cci/instance/{id}, one entry per call. The last
+	// entry repeats, so a test can describe "queued, then running".
+	statuses []string
+	statusAt int
+	sshURL   string
+	// createStatuses answers POST /subscription/CCI/create. A non-zero entry is
+	// returned as a business error status; the last entry repeats.
+	createStatuses []int
+	createAt       int
+	createNames    []string
+}
+
+func (f *fakePlatform) nextStatus() string {
+	if len(f.statuses) == 0 {
+		return ""
+	}
+	index := f.statusAt
+	if index >= len(f.statuses) {
+		index = len(f.statuses) - 1
+	}
+	f.statusAt++
+	return f.statuses[index]
+}
+
+func (f *fakePlatform) nextCreateStatus() int {
+	if len(f.createStatuses) == 0 {
+		return 0
+	}
+	index := f.createAt
+	if index >= len(f.createStatuses) {
+		index = len(f.createStatuses) - 1
+	}
+	f.createAt++
+	return f.createStatuses[index]
 }
 
 func (f *fakePlatform) handler(w http.ResponseWriter, r *http.Request) {
@@ -56,31 +91,59 @@ func (f *fakePlatform) handler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	switch {
-	case r.URL.Path == "/api/osm/v1/cci/instance/list":
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status": 200, "message": "OK",
-			"data": map[string]any{"records": f.instances, "totalCount": len(f.instances)},
-		})
-	case strings.HasSuffix(r.URL.Path, "/open-port/list"):
-		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/osm/v1/cci/instance/"), "/open-port/list")
-		mapped := f.ports[id]
-		list := make([]map[string]any, 0, len(mapped))
-		for internal, external := range mapped {
-			var externalPort int
-			_, _ = fmt.Sscanf(external, "%d", &externalPort)
-			list = append(list, map[string]any{"port": internal, "externalHost": "203.0.113.9", "externalPort": externalPort})
+	case strings.HasPrefix(r.URL.Path, "/api/osm/v1/cci/instance/"):
+		rest := strings.TrimPrefix(r.URL.Path, "/api/osm/v1/cci/instance/")
+		switch {
+		case rest == "list":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": 200, "message": "OK",
+				"data": map[string]any{"records": f.instances, "totalCount": len(f.instances)},
+			})
+		case strings.HasSuffix(rest, "/open-port/list"):
+			id := strings.TrimSuffix(rest, "/open-port/list")
+			mapped := f.ports[id]
+			list := make([]map[string]any, 0, len(mapped))
+			for internal, external := range mapped {
+				var externalPort int
+				_, _ = fmt.Sscanf(external, "%d", &externalPort)
+				list = append(list, map[string]any{"port": internal, "externalHost": "203.0.113.9", "externalPort": externalPort})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": 200, "message": "OK",
+				"data": map[string]any{"ports": list, "customPorts": []any{}},
+			})
+		case strings.HasSuffix(rest, "/release"):
+			f.released = append(f.released, strings.TrimSuffix(rest, "/release"))
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": 200, "message": "OK", "data": true})
+		case strings.HasSuffix(rest, "/get-ssh"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": 200, "message": "OK",
+				"data": map[string]any{"url": f.sshURL, "password": "pw-test"},
+			})
+		case !strings.Contains(rest, "/"):
+			// GET /cci/instance/{id}: the lifecycle status poll.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": 200, "message": "OK",
+				"data": map[string]any{"status": f.nextStatus()},
+			})
+		default:
+			w.WriteHeader(404)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status": 200, "message": "OK",
-			"data": map[string]any{"ports": list, "customPorts": []any{}},
-		})
-	case strings.HasSuffix(r.URL.Path, "/release"):
-		f.released = append(f.released, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/osm/v1/cci/instance/"), "/release"))
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": 200, "message": "OK", "data": true})
 	case r.URL.Path == "/api/osm/v1/subscription/CCI/create":
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.lastCreate = body
+		if params, ok := body["cciParams"].(map[string]any); ok {
+			if name, ok := params["name"].(string); ok {
+				f.createNames = append(f.createNames, name)
+			}
+		}
+		if status := f.nextCreateStatus(); status != 0 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": status, "message": "本企业内有重复实例名称，请更换",
+			})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": 200, "message": "OK", "data": "CCI:SUBSCRIBE:x:1",
 		})
@@ -379,5 +442,106 @@ func TestReleaseResolvesTheNameToThePlatformUUID(t *testing.T) {
 	}
 	if len(fake.released) != 1 || fake.released[0] != "uuid-1" {
 		t.Fatalf("release must be addressed by the platform UUID, got %v", fake.released)
+	}
+}
+
+// A released container keeps its name reserved on the platform while vanishing
+// from every listing, so a reused name looks free until the create call rejects
+// it (observed: 212035 on glm53-auto4, after glm53-auto4 had been released).
+// The caller can only get past it with a different name, so the collision has
+// to be reported as a name problem rather than as a generic creation failure.
+func TestCreateInstanceReportsATakenName(t *testing.T) {
+	fake := &fakePlatform{t: t, secret: "sk-test", createStatuses: []int{statusNameInUse}}
+	adapter := newTestAdapter(t, fake)
+	adapter.cfg.ProductCode = "PRD-CCI-5-208"
+	adapter.cfg.Image = "registry.test/ubuntu:24.04"
+
+	_, err := adapter.CreateInstance(context.Background(), "glm53-auto4")
+	if !errors.Is(err, partner.ErrNameInUse) {
+		t.Fatalf("expected ErrNameInUse, got %v", err)
+	}
+	// The platform's own words must survive the mapping: the status code is the
+	// only thing that tells an operator which platform rule they hit.
+	if !strings.Contains(err.Error(), "212035") {
+		t.Errorf("platform detail lost: %v", err)
+	}
+}
+
+// The queue position is the whole point of a request made while the pool is
+// full, and the container budget must not be able to throw it away: with no
+// container in existence the budget describes nothing.
+func TestAwaitSSHAccessKeepsWaitingWhileTheRequestIsQueued(t *testing.T) {
+	fake := &fakePlatform{t: t, secret: "sk-test", statuses: []string{"QUEUED"}}
+	adapter := newTestAdapter(t, fake)
+	adapter.cfg.WaitTimeout = time.Millisecond
+	adapter.cfg.PollInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_, err := adapter.AwaitSSHAccess(ctx, "inst-queued")
+	if !errors.Is(err, partner.ErrAwaitingCapacity) {
+		t.Fatalf("a queued request must report ErrAwaitingCapacity, got %v", err)
+	}
+	// It must still have been polling: a bug that simply stopped after the
+	// first read would look identical from the outside.
+	if fake.statusAt < 2 {
+		t.Fatalf("expected repeated polls while queued, got %d", fake.statusAt)
+	}
+}
+
+// The mirror image: once the platform has placed a container it is billed, so
+// the budget applies again and a node that never comes up must fail instead of
+// holding a queue position it no longer has.
+func TestAwaitSSHAccessAppliesTheBudgetOnceAContainerExists(t *testing.T) {
+	fake := &fakePlatform{t: t, secret: "sk-test", statuses: []string{"CREATING"}}
+	adapter := newTestAdapter(t, fake)
+	adapter.cfg.WaitTimeout = 40 * time.Millisecond
+	adapter.cfg.PollInterval = 5 * time.Millisecond
+
+	_, err := adapter.AwaitSSHAccess(context.Background(), "inst-slow")
+	if err == nil {
+		t.Fatal("expected the wait budget to expire")
+	}
+	if errors.Is(err, partner.ErrAwaitingCapacity) {
+		t.Fatalf("a placed container is not a queue position: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not RUNNING within") {
+		t.Errorf("the budget that expired must be named: %v", err)
+	}
+}
+
+// A request that leaves the queue has to be picked up where it stopped, not
+// reported as a failure.
+func TestAwaitSSHAccessReturnsTheLegOnceTheQueueClears(t *testing.T) {
+	fake := &fakePlatform{
+		t: t, secret: "sk-test",
+		statuses: []string{"QUEUED", "RUNNING"},
+		sshURL:   "ssh root@10.0.0.5 -p 2222",
+	}
+	adapter := newTestAdapter(t, fake)
+	adapter.cfg.PollInterval = 5 * time.Millisecond
+	adapter.cfg.WaitTimeout = 2 * time.Second
+
+	access, err := adapter.AwaitSSHAccess(context.Background(), "inst-late")
+	if err != nil {
+		t.Fatalf("await: %v", err)
+	}
+	if access.Host != "10.0.0.5" || access.Port != 2222 || access.User != "root" || access.Password != "pw-test" {
+		t.Fatalf("unexpected access: %+v", access)
+	}
+}
+
+// A status the adapter does not recognise keeps the strict behaviour: it may
+// describe a container that exists and is being billed, and leaking that costs
+// money while holding a queue position costs nothing.
+func TestUnknownStatusIsNotTreatedAsQueued(t *testing.T) {
+	fake := &fakePlatform{t: t, secret: "sk-test", statuses: []string{"SOMETHING-NEW"}}
+	adapter := newTestAdapter(t, fake)
+	adapter.cfg.WaitTimeout = 30 * time.Millisecond
+	adapter.cfg.PollInterval = 5 * time.Millisecond
+
+	_, err := adapter.AwaitSSHAccess(context.Background(), "inst-unknown")
+	if err == nil || errors.Is(err, partner.ErrAwaitingCapacity) {
+		t.Fatalf("an unknown status must keep the bounded behaviour, got %v", err)
 	}
 }

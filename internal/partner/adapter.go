@@ -70,6 +70,22 @@ var (
 	// from the console, or recycled by the platform. A release that gets this
 	// answer has reached its postcondition and must not be retried forever.
 	ErrInstanceNotFound = errors.New("partner does not list the container")
+	// ErrAwaitingCapacity means the partner accepted a creation request but has
+	// not placed a container for it yet. Nothing exists in that state, so there
+	// is nothing to bill and nothing to reclaim: the only thing the request
+	// holds is its position in the partner's queue. Giving that position up is
+	// an operator decision - never a side effect of a local timeout, which
+	// would silently convert "we are still in line" into "we are at the back
+	// of the line". A failure path that sees this error must leave the instance
+	// alone instead of releasing it.
+	ErrAwaitingCapacity = errors.New("still waiting for partner capacity")
+	// ErrNameInUse means the partner refused a creation because the requested
+	// name is already taken. On a platform that keeps a released container's
+	// name reserved while no longer listing the container, the clash is
+	// invisible until the create call fails, and the name can never be reused.
+	// Callers create again under a fresh name; nothing has been allocated yet,
+	// so the collision costs one round trip and no capacity.
+	ErrNameInUse = errors.New("creation name is already taken by the partner")
 )
 
 // SSHAccess describes how the control plane reaches one container over SSH for
@@ -86,13 +102,18 @@ type SSHAccess struct {
 // PartnerAdapter; the read-mostly contract stays untouched.
 type ProvisioningAdapter interface {
 	// CreateInstance asks the partner to provision one container and returns
-	// an opaque creation key for polling.
+	// an opaque creation key for polling. A refused name comes back as
+	// ErrNameInUse so the caller can retry under a fresh one.
 	CreateInstance(ctx context.Context, name string) (string, error)
 	// WaitCreation blocks until the creation resolves, returning the instance
 	// id, or an error when the platform rejects the request.
 	WaitCreation(ctx context.Context, creationKey string) (string, error)
 	// AwaitSSHAccess waits until the instance is running and returns the SSH
 	// connection details needed by the provisioning pipeline.
+	//
+	// A request the partner has accepted but not scheduled reports
+	// ErrAwaitingCapacity rather than a timeout: the container does not exist
+	// yet, so the caller must keep the request instead of releasing it.
 	AwaitSSHAccess(ctx context.Context, instanceID string) (SSHAccess, error)
 }
 

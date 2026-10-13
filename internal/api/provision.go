@@ -17,9 +17,13 @@ import (
 // ProvisionRecord tracks one on-demand creation from API call to the moment
 // the SSH provisioning pipeline takes over.
 type ProvisionRecord struct {
-	Name       string    `json:"name"`
-	PartnerID  string    `json:"partner_id"`
-	State      string    `json:"state"` // QUEUED CREATING WAITING_SSH HANDING_OVER MANAGED FAILED
+	Name      string `json:"name"`
+	PartnerID string `json:"partner_id"`
+	// State is QUEUED, CREATING, WAITING_SSH, HANDING_OVER, MANAGED or FAILED.
+	// QUEUED covers both "just submitted" and "the platform has not scheduled a
+	// container yet": the second is where a request waits out a contended pool,
+	// and it is not a failure.
+	State      string    `json:"state"`
 	Stage      string    `json:"stage,omitempty"`
 	InstanceID string    `json:"instance_id,omitempty"`
 	Error      string    `json:"error,omitempty"`
@@ -79,6 +83,46 @@ func (t *provisionTracker) fail(name string, err error) {
 		return
 	}
 	record.State, record.Error, record.UpdatedAt = "FAILED", err.Error(), time.Now().UTC()
+}
+
+// hold records an outcome that is neither a failure nor a completion: the
+// partner holds the request but has not handed over a container for it. The job
+// stays outstanding, which is what stops the planner from asking for the same
+// capacity again every round, and it keeps the reason it is not moving - a
+// request that looks queued while the platform is in fact unreachable is worse
+// than one that says so.
+func (t *provisionTracker) hold(name, state, stage string, cause error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	record, ok := t.byName[name]
+	if !ok {
+		return
+	}
+	record.State, record.Stage, record.UpdatedAt = state, stage, time.Now().UTC()
+	if cause != nil {
+		record.Error = cause.Error()
+	}
+}
+
+// rename moves a job onto the name the partner finally accepted, so the job
+// describes the container that exists rather than the name it refused. It fails
+// rather than clobbers when the target is already tracked, because two jobs
+// under one name would make the tracker lie about which container is which.
+func (t *provisionTracker) rename(from, to string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	record, ok := t.byName[from]
+	if !ok {
+		return false
+	}
+	if _, taken := t.byName[to]; taken {
+		return false
+	}
+	delete(t.byName, from)
+	record.Name = to
+	record.UpdatedAt = time.Now().UTC()
+	t.byName[to] = record
+	return true
 }
 
 // registerProvision exposes the on-demand creation entry (development document
@@ -259,18 +303,24 @@ func (s *Server) runSelfProvision(parent context.Context, provisioner partner.Se
 // pipeline. Every step is persisted in the in-memory record; the onboarding
 // job itself survives control plane restarts through its own state files.
 //
-// The contract is all-or-nothing: once the partner has accepted a creation
-// request the container exists and is billed, so a failure that leaves it
-// unusable releases it again instead of leaking the partner's quota.
+// The contract is all-or-nothing once a container exists: the moment the
+// partner has placed one, it is billed, so a failure that leaves it unusable
+// releases it again instead of leaking the partner's quota. Accepting a request
+// is not the same as placing a container, though. While the request is still
+// queued nothing exists to bill and nothing exists to reclaim, so releasing it
+// would only destroy our position in the queue - that case is held, not failed.
 func (s *Server) runProvision(parent context.Context, provisioner partner.ProvisioningAdapter, partnerID, name string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), s.provisionTimeout())
 	defer cancel()
 
 	logger := slog.Default().With("provision", name, "partner", partnerID)
-	// abandon releases a container that never became a usable node. It is
-	// deliberately best-effort: the job still reports its original error, and a
-	// failed release leaves the container visible to the poll, which is exactly
-	// the state an operator can reclaim from the console.
+	// abandon releases a container that never became a usable node. It must
+	// only be called for a container that is known to exist: the platform lists
+	// a queued request too, so releasing on an unconfirmed existence silently
+	// trades our place in the queue for nothing. It is deliberately
+	// best-effort: the job still reports its original error, and a failed
+	// release leaves the container visible to the poll, which is exactly the
+	// state an operator can reclaim from the console.
 	abandon := func(instanceID string, cause error) {
 		if instanceID == "" {
 			return
@@ -288,8 +338,27 @@ func (s *Server) runProvision(parent context.Context, provisioner partner.Provis
 		logger.Info("abandoned instance released", "instance", instanceID, "cause", cause.Error())
 	}
 
+	// A name a released container already used is dead on this platform: the
+	// name stays reserved while the container itself disappears from every
+	// listing, so the clash surfaces only here, on the create call. Nothing has
+	// been allocated at that point, which makes a fresh name a free retry
+	// rather than a failure to report.
+	baseName := name
 	provisionJobs.update(name, "CREATING", "提交平台创建请求")
 	key, err := provisioner.CreateInstance(ctx, name)
+	for attempt := 2; err != nil && errors.Is(err, partner.ErrNameInUse) && attempt <= maxProvisionNameAttempts; attempt++ {
+		candidate := fmt.Sprintf("%s-%d", baseName, attempt)
+		logger.Warn("instance name is taken on the platform, retrying", "name", candidate, "cause", err.Error())
+		if !provisionJobs.rename(name, candidate) {
+			// The candidate is already tracked by another job. Step over it
+			// rather than colliding with a job that is already in flight.
+			continue
+		}
+		name = candidate
+		logger = slog.Default().With("provision", name, "partner", partnerID)
+		provisionJobs.update(name, "CREATING", "平台已有同名实例，改用新名字重新提交")
+		key, err = provisioner.CreateInstance(ctx, name)
+	}
 	if err != nil {
 		logger.Error("creation rejected", "error", err)
 		provisionJobs.fail(name, err)
@@ -312,6 +381,15 @@ func (s *Server) runProvision(parent context.Context, provisioner partner.Provis
 	provisionJobs.update(name, "WAITING_SSH", "等待容器 RUNNING 并获取连接信息")
 	access, err := provisioner.AwaitSSHAccess(ctx, instanceID)
 	if err != nil {
+		if errors.Is(err, partner.ErrAwaitingCapacity) {
+			// The platform holds the request but never gave it a container. The
+			// waiting budget expiring here says nothing about whether capacity
+			// will arrive, and releasing would only put us back at the end of
+			// the queue, so the job is held as outstanding instead.
+			logger.Warn("creation is still queued at the partner", "error", err.Error())
+			provisionJobs.hold(name, "QUEUED", "平台已受理创建请求，仍在排队等待算力（未占用容器、不计费；保留队列位次）", err)
+			return
+		}
 		logger.Error("ssh access failed", "error", err)
 		provisionJobs.fail(name, err)
 		abandon(instanceID, err)
@@ -347,6 +425,13 @@ func (s *Server) runProvision(parent context.Context, provisioner partner.Provis
 	provisionJobs.update(name, "MANAGED", "铺装任务已提交，进度见 onboarding 任务列表")
 	logger.Info("provisioned instance handed to onboarding", "host", access.Host, "port", access.Port, "enrol_id", enrolID)
 }
+
+// maxProvisionNameAttempts bounds the rename ladder a name collision can walk
+// (the requested name, then -2 through -5). Every released container poisons
+// one name forever and each retry only costs a round trip, so a handful of
+// steps is enough to get past a handful of leftovers; a deeper ladder would
+// mostly produce names nobody recognises in the platform console.
+const maxProvisionNameAttempts = 5
 
 var (
 	errProvisionNotFound = errors.New("provision job not found")

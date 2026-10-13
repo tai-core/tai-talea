@@ -3,8 +3,12 @@
 // platform's HMAC-SHA256 request signing and adds on-demand instance creation,
 // which the generic read-mostly adapter contract cannot express.
 //
-// Wire notes verified against the live platform (2026-09-29/30):
-//   - Every path is prefixed with /api/osm; omitting it returns HTML.
+// Wire notes verified against the live platform (2026-09-29/30, 2026-10-13):
+//   - Every path is prefixed with /api/osm/v1. Omitting the version segment
+//     does not return a 404 about the path: it returns HTTP 200 carrying
+//     {"message":"Invalid AccessKey"}, which reads like a dead credential and
+//     sends you hunting for a key that is perfectly valid. A bare /api/osm
+//     prefix returns HTML instead. Check the prefix before the key.
 //   - StringToSign is "{ts_ms}|{METHOD}|{path}" with no query string or host.
 //   - The subscription result key contains colons; it must be appended to the
 //     path verbatim (no percent-encoding) or the signature mismatches.
@@ -60,6 +64,16 @@ type apiError struct {
 func (e *apiError) Error() string {
 	return fmt.Sprintf("alayanew api status %d: %s", e.Status, e.Message)
 }
+
+// statusNameInUse is the business status for "this enterprise already has an
+// instance with that name" (message: 本企业内有重复实例名称，请更换).
+//
+// It is not a validation error the caller can avoid by checking first: a
+// released container keeps its name reserved on the platform and is no longer
+// listed by any endpoint, so the name looks free right up until the create
+// call refuses it. Names are therefore single-use, and the only way through a
+// collision is a different name.
+const statusNameInUse = 212035
 
 // call performs one signed request and decodes the JSON envelope into out.
 // path must start with /api/osm; query is appended verbatim.

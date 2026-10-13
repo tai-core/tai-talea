@@ -109,8 +109,12 @@ HTTP 状态码经 `provisionErrorStatus` 从三个哨兵错误映射（400/503/4
   这是「排队中的容器对控制面不可见」唯一可行的处理方式：只有执行器知道自己要过什么。
 - 请求是 fire-and-forget：`RequestCapacity` 立刻返回，作业由既有 `runProvision`/`runSelfProvision`
   在 `provision_timeout`（当前部署 6h）窗口内推进；容器真正出现后由 pull/纳管流程接手，
-  再被 planner 分配角色。失败（含 `abandon()` 释放）后作业转 `FAILED` ⇒ `Outstanding` 归零 ⇒
-  下一个 cooldown 才可能再要一次。
+  再被 planner 分配角色。真失败（容器已存在却起不来）才会 `abandon()` 释放并转 `FAILED` ⇒
+  `Outstanding` 归零 ⇒ 下一个 cooldown 才可能再要一次。
+- **排队不再算失败**（2026-10-13 修，见 `provision-queue-and-names-2026-10-13.md`）：
+  预算到期时若平台还没调度容器，作业保持 `QUEUED`、**不释放队列位次**、仍计为 `Outstanding`
+  ⇒ planner 会一直 `capacity held` 而不重发。此前这条路径会释放请求（实测 `glm53-auto5`
+  在 `wait_timeout` 到期的同一秒被 release），等于把「排在第 1 位」换成「还没开始排」。
 - **默认关闭**（`capacity_actions: false`），这不是偷懒而是平台事实：
   AlayaNeW 上**释放后同名不可重建**（status 212035）、8 卡 EXCLUSIVE 池**可无限期 QUEUED**，
   所以「还容量」是不可逆的运营决定，必须人工开启；开启后 `RELEASE` 也只会降到 1P1D 为止。

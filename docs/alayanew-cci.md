@@ -15,7 +15,7 @@
 | 控制台 | https://www.alayanew.com/ |
 | 文档中心 | https://docs.alayanew.com/cn/docs/api-reference |
 | OpenAPI 基址 | `https://api.alayanew.com` |
-| **实际路径前缀** | **`/api/osm`**（见下方「踩坑」） |
+| **实际路径前缀** | **`/api/osm/v1`**（见下方「踩坑」） |
 | 产品 | CCI（Cloud Container Instance，云容器实例）、分布式训练、NAS 存储、AIDC |
 
 ### 踩坑：文档里的示例路径是错的
@@ -35,8 +35,20 @@ GET https://api.alayanew.com/v1/cci/instance/list
 | `/api/v1/cci/instance/list` | 同样 401 JSON（路由待用真实凭据二次确认） |
 
 正确前缀的来源是「身份认证」文档页里的例子：`/api/osm/v1/cci/instance/list`。
-**写客户端时以 `/api/osm` 为准**，并注意用真实凭据再确认一次 `/api/v1` 是否也有效
-（带合法签名但路径错误应返回 404，而不是 401）。
+**写客户端时以 `/api/osm/v1` 为准。**
+
+**2026-10-13 补充（这个坑踩了第二次，代价是半小时）**：`/v1` 那一段不能省。漏掉它
+**不会**报「路径不对」，而是返回 `404 {"message":"Invalid AccessKey"}`——读起来像是凭据
+失效，于是跑去核对 AK、核对时钟、diff 签名实现，全都是好的。
+
+| 路径 | 实测结果 | 读起来像什么 |
+| --- | --- | --- |
+| `/api/osm/v1/cci/instance/list` | `200 {"status":200,...}` | 正确 |
+| `/api/osm/cci/instance/list` | `404 {"message":"Invalid AccessKey"}` | **像是凭据失效** |
+| `/v1/cci/instance/list` | `200 text/html`（SPA 首页） | 像是路径不对 |
+
+判据：**先确认前缀，再看凭据**。另外 `/api/osm/v1/user/info` 实测 `404 {"message":"Not Found Api"}`
+——这个「Api 不存在」的文案可以用来区分「路径不存在」和「凭据不对」，核对前缀时很好用。
 
 ---
 
