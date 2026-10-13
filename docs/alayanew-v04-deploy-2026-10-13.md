@@ -96,15 +96,77 @@ PYTHONPATH=/opt/tai-talea python3 -c from tai_talea_bootstrap.roles import valid
 | | 状态 |
 | --- | --- |
 | 控制面 | v0.4，`0.0.0.0:8787`，`mode: fixed`，队列语义/换名修复已生效 |
-| 容器 | 只有 `glm53-prefill`（H800A×8），角色 `decode`，Router 无健康 prefill ⇒ **推理 503** |
+| 容器 | `glm53-prefill`（H800A×8，角色 `decode`，已在服）+ **`glm53-pd2`（QUEUED，见 §5）** |
 | 指标 | 当前节点不可用（`--enable-metrics` 未随启动下发）；**下一台起可用** |
 | 弹性 | 仍未开启：`mode: fixed`，且单节点下 `Snapshot.Complete` 不可能为真 |
 
 下一步按价值排序：
 
-1. **请求第二台机器**（新名字 + `priority: 1`，6h 窗口）。排队不花钱，队列位次现在也不会被超时丢掉；
-   只有 1P1D 才能到端到端验收。
+1. ~~请求第二台机器~~ —— **已完成**，见 §5。
 2. 新节点落地后：`--enable-metrics` 生效 ⇒ 两侧样本可用 ⇒ `Snapshot.Complete` 可能首次为真
    ⇒ 才谈得上把 `mode` 改 `auto` 并观察第一次真实档位移动。
 3. 若要让**当前这一台**不再 503：Router 去掉 `--pd-disaggregation` + SGLang 以聚合模式重启
    （模型重载 15–20 分钟）。注意这是临时形态 —— 第二台到位后 Router 要再切回 PD，成员表要重建。
+
+---
+
+## 5. 第二台机器：已发出（2026-10-13 10:33:28）
+
+走的是控制面自己的入口，不是手工调平台 API —— 这样「console 与自动扩容走同一条创建路径」
+这个不变量才有意义，也才顺带验证了 §3 之外的新语义。
+
+```
+POST http://127.0.0.1:8787/v1/capacity/console/provision
+Authorization: Bearer <server.admin_token>
+{"partner_id":"alayanew","name":"glm53-pd2","count":1}
+
+→ 202 {"accepted":true,"jobs":[{"name":"glm53-pd2","partner_id":"alayanew","state":"QUEUED",…}]}
+```
+
+用**管家令牌**（`server.admin_token`）通过 `consoleAuth` 时 `consolePartner(r)` 为空，
+所以 body 里**必须**显式带 `partner_id`（`handleProvision` 会以「缺少 partner_id」400 拒绝）。
+payload 受 `decoder.DisallowUnknownFields()` 约束，`count` 默认 1、上限 4。
+
+### 观察到的状态流转
+
+| 时刻 | 作业（控制面） | 平台 |
+| --- | --- | --- |
+| 10:33:28 | `QUEUED` | — |
+| 10:33:28.6 | `CREATING` / 等待平台受理 | create 已受理，`createTime 10:33:29` |
+| 10:33:43 | `WAITING_SSH` / 等待容器 RUNNING 并获取连接信息 | **`QUEUED`** |
+
+平台侧记录（`GET /api/osm/v1/cci/instance/list`）：
+
+| name | id | status | priority | GPU | createTime | releaseTime |
+| --- | --- | --- | --- | --- | --- | --- |
+| **glm53-pd2** | `543635f8-432f-42fe-8a82-8d7bce82ca33` | **QUEUED** | **1** | 8×H800A | 2026-10-13 10:33:29 | `None` |
+| glm53-prefill | `c8752ad0-2818-45e0-a7c5-52a2c7c13030` | RUNNING | 3 | 8×H800A | 2026-09-30 11:50:33 | `None` |
+
+三个结论：
+
+1. **名字是干净的** —— 没有回 `212035`，说明 `glm53-pd2` 从未被用过。
+   （已释放的 `glm53-auto4` / `glm53-auto5` / `glm53-decode4` 不在 `instance/list` 里，
+   但平台仍永久保留它们。）
+2. **`priority: 1` 真的下发了** —— 平台记录 `priority=1`，对比老机器是平台默认的 3。
+   注意这个字段是**实例属性**，只有创建时决定一次。
+3. **平台没有释放它** —— `releaseTime` 为空，`status` 是 `QUEUED` 而不是 `RELEASED`。
+
+### 这一版语义的判据（怎么算通过）
+
+作业停在 `WAITING_SSH` 是**正确**行为，不是卡住：容器不存在 ⇒ `awaitingCapacity("QUEUED")` 为真
+⇒ 适配器把 `deadline` 停在零值（预算停表）、按 15s 轮询，直到池子里腾出节点。
+真正的失败点只剩外层 `provision_timeout`（6h）；届时返回 `ErrAwaitingCapacity`，
+`runProvision` 把它 **hold 成 `QUEUED` 而不是 release**，队列位次保住。
+
+对照旧行为：上一轮 `glm53-auto5` 在 `createTime 19:57:16 → releaseTime 01:27:33`，
+**恰好 5h30m**（`wait_timeout`）—— 那是我们自己的超时把队列位次**主动丢弃**了。
+
+观测设施：容器内 `/root/pd2-watch.sh`（pid 见 `pgrep -af '[p]d2-watch'`），
+每 60s 把**去重后**的作业状态追加到 `/tmp/pd2-timeline.log`，可跨 SSH 会话保留时间线。
+
+### 未定
+
+- 池子何时腾出节点无法预测：平台没有任何容量/队列查询接口（`/cci/product/stock` 等全 404），
+  排队只能靠 `priority` + 等。
+- 若 6h 内没等到，作业会被 hold 成 `QUEUED` 且**仍计入 `OutstandingProvisions`**
+  （planner 不会重发），此时需要人决定：继续等（再发一次）还是放弃（手工 release）。
