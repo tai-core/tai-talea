@@ -109,6 +109,78 @@ func TestSchemaV2MigrationPreservesInstances(t *testing.T) {
 	}
 }
 
+func TestSchemaV3MigrationAddsTheStartReArmColumns(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v3.db")
+	persistence, err := store.OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedIdle(t, persistence, "preserved")
+	if err := persistence.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A database that predates the columns: version 3, and a row in it that has
+	// never been re-armed because the mechanism did not exist.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"ALTER TABLE capacity_instances DROP COLUMN start_rearms; ALTER TABLE capacity_instances DROP COLUMN start_parked_at; PRAGMA user_version = 3;"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	persistence, err = store.OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	row, err := persistence.GetInstance(ctx, "preserved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.StartRearms != 0 {
+		t.Fatalf("start_rearms = %d on a migrated row, want 0 (never re-armed)", row.StartRearms)
+	}
+	if !row.StartParkedAt.IsZero() {
+		t.Fatalf("start_parked_at = %s on a migrated row, want no park", row.StartParkedAt)
+	}
+}
+
+func TestStartReArmStateSurvivesARoundTrip(t *testing.T) {
+	persistence := newStore(t)
+	ctx := context.Background()
+	row := newInstanceRow(t, persistence, "parked")
+	parkedAt := time.Now().UTC().Add(-47 * time.Minute).Truncate(time.Millisecond)
+	row.StartAttempts, row.StartRearms, row.StartParkedAt = 3, 2, parkedAt
+	if err := persistence.ApplyTransition(ctx, store.Transition{InstanceID: row.ID, Next: row}); err != nil {
+		t.Fatal(err)
+	}
+	read, err := persistence.GetInstance(ctx, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read.StartAttempts != 3 || read.StartRearms != 2 || !read.StartParkedAt.Equal(parkedAt) {
+		t.Fatalf("start budget state did not survive the round trip: %+v", read)
+	}
+	// Clearing the park must round-trip too: it is how the cooldown is restarted
+	// for the next cycle.
+	read.StartAttempts, read.StartParkedAt = 0, time.Time{}
+	if err := persistence.ApplyTransition(ctx, store.Transition{InstanceID: read.ID, Next: read}); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := persistence.GetInstance(ctx, read.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared.StartAttempts != 0 || !cleared.StartParkedAt.IsZero() {
+		t.Fatalf("clearing the park did not survive: %+v", cleared)
+	}
+}
+
 func TestReclaimCannotCrossLeaseBoundary(t *testing.T) {
 	persistence := newStore(t)
 	ctx := context.Background()

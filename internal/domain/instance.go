@@ -144,7 +144,24 @@ type Instance struct {
 	ReadinessGeneration int64     `json:"readiness_generation"`
 	PrepareAttempts     int       `json:"prepare_attempts"`
 	StartAttempts       int       `json:"start_attempts"`
-	DrainDeadlineAt     time.Time `json:"drain_deadline_at,omitempty"`
+	// StartRearms counts how many times a spent start budget was re-armed
+	// automatically rather than by an operator. It exists so that the control
+	// plane can try again after a quiet period - the cards were held by another
+	// tenant, the registry was unreachable, the weights were still being
+	// written - without turning a genuinely broken launch into an unbounded
+	// loop that burns eight GPUs every cooldown. It resets the moment the
+	// service serves, so a long-lived instance never accumulates debt from
+	// failures it already recovered from.
+	StartRearms int `json:"start_rearms"`
+	// StartParkedAt is when the start budget was last spent, by the control
+	// plane's own clock. It is the cooldown's reference point, and it is a
+	// column of its own because no existing timestamp can carry that meaning:
+	// LastSeenAt is refreshed by every partner observation, including the pull
+	// loop re-asserting a container that has not moved, and the store stamps
+	// its row times from the wall clock rather than from the controller's.
+	// Zero means the budget is not spent.
+	StartParkedAt   time.Time `json:"start_parked_at,omitempty"`
+	DrainDeadlineAt time.Time `json:"drain_deadline_at,omitempty"`
 	// PendingRelease records that the container must be handed back to the
 	// partner once draining finished. It is what distinguishes a revoked
 	// container from a plain role conversion.

@@ -21,6 +21,31 @@ const examplePath = "../../deploy/tai-talea.example.yaml"
 // ideally look like, and each difference is a deployment that never starts.
 const kubernetesPath = "../../deploy/kubernetes/tai-talea.yaml"
 
+// TestShippedExamplesLoad keeps every example in the repository honest. They
+// are copied into real deployments, so one that no longer parses - or that a
+// validation rule has outgrown - is a deployment that fails at start-up with
+// the operator reading a file the project itself ships. It has happened: a
+// comment gained a literal "/r/n" where a line break was meant, which no
+// compiler and no linter would have caught.
+func TestShippedExamplesLoad(t *testing.T) {
+	examples, err := filepath.Glob("../../deploy/*.yaml")
+	if err != nil {
+		t.Fatalf("glob examples: %v", err)
+	}
+	examples = append(examples, kubernetesPath)
+	if len(examples) < 3 {
+		t.Fatalf("expected the shipped examples, found %v", examples)
+	}
+	for _, path := range examples {
+		path := path
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			if _, err := config.Load(path); err != nil {
+				t.Fatalf("%s must load and validate: %v", path, err)
+			}
+		})
+	}
+}
+
 // TestKubernetesConfigurationIsValid pins the values whose failure modes are
 // invisible from the outside: a Pod that pends, an instance that is released
 // minutes after it was created, or a worker that starts and then dies at the
@@ -266,6 +291,15 @@ func TestValidationRejectsIncompleteConfiguration(t *testing.T) {
 				Host:            "h100-04",
 				ExtraSGLangArgs: []string{"--tp-size=8", ""},
 			}}
+		},
+		// An unbounded automatic retry of a broken launch reloads eight GPUs of
+		// weights every cooldown forever, so the cap is required rather than
+		// defaulted: whoever turns the cooldown on has to say how many times.
+		"start retry cooldown without a rearm cap": func(c *config.Config) {
+			c.Controller.StartRetryCooldown = config.Duration(30 * time.Minute)
+		},
+		"negative start retry cooldown": func(c *config.Config) {
+			c.Controller.StartRetryCooldown = config.Duration(-time.Minute)
 		},
 	}
 	for name, mutate := range cases {

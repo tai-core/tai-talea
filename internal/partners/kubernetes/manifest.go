@@ -35,6 +35,41 @@ const (
 	dnsClusterFirstWithHostNet = "ClusterFirstWithHostNet"
 )
 
+// Liveness probing.
+//
+// RestartPolicy covers a process that exits. It does not cover the failure
+// that actually took an H100 worker down: a process tree that stays alive,
+// holds its eight cards and never answers again. Nothing inside the container
+// reports that state - the bootstrap's own health surface is a proxy for the
+// model, so a wedged model, a busy bootstrap and a dead bootstrap all look the
+// same from outside - and a process that never exits is never restarted by
+// Kubernetes on its own. A liveness probe is the only mechanism that turns
+// "alive but mute" into a restart, and the restart it produces is exactly the
+// operator's `kill 1` inside the container: same Pod, same address, same
+// lease, restartCount incremented.
+//
+// The endpoint is deliberately not the readiness endpoint. Readiness is
+// *expected* to fail for the first several minutes of a worker's life, while
+// the environment is prepared and the weights are loaded; a liveness probe
+// that failed for the same reason would restart a container that is loading
+// correctly. livenessPath is answered by the bootstrap's HTTP server alone -
+// no service lock, no model probe - so it survives environment preparation and
+// model loading, and goes silent only when the process stops serving.
+//
+// The numbers cannot kill a healthy worker: a minute of grace before the
+// first probe covers Python and the entrypoint, and a full minute of
+// unanswered requests - six consecutive failures, five seconds each - is
+// unambiguous for a server that otherwise answers in microseconds. It is also
+// short against the failure it exists for: the wedged worker that motivated
+// this stayed mute for ten minutes.
+const (
+	livenessPath                = "/bootstrap/liveness"
+	livenessInitialDelaySeconds = 60
+	livenessPeriodSeconds       = 10
+	livenessTimeoutSeconds      = 5
+	livenessFailureThreshold    = 6
+)
+
 // selector is the label query that scopes a list to this partner's capacity.
 func (a *Adapter) selector() string {
 	return LabelManagedBy + "=" + managedByValue + "," + LabelPartner + "=" + a.partnerID
@@ -151,6 +186,31 @@ func (a *Adapter) buildPod(name string) Pod {
 	}
 	if container.ImagePullPolicy == "" {
 		container.ImagePullPolicy = "IfNotPresent"
+	}
+	// Like Privileged below, this is set on the local copy before the Pod
+	// literal is built: the container struct is copied by value into the spec,
+	// so a mutation after that point would never reach the API.
+	//
+	// The probe is opt-in. A worker image whose bootstrap predates
+	// /bootstrap/liveness answers 404 to it, which the kubelet reads as a
+	// failed probe, and the container would be restarted forever without ever
+	// serving. A wedged worker is bad; a worker that can never start is worse,
+	// so the control plane asks for the probe only where the operator has
+	// declared the image supports it - kubernetes.liveness_probe.
+	if a.cfg.LivenessProbe {
+		container.LivenessProbe = &Probe{
+			HTTPGet: &HTTPGetAction{
+				Path: livenessPath,
+				Port: a.cfg.BootstrapPort,
+				HTTPHeaders: []HTTPHeader{
+					{Name: "X-Bootstrap-Token", Value: a.cfg.BootstrapToken},
+				},
+			},
+			InitialDelaySeconds: livenessInitialDelaySeconds,
+			PeriodSeconds:       livenessPeriodSeconds,
+			TimeoutSeconds:      livenessTimeoutSeconds,
+			FailureThreshold:    livenessFailureThreshold,
+		}
 	}
 	// Privileged is set on the copy that goes into the Pod, before the Pod
 	// literal is built: the container struct is copied by value into the

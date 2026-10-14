@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is bumped whenever the DDL below changes. Migrations are
 // applied inside a single transaction and recorded through PRAGMA user_version.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // schemaDDL is the milestone 1 data model. Tables capacity_instances,
 // capacity_events, partner_snapshots and operations follow development

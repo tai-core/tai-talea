@@ -97,3 +97,35 @@ func TestRoleRecoveryRefusesBusyOrUnknownStaleMembership(t *testing.T) {
 		})
 	}
 }
+
+// A Router drops a membership through its own asynchronous workflow: the
+// DELETE is accepted at once and the entry disappears seconds later. The
+// control plane used to wait with call_timeout, so the only thing it could
+// ever observe was its own deadline - the delete was accepted, the entry
+// stayed listed, and every round reproduced the identical failure while the
+// instance stayed unregistered. The wait is bounded by router.removal_timeout
+// instead, which covers the workflow's budget.
+func TestRoleRecoveryOutlastsTheRoutersAsynchronousRemoval(t *testing.T) {
+	h := newHarness(t)
+	h.handle(h.addedEvent("node", h.bootstrap.Endpoint(), "lease", h.clock.Now()))
+	if _, err := h.ctrl.router.RegisterWorker(t.Context(), routeradapter.RegisterRequest{
+		WorkerURL: h.bootstrap.Endpoint(), WorkerType: domain.RoleDecode, ModelID: testModelID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Longer than the harness call timeout (3s), well under removal_timeout.
+	h.router.removeDelay = 5 * time.Second
+
+	started := time.Now()
+	if err := h.ctrl.StartService(t.Context(), "node", domain.RolePrefill); err != nil {
+		t.Fatalf("role recovery must outlast call_timeout: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < h.router.removeDelay {
+		t.Fatalf("returned after %s; the wait must cover the Router's workflow "+
+			"rather than stop at call_timeout", elapsed)
+	}
+	worker, found := h.router.workerByURL(h.bootstrap.Endpoint())
+	if !found || worker.WorkerType != "prefill" {
+		t.Fatalf("wrong membership after the wait: %+v", worker)
+	}
+}

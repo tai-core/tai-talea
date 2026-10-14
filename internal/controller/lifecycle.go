@@ -318,6 +318,11 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 	instance.ReadinessGeneration = generation
 	instance.ServiceState = domain.ServiceServing
 	instance.StartAttempts = 0
+	// The service is serving, so whatever the re-arm counter was measuring is
+	// over: an instance that recovers must not carry a debt that would park it
+	// permanently the next time a transient failure spends a budget.
+	instance.StartRearms = 0
+	instance.StartParkedAt = time.Time{}
 	instance.LastError = ""
 	instance.LastSeenAt = c.now()
 	operation.Status = store.OpSucceeded
@@ -415,7 +420,15 @@ func (c *Controller) register(ctx context.Context, instance domain.Instance, rol
 		if !ok {
 			return routeradapter.Registration{}, fmt.Errorf("router role mismatch: %s != %s", existing.WorkerType, role)
 		}
-		cleanCtx, cleanCancel := c.callContext(ctx)
+		// This is the one call that legitimately outlives call_timeout. The
+		// Router drops a membership through its own asynchronous workflow, so
+		// a seconds-long deadline can only ever observe its own timeout: the
+		// delete is accepted, the entry stays listed, and the next round
+		// reproduces the identical failure. removal_timeout covers the
+		// workflow's budget instead. The instance lock is held throughout, so
+		// concurrent operations on this instance are refused rather than
+		// racing the role change - which is the point.
+		cleanCtx, cleanCancel := c.removalContext(ctx)
 		err = cleaner.RemoveStaleMembership(cleanCtx, existing.ID, instance.ServiceURL(), role)
 		cleanCancel()
 		if err != nil {
@@ -633,6 +646,18 @@ func (c *Controller) failStart(ctx context.Context, instance domain.Instance, op
 	next.LastError = message + ": " + cause.Error()
 	next.LastSeenAt = c.now()
 	exhausted := next.StartAttempts >= c.cfg.Controller.StartMaxAttempts
+	if exhausted {
+		// The park begins now, on the control plane's clock. This is what
+		// start_retry_cooldown measures from, and it is written here rather
+		// than derived from a row timestamp because no existing one means
+		// "this budget was spent": the store stamps its own times from the
+		// wall clock, and LastSeenAt is refreshed by partner observations.
+		next.StartParkedAt = c.now()
+	} else {
+		// A failure with attempts left is not a park. Clearing the stamp keeps
+		// the row from carrying a cooldown that no longer describes it.
+		next.StartParkedAt = time.Time{}
+	}
 
 	operation.Status = store.OpPending
 	operation.LastError = next.LastError
@@ -737,6 +762,8 @@ func (c *Controller) RequeueService(ctx context.Context, instanceID, reason stri
 
 	next := instance
 	next.StartAttempts = 0
+	next.StartRearms = 0
+	next.StartParkedAt = time.Time{}
 	next.LastError = ""
 	next.LastSeenAt = c.now()
 	// Rewrite the operation row rather than relying on the failed one already
@@ -1015,6 +1042,8 @@ func (c *Controller) finishDrain(ctx context.Context, instance domain.Instance) 
 	next.Role = domain.RoleNone
 	next.RoleAssignedAt = time.Time{}
 	next.StartAttempts = 0
+	next.StartRearms = 0
+	next.StartParkedAt = time.Time{}
 	next.DrainDeadlineAt = time.Time{}
 	next.LastSeenAt = c.now()
 	next.LastError = ""
@@ -1331,6 +1360,8 @@ func applyInstanceUpdate(instance *domain.Instance, update domain.InstanceUpdate
 	instance.LeaseUpdatedAt = update.ObservedAt
 	instance.PrepareAttempts = 0
 	instance.StartAttempts = 0
+	instance.StartRearms = 0
+	instance.StartParkedAt = time.Time{}
 	instance.PendingUpdate = nil
 }
 

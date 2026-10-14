@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tai-core/tai-talea/internal/config"
@@ -113,6 +114,12 @@ type Controller struct {
 	// automatic change can be audited even when it produced no role change.
 	lastEffectiveGear  string
 	instanceOperations sync.Map
+	// healthFailures counts consecutive reconcile rounds in which a running
+	// model failed its health probe, keyed by instance ID. One miss is not
+	// evidence of a broken model: the bootstrap answers "degraded" whenever a
+	// single /health_generate call misses, and condemning on the first miss
+	// costs a full multi-GPU reload.
+	healthFailures     sync.Map
 	eventOperations    [64]sync.Mutex
 	capacityAdmissions sync.Mutex
 	pullOperations     sync.Map
@@ -134,6 +141,42 @@ func (c *Controller) eventOperation(id string) *sync.Mutex {
 func (c *Controller) instanceOperation(id string) *sync.Mutex {
 	lock, _ := c.instanceOperations.LoadOrStore(id, &sync.Mutex{})
 	return lock.(*sync.Mutex)
+}
+
+// noteHealthFailure records one failed health probe and returns how many have
+// failed in a row.
+func (c *Controller) noteHealthFailure(id string) int {
+	value, _ := c.healthFailures.LoadOrStore(id, new(int32))
+	return int(atomic.AddInt32(value.(*int32), 1))
+}
+
+// clearHealthFailures forgets an instance's streak once a probe succeeds.
+func (c *Controller) clearHealthFailures(id string) {
+	c.healthFailures.Delete(id)
+}
+
+// HealthFailureThreshold is how many consecutive failed probes condemn a
+// running model. A non-positive configuration means one, which restores the
+// historical behaviour of failing on the first miss.
+func (c *Controller) HealthFailureThreshold() int {
+	if threshold := c.cfg.Controller.HealthFailureThreshold; threshold > 0 {
+		return threshold
+	}
+	return 1
+}
+
+// removalContext bounds RemoveStaleMembership, the abnormal role-recovery path.
+// The Router drops a membership through its own asynchronous workflow, whose
+// budget runs to minutes; the ordinary call timeout is seconds, so using it
+// here guarantees the control plane never observes the removal landing - the
+// delete is accepted, the entry stays listed, and every retry reproduces the
+// identical timeout.
+func (c *Controller) removalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := c.cfg.Router.RemovalTimeout.Duration()
+	if timeout <= 0 {
+		timeout = 8 * time.Minute
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 // New validates dependencies and builds a controller.

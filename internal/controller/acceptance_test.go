@@ -44,6 +44,11 @@ type bootstrapFake struct {
 	unauthorized int
 	failStart    bool
 	down         bool
+	// healthStatus lets a test answer /bootstrap/health with something other
+	// than "ok". The real bootstrap answers "degraded" - HTTP 200, status
+	// "degraded" - whenever one /health_generate probe misses, and Healthy()
+	// does not accept it.
+	healthStatus string
 	env          launcher.Environment
 	server       *httptest.Server
 }
@@ -109,11 +114,23 @@ func (f *bootstrapFake) health(writer http.ResponseWriter, _ *http.Request) {
 		writeTestJSON(writer, http.StatusServiceUnavailable, map[string]string{"error": "container unavailable"})
 		return
 	}
+	status := f.healthStatus
+	if status == "" {
+		status = "ok"
+	}
 	writeTestJSON(writer, http.StatusOK, launcher.Health{
-		Status:  "ok",
+		Status:  status,
 		Phase:   f.phase,
 		Version: testBootstrapVersion,
 	})
+}
+
+// setHealthStatus makes /bootstrap/health answer with the given status; an
+// empty string restores "ok".
+func (f *bootstrapFake) setHealthStatus(status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.healthStatus = status
 }
 
 func (f *bootstrapFake) status(writer http.ResponseWriter, _ *http.Request) {
@@ -201,10 +218,21 @@ type routerFake struct {
 	typeReportedByGet string
 	// getsByID counts GET /workers/{id}, so a test can observe the poll cadence.
 	getsByID int
+
+	// removeDelay models the Router's asynchronous worker_removal workflow: the
+	// DELETE is accepted at once, but the entry keeps being listed until the
+	// workflow runs. Zero keeps the historical behaviour of dropping it inside
+	// the DELETE handler.
+	removeDelay time.Duration
+	removals    map[string]time.Time
 }
 
 func newRouterFake() *routerFake {
-	fake := &routerFake{workers: map[string]*fakeWorker{}, byURL: map[string]string{}}
+	fake := &routerFake{
+		workers:  map[string]*fakeWorker{},
+		byURL:    map[string]string{},
+		removals: map[string]time.Time{},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/workers", fake.workersHandler)
 	mux.HandleFunc("/workers/", fake.workerHandler)
@@ -253,6 +281,25 @@ func (f *routerFake) deletes() int {
 	return f.deleteCalls
 }
 
+// applyPendingRemovalsLocked drops the memberships whose asynchronous removal
+// workflow has run. The caller must hold f.mu.
+func (f *routerFake) applyPendingRemovalsLocked() {
+	if len(f.removals) == 0 {
+		return
+	}
+	now := time.Now()
+	for id, at := range f.removals {
+		if now.Before(at) {
+			continue
+		}
+		if worker, ok := f.workers[id]; ok {
+			delete(f.byURL, worker.URL)
+		}
+		delete(f.workers, id)
+		delete(f.removals, id)
+	}
+}
+
 func (f *routerFake) workerByURL(url string) (fakeWorker, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -271,8 +318,14 @@ func (f *routerFake) workerHandler(writer http.ResponseWriter, request *http.Req
 		f.deleteCalls++
 		id := strings.TrimPrefix(request.URL.Path, "/workers/")
 		if worker, ok := f.workers[id]; ok {
-			delete(f.byURL, worker.URL)
-			delete(f.workers, id)
+			if f.removeDelay <= 0 {
+				delete(f.byURL, worker.URL)
+				delete(f.workers, id)
+			} else {
+				// Accepted, not yet applied: the Router drops the membership
+				// through its own workflow, so the entry survives for a while.
+				f.removals[id] = time.Now().Add(f.removeDelay)
+			}
 		}
 		f.mu.Unlock()
 		writeTestJSON(writer, http.StatusAccepted, map[string]string{"worker_id": "deleted"})
@@ -281,6 +334,7 @@ func (f *routerFake) workerHandler(writer http.ResponseWriter, request *http.Req
 	id := strings.TrimPrefix(request.URL.Path, "/workers/")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.applyPendingRemovalsLocked()
 	worker, ok := f.workers[id]
 	if !ok {
 		writeTestJSON(writer, http.StatusNotFound, map[string]string{"error": "worker_not_found"})
@@ -300,6 +354,7 @@ func (f *routerFake) workersHandler(writer http.ResponseWriter, request *http.Re
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if request.Method == http.MethodGet {
+		f.applyPendingRemovalsLocked()
 		workers := make([]fakeWorker, 0, len(f.workers))
 		for _, worker := range f.workers {
 			workers = append(workers, *worker)

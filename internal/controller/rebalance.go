@@ -62,10 +62,24 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 			}
 		case instance.InstanceState == domain.InstanceIdle && !instance.Role.Valid() && assignable(instance):
 			input.Idle = append(input.Idle, planner.Candidate{ID: instance.ID})
+		case notServingCandidate(instance):
+			candidate := planner.Candidate{
+				ID:         instance.ID,
+				Role:       instance.Role,
+				RoleSince:  instance.RoleAssignedAt,
+				NotServing: true,
+			}
+			if c.startRetryPending(instance) {
+				input.Recovering = append(input.Recovering, candidate)
+			} else {
+				input.Stranded = append(input.Stranded, candidate)
+			}
 		}
 	}
 	sort.Slice(input.Serving, func(i, j int) bool { return input.Serving[i].ID < input.Serving[j].ID })
 	sort.Slice(input.Idle, func(i, j int) bool { return input.Idle[i].ID < input.Idle[j].ID })
+	sort.Slice(input.Recovering, func(i, j int) bool { return input.Recovering[i].ID < input.Recovering[j].ID })
+	sort.Slice(input.Stranded, func(i, j int) bool { return input.Stranded[i].ID < input.Stranded[j].ID })
 
 	// Router in-flight counts are not scheduler queue lengths. Only fresh,
 	// complete scheduler samples are passed as measured planner inputs.
@@ -272,6 +286,61 @@ func assignable(instance domain.Instance) bool {
 		return false
 	}
 	return true
+}
+
+// notServingCandidate reports whether an instance is owned capacity in limbo:
+// it holds a role, and it can neither take traffic nor be reassigned.
+//
+// These are the rows that used to be invisible to the planner: the role they
+// still carry keeps them out of the idle bucket, and a failed or unreachable
+// service is not a live one, so they are not serving either. The planner then
+// saw a pool that was short a worker without knowing whether the machine had
+// been delivered, and the 2026-10-13 incident is what that costs - one worker
+// parked, and the round "rebalanced" the remaining one until both roles were
+// gone.
+func notServingCandidate(instance domain.Instance) bool {
+	if !instance.Role.Valid() {
+		return false
+	}
+	if instance.InstanceState == domain.InstanceLost {
+		// The container stopped answering. Whether anything will retry it is
+		// decided by startRetryPending: the preparation pipeline owns the
+		// recovery, and a container the partner has already dropped is handled
+		// by the reclaim path rather than by the planner.
+		return true
+	}
+	return instance.InstanceState == domain.InstanceIdle && instance.ServiceState == domain.ServiceFailed
+}
+
+// startRetryPending reports whether something will try this instance again
+// without an operator: the reconciler still has start attempts, a configured
+// cooldown will re-arm a spent budget, or the preparation pipeline that recovers
+// an unreachable container has attempts left.
+//
+// The distinction matters to the planner because only the first half may hold
+// back a capacity request. An instance that is parked for good is a hole in the
+// pool that has to be filled some other way - by the operator, or by asking the
+// partner for another container - and suppressing that ask would turn a
+// repairable outage into a permanent one.
+func (c *Controller) startRetryPending(instance domain.Instance) bool {
+	if instance.InstanceState == domain.InstanceLost {
+		// The recovery path for an unreachable container is the preparation
+		// pipeline, which is re-entered the moment the endpoint answers. It
+		// stops being a live path when that pipeline has spent its own budget:
+		// runPrepare then parks the row back in LOST with its operation marked
+		// failed, and nothing retries it again. That is the dead end this used
+		// to describe as "recovering", which is exactly the wrong thing to tell
+		// a planner deciding whether the pool needs another machine.
+		return instance.PrepareAttempts < c.cfg.Controller.PrepareMaxAttempts
+	}
+	if instance.ServiceState != domain.ServiceFailed {
+		return true
+	}
+	if instance.StartAttempts < c.cfg.Controller.StartMaxAttempts {
+		return true
+	}
+	return c.cfg.Controller.StartRetryCooldown.Duration() > 0 &&
+		instance.StartRearms < c.cfg.Controller.StartRetryMaxRearms
 }
 
 func (c *Controller) publishPlanMetrics(prefill, decode int, decision planner.Decision) {

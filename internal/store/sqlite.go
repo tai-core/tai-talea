@@ -83,6 +83,14 @@ type addedColumn struct {
 var addedColumns = []addedColumn{
 	{table: "capacity_instances", name: "service_endpoint", definition: "TEXT"},
 	{table: "capacity_instances", name: "pending_update_json", definition: "TEXT"},
+	// start_rearms lets the control plane re-arm a spent start budget a bounded
+	// number of times. It needs a default because an existing database has
+	// rows: zero means "never re-armed", which is exactly what those rows are.
+	{table: "capacity_instances", name: "start_rearms", definition: "INTEGER NOT NULL DEFAULT 0"},
+	// start_parked_at is when the budget was last spent, by the controller's
+	// clock. NULL is the honest value for existing rows: no start has been
+	// parked since this column existed, so there is no cooldown to measure.
+	{table: "capacity_instances", name: "start_parked_at", definition: "TEXT"},
 }
 
 // ensureColumn adds a column when it is missing, leaving existing data intact.
@@ -343,7 +351,7 @@ func scanEvent(row rowScanner) (EventRecord, error) {
 const instanceColumns = `id, partner_id, endpoint, service_endpoint, lease_id, spec_json,
 	instance_state, service_state,
 	role, role_assigned_at, router_worker_id, readiness_generation, prepare_attempts, start_attempts,
-	drain_deadline_at, pending_release, pending_update_json, lease_updated_at, last_error, last_seen_at, created_at, updated_at`
+	start_rearms, start_parked_at, drain_deadline_at, pending_release, pending_update_json, lease_updated_at, last_error, last_seen_at, created_at, updated_at`
 
 // GetInstance reads one instance row.
 func (s *SQLiteStore) GetInstance(ctx context.Context, id string) (domain.Instance, error) {
@@ -430,6 +438,7 @@ func scanInstance(row rowScanner) (domain.Instance, error) {
 		leaseID         sql.NullString
 		routerWorkerID  sql.NullString
 		drainDeadline   sql.NullString
+		startParkedAt   sql.NullString
 		pendingRelease  int
 		pendingUpdate   sql.NullString
 		leaseUpdated    sql.NullString
@@ -441,7 +450,7 @@ func scanInstance(row rowScanner) (domain.Instance, error) {
 	if err := row.Scan(
 		&instance.ID, &instance.PartnerID, &instance.Endpoint, &serviceEndpoint, &leaseID, &specJSON,
 		&instanceState, &serviceState, &role, &roleAssignedAt, &routerWorkerID, &instance.ReadinessGeneration,
-		&instance.PrepareAttempts, &instance.StartAttempts, &drainDeadline, &pendingRelease, &pendingUpdate, &leaseUpdated,
+		&instance.PrepareAttempts, &instance.StartAttempts, &instance.StartRearms, &startParkedAt, &drainDeadline, &pendingRelease, &pendingUpdate, &leaseUpdated,
 		&lastError, &lastSeen, &createdAt, &updatedAt,
 	); err != nil {
 		return domain.Instance{}, err
@@ -466,6 +475,9 @@ func scanInstance(row rowScanner) (domain.Instance, error) {
 	}
 	var err error
 	if instance.RoleAssignedAt, err = ParseTime(roleAssignedAt.String); err != nil {
+		return domain.Instance{}, err
+	}
+	if instance.StartParkedAt, err = ParseTime(startParkedAt.String); err != nil {
 		return domain.Instance{}, err
 	}
 	if instance.DrainDeadlineAt, err = ParseTime(drainDeadline.String); err != nil {
@@ -650,13 +662,14 @@ func insertInstanceTx(ctx context.Context, tx *sql.Tx, instance domain.Instance)
 INSERT INTO capacity_instances (
     id, partner_id, endpoint, service_endpoint, lease_id, spec_json, instance_state, service_state, role,
     role_assigned_at, router_worker_id, readiness_generation, prepare_attempts, start_attempts,
-    drain_deadline_at, pending_release, pending_update_json, lease_updated_at, last_error, last_seen_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    start_rearms, start_parked_at, drain_deadline_at, pending_release, pending_update_json, lease_updated_at, last_error, last_seen_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		instance.ID, instance.PartnerID, instance.Endpoint, nullString(instance.ServiceEndpoint),
 		nullString(instance.LeaseID), string(specJSON),
 		string(instance.InstanceState), string(instance.ServiceState), nullString(string(instance.Role)),
 		nullTime(instance.RoleAssignedAt), nullString(instance.RouterWorkerID), instance.ReadinessGeneration,
-		instance.PrepareAttempts, instance.StartAttempts, nullTime(instance.DrainDeadlineAt),
+		instance.PrepareAttempts, instance.StartAttempts, instance.StartRearms, nullTime(instance.StartParkedAt),
+		nullTime(instance.DrainDeadlineAt),
 		boolInt(instance.PendingRelease), string(pendingJSON), nullTime(instance.LeaseUpdatedAt),
 		nullString(instance.LastError), nullTime(instance.LastSeenAt),
 		FormatTime(instance.CreatedAt), FormatTime(now))
@@ -682,13 +695,14 @@ func updateInstanceTx(ctx context.Context, tx *sql.Tx, current, next domain.Inst
 UPDATE capacity_instances SET
     partner_id = ?, endpoint = ?, service_endpoint = ?, lease_id = ?, spec_json = ?,
     instance_state = ?, service_state = ?, role = ?, role_assigned_at = ?, router_worker_id = ?,
-    readiness_generation = ?, prepare_attempts = ?, start_attempts = ?, drain_deadline_at = ?,
+    readiness_generation = ?, prepare_attempts = ?, start_attempts = ?, start_rearms = ?, start_parked_at = ?, drain_deadline_at = ?,
     pending_release = ?, pending_update_json = ?, lease_updated_at = ?, last_error = ?, last_seen_at = ?, updated_at = ?
 WHERE id = ?`,
 		next.PartnerID, next.Endpoint, nullString(next.ServiceEndpoint), nullString(next.LeaseID), string(specJSON),
 		string(next.InstanceState), string(next.ServiceState), nullString(string(next.Role)),
 		nullTime(next.RoleAssignedAt), nullString(next.RouterWorkerID), next.ReadinessGeneration,
-		next.PrepareAttempts, next.StartAttempts, nullTime(next.DrainDeadlineAt),
+		next.PrepareAttempts, next.StartAttempts, next.StartRearms, nullTime(next.StartParkedAt),
+		nullTime(next.DrainDeadlineAt),
 		boolInt(next.PendingRelease), string(pendingJSON), nullTime(next.LeaseUpdatedAt), nullString(next.LastError),
 		nullTime(next.LastSeenAt), FormatTime(time.Now()), next.ID)
 	if err != nil {

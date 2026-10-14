@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/tai-core/tai-talea/internal/domain"
 	"github.com/tai-core/tai-talea/internal/store"
@@ -81,7 +82,8 @@ func (c *Controller) adoptVerifiedEndpoint(ctx context.Context, current, verifie
 	next.ServiceEndpoint = domain.NormalizeEndpoint(verified.ServiceEndpoint)
 	next.InstanceState = domain.InstancePreparing
 	next.ServiceState = domain.ServiceNone
-	next.PrepareAttempts, next.StartAttempts = 0, 0
+	next.PrepareAttempts, next.StartAttempts, next.StartRearms = 0, 0, 0
+	next.StartParkedAt = time.Time{}
 	next.RouterWorkerID, next.ReadinessGeneration = "", 0
 	next.LastError = ""
 	next.LeaseUpdatedAt, next.LastSeenAt = c.now(), c.now()

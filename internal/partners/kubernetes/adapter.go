@@ -125,6 +125,15 @@ type Config struct {
 	HostIPC     bool
 	Privileged  bool
 
+	// LivenessProbe asks the kubelet to restart a worker that is alive but has
+	// stopped answering. It is off by default because the probe it installs
+	// requires a worker image whose bootstrap serves /bootstrap/liveness: an
+	// image that predates that endpoint answers 404, and the container is then
+	// restarted in a loop without ever serving. Turn it on for an image that
+	// has the endpoint; the timing is fixed in manifest.go and cannot kill a
+	// healthy worker.
+	LivenessProbe bool
+
 	ServiceAccount string
 	// RunAsUser / RunAsGroup / FSGroup are optional. Leaving RunAsGroup unset
 	// matters: overriding the image's group drops the supplementary video

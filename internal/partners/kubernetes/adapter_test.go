@@ -281,6 +281,116 @@ func TestBuildPodGrantsHostAccessOnlyWhenConfigured(t *testing.T) {
 	}
 }
 
+// The liveness probe is the only mechanism that restarts a worker which is
+// alive but has stopped answering, and it is also the only one that can kill a
+// worker that is merely slow. Both halves of that trade are asserted here.
+func TestBuildPodInstallsALivenessProbeOnlyWhenAsked(t *testing.T) {
+	f := newFakeAPIServer(t)
+
+	// Off by default. A worker image whose bootstrap predates the endpoint
+	// answers 404, and a probe against it would restart the container forever
+	// without it ever serving - a worse outcome than the wedge it prevents.
+	plain := testAdapter(t, f, nil).buildPod("glm53-decode")
+	if plain.Spec.Containers[0].LivenessProbe != nil {
+		t.Fatal("liveness probe must stay off unless the operator asks for it")
+	}
+
+	pod := testAdapter(t, f, func(cfg *Config) { cfg.LivenessProbe = true }).buildPod("glm53-decode")
+	probe := pod.Spec.Containers[0].LivenessProbe
+	if probe == nil {
+		t.Fatal("liveness probe was requested but not rendered")
+	}
+	if probe.HTTPGet == nil {
+		t.Fatal("liveness probe has no httpGet action")
+	}
+	if probe.HTTPGet.Path != livenessPath {
+		t.Fatalf("liveness path = %q, want %q", probe.HTTPGet.Path, livenessPath)
+	}
+	if probe.HTTPGet.Port != 9001 {
+		t.Fatalf("liveness port = %d, want the bootstrap port", probe.HTTPGet.Port)
+	}
+	// The endpoint is behind the same shared secret as the rest of the
+	// surface; a probe without the header would be answered with a 401 and the
+	// kubelet would read that as the container being dead.
+	if len(probe.HTTPGet.HTTPHeaders) != 1 || probe.HTTPGet.HTTPHeaders[0].Name != "X-Bootstrap-Token" ||
+		probe.HTTPGet.HTTPHeaders[0].Value != testToken {
+		t.Fatalf("liveness probe does not carry the bootstrap token: %+v", probe.HTTPGet.HTTPHeaders)
+	}
+	if probe.InitialDelaySeconds != livenessInitialDelaySeconds ||
+		probe.PeriodSeconds != livenessPeriodSeconds ||
+		probe.TimeoutSeconds != livenessTimeoutSeconds ||
+		probe.FailureThreshold != livenessFailureThreshold {
+		t.Fatalf("liveness timing drifted from the documented constants: %+v", probe)
+	}
+}
+
+// The readiness and liveness probes must not converge on one endpoint. A
+// readiness probe is *supposed* to fail while a worker loads its weights; the
+// same failure reported as liveness restarts a container that is doing exactly
+// what it should.
+func TestLivenessAndReadinessProbeDifferentQuestions(t *testing.T) {
+	f := newFakeAPIServer(t)
+	container := testAdapter(t, f, func(cfg *Config) { cfg.LivenessProbe = true }).
+		buildPod("glm53-decode").Spec.Containers[0]
+
+	if container.ReadinessProbe == nil || container.LivenessProbe == nil {
+		t.Fatal("both probes should be present")
+	}
+	if container.ReadinessProbe.HTTPGet.Path == container.LivenessProbe.HTTPGet.Path {
+		t.Fatalf("both probes point at %q; liveness must not be the model proxy",
+			container.ReadinessProbe.HTTPGet.Path)
+	}
+	if container.ReadinessProbe.HTTPGet.Path != "/bootstrap/health" {
+		t.Fatalf("readiness path = %q, want the health surface", container.ReadinessProbe.HTTPGet.Path)
+	}
+}
+
+// A kubelet that does not receive a rendered probe does not probe at all, and
+// every deployed cluster would then be running the old, unwatched spec while
+// the source reads as if it were covered. The tag is the whole delivery
+// mechanism, so it is asserted directly.
+func TestLivenessProbeSurvivesTheAPISerialisation(t *testing.T) {
+	f := newFakeAPIServer(t)
+	container := testAdapter(t, f, func(cfg *Config) { cfg.LivenessProbe = true }).
+		buildPod("glm53-decode").Spec.Containers[0]
+
+	encoded, err := json.Marshal(container)
+	if err != nil {
+		t.Fatalf("marshal container: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"livenessProbe"`) {
+		t.Fatalf("liveness probe is missing from the Pod JSON: %s", encoded)
+	}
+	// The absent probe must not appear at all, so an old image is never asked
+	// to answer a path it does not serve.
+	plain := testAdapter(t, f, nil).buildPod("glm53-decode").Spec.Containers[0]
+	encoded, err = json.Marshal(plain)
+	if err != nil {
+		t.Fatalf("marshal container: %v", err)
+	}
+	if strings.Contains(string(encoded), "livenessProbe") {
+		t.Fatalf("an unrequested liveness probe appeared in the Pod JSON: %s", encoded)
+	}
+}
+
+// The probe has to be patient with a healthy worker and impatient with a
+// wedged one, and both bounds live in constants that are easy to relax by
+// accident. A healthy worker is never silent for a second; the one this was
+// written for was silent for ten minutes.
+func TestLivenessTimingKeepsItsMargin(t *testing.T) {
+	if livenessInitialDelaySeconds < 30 {
+		t.Fatalf("initial delay %ds is too short for the entrypoint and the bootstrap",
+			livenessInitialDelaySeconds)
+	}
+	window := time.Duration(livenessPeriodSeconds) * time.Duration(livenessFailureThreshold) * time.Second
+	if window < time.Minute {
+		t.Fatalf("a %s silence window is too easy to trip", window)
+	}
+	if window > 3*time.Minute {
+		t.Fatalf("a %s silence window recovers too slowly from a real wedge", window)
+	}
+}
+
 func TestProvisionNodeWaitsForRunningAndReportsEndpoints(t *testing.T) {
 	f := newFakeAPIServer(t)
 	f.pendingGets = 1 // Pending once, then Running

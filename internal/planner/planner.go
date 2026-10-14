@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -213,6 +214,11 @@ type Candidate struct {
 	RoleSince time.Time
 	// Assigned is the profile of a live PD worker used by the Router.
 	Assigned bool
+	// NotServing marks an instance that holds a role but cannot take traffic
+	// right now: the model process failed, or the container stopped answering.
+	// It is capacity the control plane already owns and cannot use yet, which
+	// is a different thing from capacity that does not exist.
+	NotServing bool
 }
 
 // CapacityState is what the planner knows about capacity it has already asked
@@ -228,10 +234,25 @@ type CapacityState struct {
 // Input is one planner round input.
 type Input struct {
 	Now time.Time
-	// Serving lists instances that already hold a PD role.
+	// Serving lists instances that already hold a PD role and can take traffic.
 	Serving []Candidate
 	// Idle lists prepared instances without a role.
 	Idle []Candidate
+	// Recovering lists instances that hold a role but are not serving, where
+	// something will try again without an operator: the reconciler still has
+	// start attempts, or a configured cooldown will re-arm the budget, or a
+	// container that stopped answering will be re-entered into preparation when
+	// it does. They are deliberately not part of Serving - a pool short of a
+	// worker must not be described as whole - and not part of Idle, because an
+	// instance the reconciler owns must not be raced by the planner. They exist
+	// so the pool's true shape is visible: without them a parked worker looks
+	// exactly like a worker that was never created, and the next capacity
+	// decision is made on a number that is wrong.
+	Recovering []Candidate
+	// Stranded lists instances in the same shape where nothing will try again
+	// without an operator - the start budget is spent and no re-arm is coming.
+	// They are reported and never moved: the escalation an operator answers.
+	Stranded []Candidate
 	// Load is the latest scheduler sample. Auto mode reads it; fixed mode only
 	// echoes it back through the decision.
 	Load LoadSnapshot
@@ -280,17 +301,24 @@ type Decision struct {
 	// Gear is the configured gear. EffectiveGear is the gear this round used:
 	// the same value in fixed mode, and the rung the load moved the planner to
 	// in auto mode.
-	Gear          string    `json:"gear"`
-	EffectiveGear string    `json:"effective_gear"`
-	TargetRatio   float64   `json:"target_ratio"`
-	CurrentRatio  float64   `json:"current_ratio"`
-	TargetPrefill int       `json:"target_prefill"`
-	TargetDecode  int       `json:"target_decode"`
-	ServingCount  int       `json:"serving_count"`
-	IdleCount     int       `json:"idle_count"`
-	Actions       []Action  `json:"actions"`
-	Notes         []string  `json:"notes,omitempty"`
-	PlannedAt     time.Time `json:"planned_at"`
+	Gear          string  `json:"gear"`
+	EffectiveGear string  `json:"effective_gear"`
+	TargetRatio   float64 `json:"target_ratio"`
+	CurrentRatio  float64 `json:"current_ratio"`
+	TargetPrefill int     `json:"target_prefill"`
+	TargetDecode  int     `json:"target_decode"`
+	ServingCount  int     `json:"serving_count"`
+	IdleCount     int     `json:"idle_count"`
+	// RecoveringCount and StrandedCount describe capacity the control plane owns
+	// that is not serving and not idle. They are reported rather than acted on:
+	// a pool that is short a worker has to say whether it is short because the
+	// partner has not delivered one or because one it already delivered is
+	// being restarted.
+	RecoveringCount int       `json:"recovering_count,omitempty"`
+	StrandedCount   int       `json:"stranded_count,omitempty"`
+	Actions         []Action  `json:"actions"`
+	Notes           []string  `json:"notes,omitempty"`
+	PlannedAt       time.Time `json:"planned_at"`
 }
 
 // Planner applies a ratio gear to the current worker population. In auto mode
@@ -461,6 +489,18 @@ func (p *Planner) capacityStep(input Input, planned []Action, rungMoved bool) (*
 			"capacity held: %d provision request(s) are still open with the partner",
 			input.Capacity.Provisioning)}
 	}
+	// A worker that is being restarted is not a worker that was never ordered.
+	// Queueing pressure alone cannot tell the two apart, and confusing them buys
+	// a container to sit next to one that is already coming back: on AlayaNeW
+	// that is a queued creation measured in hours, and on the H100 nodes it is
+	// eight cards held twice. The wait is bounded by construction - Recovery
+	// lasts exactly as long as something will try again - and the moment the
+	// instance either serves or is stranded, this gate opens.
+	if len(input.Recovering) > 0 {
+		return nil, []string{fmt.Sprintf(
+			"capacity held: %d instance(s) already hold a role and are being restarted (%s), so the shortfall may be temporary",
+			len(input.Recovering), candidateIDs(input.Recovering))}
+	}
 	if len(planned) >= p.config.MaxChangePerRound {
 		return nil, nil
 	}
@@ -601,14 +641,26 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 	}
 
 	decision := Decision{
-		ObservedLoad:  input.Load,
-		Mode:          mode,
-		Gear:          p.config.Gear,
-		EffectiveGear: gear,
-		TargetRatio:   ratio,
-		ServingCount:  len(input.Serving),
-		IdleCount:     len(input.Idle),
-		PlannedAt:     now,
+		ObservedLoad:    input.Load,
+		Mode:            mode,
+		Gear:            p.config.Gear,
+		EffectiveGear:   gear,
+		TargetRatio:     ratio,
+		ServingCount:    len(input.Serving),
+		IdleCount:       len(input.Idle),
+		RecoveringCount: len(input.Recovering),
+		StrandedCount:   len(input.Stranded),
+		PlannedAt:       now,
+	}
+	if decision.RecoveringCount > 0 {
+		decision.Notes = append(decision.Notes, fmt.Sprintf(
+			"%d instance(s) hold a role and are not serving; they are being restarted and are not counted as capacity",
+			decision.RecoveringCount))
+	}
+	if decision.StrandedCount > 0 {
+		decision.Notes = append(decision.Notes, fmt.Sprintf(
+			"%d instance(s) hold a role with the start budget spent and nothing left to retry them; an operator has to requeue or release them",
+			decision.StrandedCount))
 	}
 
 	prefillNow := 0
@@ -646,6 +698,11 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 		}
 	}
 
+	// Recovering and stranded instances are deliberately absent from this sum.
+	// A ratio target describes what the pool can serve, and counting a worker
+	// that is not serving as if it were is how a degraded pool gets planned as
+	// a whole one: the deficit would be filled by converting a healthy worker
+	// instead of by waiting for the one that is already coming back.
 	total := len(input.Serving) + len(input.Idle)
 	if p.config.MaxServing > 0 && total > p.config.MaxServing {
 		decision.Notes = append(decision.Notes, fmt.Sprintf(
@@ -836,6 +893,21 @@ func nextConversion(candidates []Candidate, actions []Action, now time.Time, min
 	return Candidate{}, false
 }
 
+// candidateIDs renders the candidate ids of one bucket for a note, bounded so a
+// large pool cannot turn a log line into a page.
+func candidateIDs(candidates []Candidate) string {
+	const limit = 4
+	ids := make([]string, 0, min(len(candidates), limit))
+	for index, candidate := range candidates {
+		if index == limit {
+			ids = append(ids, fmt.Sprintf("and %d more", len(candidates)-limit))
+			break
+		}
+		ids = append(ids, candidate.ID)
+	}
+	return strings.Join(ids, ", ")
+}
+
 // alreadyPlanned reports whether the round already changed the instance.
 func alreadyPlanned(actions []Action, instanceID string) bool {
 	for _, action := range actions {
@@ -867,6 +939,7 @@ func movable(candidates []Candidate, now time.Time, minHold time.Duration) []Can
 
 // DecisionSummary is a compact human readable rendering used in logs.
 func (d Decision) DecisionSummary() string {
-	return fmt.Sprintf("gear=%s target=%d/%d serving=%d idle=%d actions=%d",
-		d.Gear, d.TargetPrefill, d.TargetDecode, d.ServingCount, d.IdleCount, len(d.Actions))
+	return fmt.Sprintf("gear=%s target=%d/%d serving=%d idle=%d recovering=%d stranded=%d actions=%d",
+		d.Gear, d.TargetPrefill, d.TargetDecode, d.ServingCount, d.IdleCount,
+		d.RecoveringCount, d.StrandedCount, len(d.Actions))
 }

@@ -254,6 +254,11 @@ type Container struct {
 	VolumeMounts    []VolumeMount        `json:"volumeMounts,omitempty"`
 	SecurityContext *SecurityContext     `json:"securityContext,omitempty"`
 	ReadinessProbe  *Probe               `json:"readinessProbe,omitempty"`
+	// LivenessProbe is what makes the kubelet restart a worker whose process
+	// tree is alive but no longer answering. It is a different question from
+	// ReadinessProbe, and the two point at different endpoints on purpose:
+	// see the constants in manifest.go.
+	LivenessProbe *Probe `json:"livenessProbe,omitempty"`
 }
 
 // EnvVar is one environment variable.

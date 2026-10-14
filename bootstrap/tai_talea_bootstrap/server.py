@@ -1,6 +1,7 @@
 """Local control interface of the bootstrap process (§9).
 
     GET  /bootstrap/health
+    GET  /bootstrap/liveness
     GET  /bootstrap/status
     POST /bootstrap/start
     POST /bootstrap/stop
@@ -8,6 +9,19 @@
 Every endpoint requires the shared secret in ``X-Bootstrap-Token``. The token
 comes from ``TAI_TALEA_BOOTSTRAP_TOKEN`` (or ``--token-file``) and the server
 **refuses to start without it** rather than falling back to an open interface.
+
+``/bootstrap/liveness`` is deliberately not ``/bootstrap/health``. Health is a
+proxy for the model: it takes ``SGLangService._lock`` and then asks SGLang's
+``/health_generate`` with a two second timeout, so it queues behind whatever
+holds that lock, and it answers 503 once the service phase is FAILED. A
+Kubernetes liveness probe must not be built on that: it would restart a
+container whose model merely failed to start - an action the control plane
+already owns, and racing it wastes a full multi-GPU load - and a held lock
+would look like a dead process. Liveness therefore answers without touching any
+lock and without touching the model: 200 means only "this process can still
+serve HTTP". That is the one condition Kubernetes has to resolve by restarting
+the container, and it is exactly the signal that was missing when a card-level
+hang froze the process tree and nothing answered for ten minutes.
 
 Two independent barriers keep the interface off the public internet:
 
@@ -33,6 +47,7 @@ import logging
 import math
 import signal
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import BOOTSTRAP_VERSION, exitcodes
@@ -40,6 +55,11 @@ from .roles import ConfigurationError
 from .service import SGLangService
 
 PATH_HEALTH = "/bootstrap/health"
+# PATH_LIVENESS is the Kubernetes liveness surface: it is answered by the HTTP
+# server alone, so it stays up through every legitimate slow phase (environment
+# preparation, model loading) and goes down only when this process stops
+# serving. See the module docstring for why it is not PATH_HEALTH.
+PATH_LIVENESS = "/bootstrap/liveness"
 PATH_STATUS = "/bootstrap/status"
 PATH_START = "/bootstrap/start"
 PATH_STOP = "/bootstrap/stop"
@@ -143,6 +163,16 @@ class BootstrapHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._reject_unauthorized()
             return
+        if self.path == PATH_LIVENESS:
+            # No lock, no model probe, no disk: anything that can block here
+            # would make the probe report a wedged container as healthy, which
+            # is the one judgement it exists to make.
+            self._write(200, {
+                "status": "alive",
+                "version": BOOTSTRAP_VERSION,
+                "uptime_seconds": int(max(0.0, time.monotonic() - self.server.started_at)),
+            })
+            return
         if self.path == PATH_HEALTH:
             health = self.service.health()
             status = health.get("status")
@@ -237,10 +267,22 @@ class BootstrapServer(ThreadingHTTPServer):
         super().__init__(address, BootstrapHandler)
         self.service = service
         self.token = str(token)
+        # Monotonic, so a clock step on the host cannot make uptime go
+        # backwards; the liveness handler reports it as seconds since the
+        # control interface came up, not since the container did.
+        self.started_at = time.monotonic()
 
 
-def serve(service, host=DEFAULT_HOST, port=8080, token="", stop_event=None, log_dir=""):
-    """Run the bootstrap control interface until ``stop_event`` is set."""
+def serve(service, host=DEFAULT_HOST, port=8080, token="", stop_event=None, log_dir="",
+          install_signal_handlers=True):
+    """Run the bootstrap control interface until ``stop_event`` is set.
+
+    ``install_signal_handlers`` exists for callers that already own SIGTERM and
+    SIGINT. ``__main__`` installs a handler that stops the model before letting
+    the HTTP server drain; this function used to overwrite it, so two handlers
+    were registered, the later one silently won, and the shutdown order
+    depended on which of them ran. Passing False keeps a single owner.
+    """
     server = BootstrapServer((host, int(port)), service, token, log_dir=log_dir)
     stop_event = stop_event or threading.Event()
 
@@ -255,16 +297,17 @@ def serve(service, host=DEFAULT_HOST, port=8080, token="", stop_event=None, log_
     watcher.start()
 
     previous = {}
-    for name in ("SIGTERM", "SIGINT"):
-        number = getattr(signal, name, None)
-        if number is None:
-            continue
-        try:
-            previous[number] = signal.getsignal(number)
-            signal.signal(number, _shutdown)
-        except (ValueError, OSError):
-            # Not on the main thread: the caller drives the stop event instead.
-            pass
+    if install_signal_handlers:
+        for name in ("SIGTERM", "SIGINT"):
+            number = getattr(signal, name, None)
+            if number is None:
+                continue
+            try:
+                previous[number] = signal.getsignal(number)
+                signal.signal(number, _shutdown)
+            except (ValueError, OSError):
+                # Not on the main thread: the caller drives the stop event instead.
+                pass
 
     try:
         server.serve_forever(poll_interval=0.2)
@@ -281,7 +324,7 @@ def serve(service, host=DEFAULT_HOST, port=8080, token="", stop_event=None, log_
 
 
 __all__ = [
-    "PATH_HEALTH", "PATH_STATUS", "PATH_START", "PATH_STOP",
+    "PATH_HEALTH", "PATH_LIVENESS", "PATH_STATUS", "PATH_START", "PATH_STOP",
     "HEADER_TOKEN", "ENV_TOKEN", "DEFAULT_HOST",
     "BootstrapHandler", "BootstrapServer", "serve", "MAX_BODY_BYTES",
 ]

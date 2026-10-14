@@ -20,7 +20,9 @@ type ReconcileReport struct {
 	Reported      []string `json:"reported,omitempty"`
 	Preparing     []string `json:"preparing,omitempty"`
 	Reregister    []string `json:"reregister,omitempty"`
+	Unhealthy     []string `json:"unhealthy,omitempty"`
 	Resumed       []string `json:"resumed,omitempty"`
+	Rearmed       []string `json:"rearmed,omitempty"`
 	Recovered     []string `json:"recovered,omitempty"`
 	Released      []string `json:"released,omitempty"`
 	Drained       []string `json:"drained,omitempty"`
@@ -222,6 +224,22 @@ func (c *Controller) reconcileInstance(ctx context.Context, instance domain.Inst
 			return err
 		}
 		if instance.StartAttempts >= c.cfg.Controller.StartMaxAttempts {
+			// The budget is spent. Parking the instance is the design - an
+			// escalation an operator answers - but parking it for good turns
+			// every transient, out-of-band cause into a permanent one. When a
+			// cooldown is configured, the budget is re-armed after a quiet
+			// period a bounded number of times, and the next round takes the
+			// attempt through the path below with a fresh budget.
+			if !c.startRearmDue(instance) {
+				return nil
+			}
+			rearmed, err := c.rearmStartBudget(ctx, instance)
+			if err != nil {
+				return err
+			}
+			if rearmed {
+				report.Rearmed = append(report.Rearmed, instance.ID)
+			}
 			return nil
 		}
 		if due, err := c.operationRetryDue(ctx, instance.ID, store.OpStart); err != nil {
@@ -257,6 +275,9 @@ func (c *Controller) reconcileInstance(ctx context.Context, instance domain.Inst
 		}
 		if action == "reregistered" {
 			report.Reregister = append(report.Reregister, instance.ID)
+		}
+		if action == "unhealthy" {
+			report.Unhealthy = append(report.Unhealthy, instance.ID)
 		}
 	case domain.ServiceDraining:
 		if due, err := c.operationRetryDue(ctx, instance.ID, store.OpDrain); err != nil {
@@ -316,12 +337,29 @@ func (c *Controller) settleService(ctx context.Context, instance domain.Instance
 	}
 	health, healthErr := c.Probe(ctx, instance)
 	if healthErr != nil || !health.Healthy() {
+		// The bootstrap answers "degraded" whenever a single /health_generate
+		// call misses - during warm-up, or under a burst - and Healthy() only
+		// accepts "ok". A running model that misses one probe is therefore not
+		// yet a broken one, and condemning it here is expensive: failStart
+		// ends the service, and the next attempt reloads every GPU on the
+		// node. Take the instance out of rotation at once, but let the failure
+		// persist across several rounds before acting on it.
+		streak := c.noteHealthFailure(instance.ID)
 		if err := c.closeReadiness(ctx, instance); err != nil {
 			return "", err
 		}
+		if streak < c.HealthFailureThreshold() {
+			c.log().Warn("model health probe failed; instance taken out of rotation",
+				"instance_id", instance.ID, "role", string(instance.Role),
+				"status", health.Status, "error", healthErr,
+				"streak", streak, "threshold", c.HealthFailureThreshold())
+			return "unhealthy", nil
+		}
 		return "", c.failStart(ctx, instance, &store.Operation{OperationID: lifecycleOperationID(instance, store.OpStart),
-			InstanceID: instance.ID, Type: store.OpStart}, "running model is not healthy", fmt.Errorf("status=%s error=%v", health.Status, healthErr))
+			InstanceID: instance.ID, Type: store.OpStart}, "running model is not healthy",
+			fmt.Errorf("status=%s error=%v streak=%d/%d", health.Status, healthErr, streak, c.HealthFailureThreshold()))
 	}
+	c.clearHealthFailures(instance.ID)
 	if instance.ServiceState == domain.ServiceFailed {
 		// Re-enter each legal state using the already running process. No model
 		// launch is needed, but FAILED must not jump directly to SERVING.
@@ -391,6 +429,8 @@ func (c *Controller) settleService(ctx context.Context, instance domain.Instance
 	next.LastSeenAt = c.now()
 	if instance.ServiceState != domain.ServiceServing {
 		next.StartAttempts = 0
+		next.StartRearms = 0
+		next.StartParkedAt = time.Time{}
 	}
 	action := "reregistered"
 	auditAction := "service_reregistered"
@@ -451,6 +491,113 @@ func (c *Controller) operationRetryDue(ctx context.Context, instanceID string, k
 	}
 	// No open operation: the instance was restored from a previous process
 	// lifetime, so the retry budget is available immediately.
+	return true, nil
+}
+
+// startRearmDue reports whether a spent start budget should be granted again.
+//
+// The clock is StartParkedAt, which failStart stamps on the control plane's own
+// clock when the budget runs out and nothing else writes: LastSeenAt is
+// refreshed by every partner observation, including the pull loop re-asserting
+// a container that has not moved, and the store stamps its row times from the
+// wall clock rather than from the controller's.
+//
+// A cooldown of zero, the default, disables the mechanism entirely: the budget
+// stays spent until RequeueService.
+//
+// The re-arm count bounds the other side of that trade. A launch that is broken
+// for its own reasons - a bad model path, an argument the bootstrap refuses -
+// would otherwise reload eight GPUs of weights every cooldown forever, which is
+// a worse failure than the outage it set out to heal.
+func (c *Controller) startRearmDue(instance domain.Instance) bool {
+	cooldown := c.cfg.Controller.StartRetryCooldown.Duration()
+	if cooldown <= 0 {
+		return false
+	}
+	if instance.StartRearms >= c.cfg.Controller.StartRetryMaxRearms {
+		return false
+	}
+	if instance.StartParkedAt.IsZero() {
+		// Nothing recorded a park, so there is no cooldown to measure. Staying
+		// parked is the safe direction of that uncertainty, and RequeueService
+		// is still available to the operator.
+		return false
+	}
+	return c.now().Sub(instance.StartParkedAt) >= cooldown
+}
+
+// rearmStartBudget clears a spent start budget so the reconciler tries again.
+//
+// It mirrors RequeueService - the operator's version of the same act - down to
+// rewriting the operation row, because that row's NextRetryAt is what lets the
+// retry path fire at all. It deliberately does not start the service itself:
+// the next round sees a zeroed budget and takes the attempt through exactly the
+// same path as a first start, so there is one code path that starts a service
+// and one place where the attempt counter is incremented.
+//
+// Clearing StartParkedAt is what makes the next cooldown start from the next
+// failure, so the sequence is one re-arm per cooldown window however long the
+// attempt in between takes to fail.
+func (c *Controller) rearmStartBudget(ctx context.Context, instance domain.Instance) (bool, error) {
+	lock := c.instanceOperation(instance.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	latest, err := c.store.GetInstance(ctx, instance.ID)
+	if err != nil {
+		return false, err
+	}
+	// Re-decide against the row as it stands now. Another round, the planner or
+	// the operator may have moved the instance while this one was deciding.
+	if latest.InstanceState != domain.InstanceIdle || latest.ServiceState != domain.ServiceFailed ||
+		latest.StartAttempts < c.cfg.Controller.StartMaxAttempts || !latest.Role.Valid() ||
+		latest.PendingRelease || latest.PendingUpdate != nil {
+		return false, nil
+	}
+	if latest.StartRearms >= c.cfg.Controller.StartRetryMaxRearms || latest.StartParkedAt.IsZero() {
+		return false, nil
+	}
+	if !c.startRearmDue(latest) {
+		return false, nil
+	}
+
+	next := latest
+	next.StartAttempts = 0
+	next.StartRearms = latest.StartRearms + 1
+	next.StartParkedAt = time.Time{}
+	next.LastError = ""
+	operation := &store.Operation{
+		OperationID: lifecycleOperationID(latest, store.OpStart),
+		InstanceID:  latest.ID,
+		Type:        store.OpStart,
+		Status:      store.OpPending,
+		CreatedAt:   c.now(),
+	}
+	if err := c.transition(ctx, store.Transition{
+		InstanceID: latest.ID,
+		Next:       next,
+		Operation:  operation,
+		Audit: store.AuditEntry{
+			Action:     "service_start_rearmed",
+			InstanceID: latest.ID,
+			PartnerID:  latest.PartnerID,
+			Details: map[string]string{
+				"role":           string(latest.Role),
+				"rearm":          fmt.Sprintf("%d", next.StartRearms),
+				"max_rearms":     fmt.Sprintf("%d", c.cfg.Controller.StartRetryMaxRearms),
+				"cooldown":       c.cfg.Controller.StartRetryCooldown.Duration().String(),
+				"attempts_spent": fmt.Sprintf("%d", latest.StartAttempts),
+				"parked_for":     c.now().Sub(latest.StartParkedAt).String(),
+				"last_error":     latest.LastError,
+			},
+		},
+	}); err != nil {
+		return false, err
+	}
+	c.log().Info("re-armed a spent start budget",
+		"instance_id", latest.ID, "role", string(latest.Role),
+		"rearm", next.StartRearms, "max_rearms", c.cfg.Controller.StartRetryMaxRearms,
+		"attempts_spent", latest.StartAttempts)
 	return true, nil
 }
 
@@ -587,6 +734,7 @@ func (c *Controller) Recover(ctx context.Context) (ReconcileReport, []string, er
 		"lost", len(report.Lost),
 		"recovered", len(report.Recovered),
 		"reregistered", len(report.Reregister),
+		"unhealthy", len(report.Unhealthy),
 		"resumed_operations", len(resumed),
 		"resumed_events", report.ResumedEvents)
 	return report, resumed, nil

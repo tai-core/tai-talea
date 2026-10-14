@@ -36,9 +36,23 @@ controller:
   prepare_max_attempts: 3
   start_max_attempts: 3
   release_max_attempts: 3
+  # A spent start budget - start_max_attempts failed launches - parks the
+  # instance and raises an alert, which an operator answers with RequeueService.
+  # Parking it for good is wrong when the cause was outside the control plane:
+  # the cards were still held by another tenant, the registry was unreachable,
+  # the weights were still being written. start_retry_cooldown re-arms the
+  # budget after this much quiet time, and start_retry_max_rearms caps how many
+  # times. Both zero (the default) keeps the operator-gated behaviour.
+  start_retry_cooldown: 0s
+  start_retry_max_rearms: 0
   drain_grace: 300s
   operation_retry: 15s
   call_timeout: 10s
+  # How many consecutive reconcile rounds must find a running model unhealthy
+  # before it is condemned. The bootstrap answers "degraded" whenever a single
+  # /health_generate probe misses, and acting on the first miss reloads every
+  # GPU on the node.
+  health_failure_threshold: 3
   # Loading 306 GB of weights from the node takes minutes; the bootstrap only
   # answers /bootstrap/health long before SGLang is ready.
   start_timeout: 15m
@@ -119,6 +133,10 @@ router:
   url: http://10.214.81.70:8000
   mode: readiness-v1
   timeout: 10s
+  # Bounds the stale-role recovery call. The Router drops a membership through
+  # its own asynchronous workflow, which runs for minutes, so the ordinary
+  # call timeout (seconds) can only ever observe its own deadline.
+  removal_timeout: 8m
   prefill_bootstrap_port: 8998
 
 planner:
@@ -303,6 +321,30 @@ partners:
       host_network: true
       host_ipc: true
       privileged: true
+
+      # Leave this off until the worker image carries /bootstrap/liveness.
+      #
+      # The switch installs a kubelet liveness probe. It is the only thing
+      # that restarts a worker which is alive but has stopped answering: the
+      # container has no owner and its process tree never exits, so a wedged
+      # worker holds all eight cards until an operator logs in and kills it -
+      # which is exactly what happened on 2026-10-14 and cost seven minutes of
+      # model reloading. The restart it produces is the operator's own
+      # recovery, automated: same Pod, same address, same lease, restartCount
+      # incremented.
+      #
+      # It is off because being wrong on the other side is worse. An image
+      # built from a bootstrap that predates the endpoint answers 404, which
+      # the kubelet reads as a failed probe, and the container is then
+      # restarted forever without ever serving. Turn it on in the same change
+      # that moves the image below to a tag built after this endpoint existed -
+      # the pair is the image contract, and the bootstrap version handshake is
+      # what makes a mismatch visible instead of silent.
+      #
+      # The timing is not configurable: it is fixed so that no healthy worker
+      # can be killed by it, and it is documented in
+      # internal/partners/kubernetes/manifest.go.
+      liveness_probe: false
 
       bootstrap_port: 9001
       service_port: 9002

@@ -56,9 +56,22 @@ spec:
       # endpoint and hid the reason. Both now back off, and both say what they
       # were waiting for and what they last saw instead.
       #
+      # v0.6 stops treating one missed health probe as a dead model. The
+      # bootstrap answers "degraded" - HTTP 200, status "degraded" - whenever a
+      # single /health_generate call misses, which happens during warm-up and
+      # under a burst, and Healthy() only accepts "ok". Acting on the first miss
+      # ended a service that was serving traffic and made the next attempt
+      # reload every GPU on the node, so a model is now condemned only after
+      # controller.health_failure_threshold consecutive misses (default 3) and
+      # is merely taken out of rotation before that. The same version gives the
+      # Router's asynchronous membership removal its own budget
+      # (router.removal_timeout, default 8m) instead of borrowing call_timeout,
+      # which could only ever observe its own deadline, and makes the bootstrap
+      # keep a single owner of SIGTERM/SIGINT.
+      #
       # A tag is not a version: imagePullPolicy Always only guarantees the
       # newest digest behind the tag, so every bundle change takes a new tag.
-      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/tai-talea:v0.5
+      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/tai-talea:v0.6
       # Always: the image is not preloaded into any node's containerd, so a
       # conditional pull would hunt for a local copy and give up.
       imagePullPolicy: Always

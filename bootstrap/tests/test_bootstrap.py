@@ -694,6 +694,90 @@ class HttpSurfaceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["version"], BOOTSTRAP_VERSION)
 
+    @staticmethod
+    def _status(port, path, token=TOKEN, timeout=5):
+        """One GET against a raw port, for cases that are not self.port.
+
+        The body is drained before closing: leaving it unread makes the server
+        log a ConnectionAborted while it waits for the next keep-alive request,
+        which buries the real failures in noise.
+        """
+        connection = HTTPConnection("127.0.0.1", port, timeout=timeout)
+        headers = {HEADER_TOKEN: token} if token is not None else {}
+        connection.request("GET", path, headers=headers)
+        try:
+            response = connection.getresponse()
+            response.read()
+            return response.status
+        finally:
+            connection.close()
+
+    def test_liveness_answers_while_the_service_lock_is_held(self):
+        """Health queues behind the service lock, liveness must not.
+
+        This is the difference between a probe that reports a wedged container
+        as healthy - useless - and one that reports it as unable to serve,
+        which is the only judgement Kubernetes can act on.
+        """
+        done = threading.Event()
+
+        def probe_health():
+            self.service.health()
+            done.set()
+
+        self.service._lock.acquire()
+        try:
+            threading.Thread(target=probe_health, daemon=True).start()
+            status, payload = self.request("GET", "/bootstrap/liveness")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["status"], "alive")
+            self.assertFalse(
+                done.wait(0.3), "health must not finish while the service lock is held")
+        finally:
+            self.service._lock.release()
+        # And it is the lock alone: release it and health completes.
+        self.assertTrue(
+            done.wait(2), "health must finish once the service lock is released")
+
+    def test_liveness_stays_up_when_the_model_failed_to_start(self):
+        """A failed model is the control plane's business, not Kubernetes'.
+
+        The container is alive and the bootstrap answers. Restarting the
+        container here would race the control plane's own start retry and throw
+        away its diagnosis, so health reports the failure (503) and liveness
+        does not.
+        """
+        service = SGLangService(
+            profile(),
+            installer=FakeInstaller(),
+            runner=lambda _command: DyingProcess(exit_code=1, dies_after=0.0),
+            health_probe=lambda _port: False,
+        )
+        result = service.start("prefill", "model-a", prepare_environment=False)
+        self.assertFalse(result.accepted)
+        self.assertEqual(service.state.phase, PHASE_FAILED)
+
+        server = BootstrapServer(("127.0.0.1", 0), service, TOKEN)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            self.assertEqual(self._status(port, "/bootstrap/health"), 503)
+            self.assertEqual(self._status(port, "/bootstrap/liveness"), 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_liveness_requires_the_shared_secret(self):
+        status, payload = self.request("GET", "/bootstrap/liveness", token=None)
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"], "unauthorized")
+
+    def test_liveness_reports_the_bootstrap_version_and_uptime(self):
+        status, payload = self.request("GET", "/bootstrap/liveness")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["version"], BOOTSTRAP_VERSION)
+        self.assertGreaterEqual(payload["uptime_seconds"], 0)
+
     def test_status_starts_idle(self):
         status, payload = self.request("GET", "/bootstrap/status")
         self.assertEqual(status, 200)
@@ -778,6 +862,68 @@ class ServerShutdownTests(unittest.TestCase):
                 if worker.is_alive() and servers:
                     servers[0].shutdown()
                     worker.join(3)
+
+    def test_serve_keeps_a_foreign_signal_handler_when_told_to(self):
+        """install_signal_handlers=False leaves the caller as the only owner.
+
+        __main__ installs a handler that stops the model before letting the
+        HTTP server drain. serve() used to install its own on top of it, so two
+        handlers were registered, the later one silently won, and the shutdown
+        order depended on registration order rather than on intent.
+        """
+        import signal as signal_module
+
+        stop = threading.Event()
+        servers = []
+
+        def create(*args, **kwargs):
+            server = BootstrapServer(*args, **kwargs)
+            servers.append(server)
+            return server
+
+        sentinel = lambda *_args: None  # noqa: E731
+        original = signal_module.getsignal(signal_module.SIGTERM)
+        signal_module.signal(signal_module.SIGTERM, sentinel)
+        self.addCleanup(signal_module.signal, signal_module.SIGTERM, original)
+
+        timer = threading.Timer(0.5, stop.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        try:
+            with patch("tai_talea_bootstrap.server.BootstrapServer", side_effect=create):
+                code = serve(SGLangService(profile()), port=0, token=TOKEN,
+                             stop_event=stop, install_signal_handlers=False)
+        finally:
+            if servers:
+                servers[0].shutdown()
+        self.assertEqual(code, exitcodes.EXIT_OK)
+        self.assertIs(signal_module.getsignal(signal_module.SIGTERM), sentinel,
+                      "serve() must not overwrite a handler it did not install")
+
+    def test_serve_installs_and_restores_handlers_by_default(self):
+        """The default still installs its own handler and puts the old one back."""
+        import signal as signal_module
+
+        stop = threading.Event()
+        servers = []
+
+        def create(*args, **kwargs):
+            server = BootstrapServer(*args, **kwargs)
+            servers.append(server)
+            return server
+
+        original = signal_module.getsignal(signal_module.SIGTERM)
+        timer = threading.Timer(0.5, stop.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        try:
+            with patch("tai_talea_bootstrap.server.BootstrapServer", side_effect=create):
+                code = serve(SGLangService(profile()), port=0, token=TOKEN, stop_event=stop)
+        finally:
+            if servers:
+                servers[0].shutdown()
+        self.assertEqual(code, exitcodes.EXIT_OK)
+        self.assertIs(signal_module.getsignal(signal_module.SIGTERM), original)
 
 
 class BootstrapAuthTests(unittest.TestCase):
@@ -1017,6 +1163,28 @@ class ServeCommandTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertEqual(service.state.phase, PHASE_STOPPED)
         self.assertEqual(code, exitcodes.EXIT_START_FAILED)
+
+    def test_serve_path_owns_its_signal_handlers(self):
+        """command_serve keeps a single owner of SIGTERM/SIGINT.
+
+        It installs a handler that stops the model first and only then lets the
+        HTTP server drain. That ordering is only guaranteed while nothing else
+        replaces the handler, so the serve path must tell serve() to stand
+        down.
+        """
+        captured = {}
+
+        def capture(*_args, **kwargs):
+            captured.update(kwargs)
+            return exitcodes.EXIT_OK
+
+        with patch.object(bootstrap_cli, "detect_environment", return_value=EnvironmentReport()), \
+                patch.object(bootstrap_cli, "SGLangService", return_value=_idle_service()), \
+                patch.object(bootstrap_cli, "serve", side_effect=capture):
+            code, _, stderr = self.run_serve()
+        self.assertEqual(code, exitcodes.EXIT_OK, stderr)
+        self.assertIs(captured.get("install_signal_handlers"), False,
+                      "the serve path must not let serve() take over its handler")
 
 
 class ExitCodeTests(unittest.TestCase):

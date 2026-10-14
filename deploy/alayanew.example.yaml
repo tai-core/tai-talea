@@ -41,10 +41,24 @@ controller:
   prepare_max_attempts: 3
   start_max_attempts: 3
   release_max_attempts: 3
+  # A spent start budget - start_max_attempts failed launches - parks the
+  # instance and raises an alert, which an operator answers with RequeueService.
+  # Parking it for good is wrong when the cause was outside the control plane:
+  # the cards were still held by another tenant, the registry was unreachable,
+  # the weights were still being written. start_retry_cooldown re-arms the
+  # budget after this much quiet time, and start_retry_max_rearms caps how many
+  # times. Both zero (the default) keeps the operator-gated behaviour.
+  start_retry_cooldown: 0s
+  start_retry_max_rearms: 0
   # A revoke event may ask for a shorter grace period; this is the default.
   drain_grace: 300s
   operation_retry: 15s
   call_timeout: 10s
+  # How many consecutive reconcile rounds must find a running model unhealthy
+  # before it is condemned. The bootstrap answers "degraded" whenever a single
+  # /health_generate probe misses, and acting on the first miss reloads every
+  # GPU on the node.
+  health_failure_threshold: 3
   # Shared secret of the bootstrap interface. The container must carry the same
   # value in TAI_TALEA_BOOTSTRAP_TOKEN; 九章 CCI lets you set environment
   # variables when creating the instance. The bootstrap refuses to start
@@ -66,6 +80,10 @@ router:
   url: http://127.0.0.1:30001
   mode: readiness-v1
   timeout: 10s
+  # Bounds the stale-role recovery call. The Router drops a membership through
+  # its own asynchronous workflow, which runs for minutes, so the ordinary
+  # call timeout (seconds) can only ever observe its own deadline.
+  removal_timeout: 8m
 
 planner:
   # fixed: §11 manual gear. auto: follow the measured P/D pressure, one rung per

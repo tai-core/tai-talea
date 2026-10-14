@@ -375,7 +375,8 @@ func (c *Controller) handleCapacityUpdated(ctx context.Context, event domain.Cap
 	if !instance.HasService() && (contains(changed, "endpoint") || contains(changed, "service_endpoint") || contains(changed, "lease_id")) &&
 		(instance.InstanceState == domain.InstanceIdle || instance.InstanceState == domain.InstanceLost) {
 		updated.InstanceState = domain.InstancePreparing
-		updated.PrepareAttempts, updated.StartAttempts = 0, 0
+		updated.PrepareAttempts, updated.StartAttempts, updated.StartRearms = 0, 0, 0
+		updated.StartParkedAt = time.Time{}
 		updated.RouterWorkerID, updated.ReadinessGeneration = "", 0
 	}
 

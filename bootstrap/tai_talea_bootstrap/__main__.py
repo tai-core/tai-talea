@@ -150,7 +150,11 @@ def command_serve(args):
     stop_event = threading.Event()
 
     def _forward_signal(_signum, _frame):
-        # Stop the service first, then let the http server drain.
+        # Stop the service first, then let the http server drain. This is the
+        # single owner of SIGTERM/SIGINT for the serve path: serve() is told
+        # not to install its own handler, so nothing overwrites this one and
+        # the shutdown order is fixed rather than dependent on registration
+        # order.
         service.stop(timeout=args.stop_timeout)
         stop_event.set()
 
@@ -177,7 +181,7 @@ def command_serve(args):
         )
     try:
         serve(service, host=args.host, port=args.port, token=token, stop_event=stop_event,
-              log_dir=args.log_dir)
+              log_dir=args.log_dir, install_signal_handlers=False)
     finally:
         failed_before_shutdown = service.state.phase == "FAILED"
         if service.state.phase != "STOPPED":

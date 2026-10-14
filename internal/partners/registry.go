@@ -118,6 +118,7 @@ func buildAdapter(global config.Config, partnerConfig config.PartnerConfig, reso
 			HostNetwork:    cluster.HostNetwork,
 			HostIPC:        cluster.HostIPC,
 			Privileged:     cluster.Privileged,
+			LivenessProbe:  cluster.LivenessProbe,
 			ServiceAccount: cluster.ServiceAccount,
 			RunAsUser:      cluster.RunAsUser,
 			RunAsGroup:     cluster.RunAsGroup,

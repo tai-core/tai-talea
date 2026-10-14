@@ -34,10 +34,25 @@ controller:
   # §7.2 retry budget before a service is left FAILED.
   start_max_attempts: 3
   release_max_attempts: 3
+  # A spent start budget - start_max_attempts failed launches - parks the
+  # instance and raises an alert, which an operator answers with RequeueService.
+  # Parking it for good is wrong when the cause was outside the control plane:
+  # the cards were still held by another tenant, the registry was unreachable,
+  # the weights were still being written. start_retry_cooldown re-arms the
+  # budget after this much quiet time, and start_retry_max_rearms caps how many
+  # times. Both zero (the default) keeps the operator-gated behaviour.
+  start_retry_cooldown: 0s
+  start_retry_max_rearms: 0
   # §5 default grace period when a revoke event carries no grace_seconds.
   drain_grace: 300s
   operation_retry: 15s
   call_timeout: 10s
+  # How many consecutive reconcile rounds must find a running model unhealthy
+  # before it is condemned. The bootstrap answers "degraded" whenever a single
+  # /health_generate probe misses - during warm-up, or under a burst - and
+  # acting on the first miss ends a service that was serving traffic and
+  # reloads every GPU on the node.
+  health_failure_threshold: 3
   # Waiting for a freshly started SGLang to answer health checks - model
   # loading takes minutes, so this is not call_timeout.
   start_timeout: 10m
@@ -66,6 +81,10 @@ router:
   url: http://127.0.0.1:30001
   mode: readiness-v1
   timeout: 10s
+  # Bounds the stale-role recovery call. The Router drops a membership through
+  # its own asynchronous workflow, which runs for minutes, so the ordinary
+  # call timeout (seconds) can only ever observe its own deadline.
+  removal_timeout: 8m
   # Must match the SGLang prefill disaggregation bootstrap port.
   prefill_bootstrap_port: 8998
 

@@ -68,10 +68,41 @@ type ControllerConfig struct {
 	ReconcileInterval  Duration `yaml:"reconcile_interval" json:"reconcile_interval"`
 	PrepareMaxAttempts int      `yaml:"prepare_max_attempts" json:"prepare_max_attempts"`
 	StartMaxAttempts   int      `yaml:"start_max_attempts" json:"start_max_attempts"`
-	ReleaseMaxAttempts int      `yaml:"release_max_attempts" json:"release_max_attempts"`
-	DrainGrace         Duration `yaml:"drain_grace" json:"drain_grace"`
-	OperationRetry     Duration `yaml:"operation_retry" json:"operation_retry"`
-	CallTimeout        Duration `yaml:"call_timeout" json:"call_timeout"`
+	// StartRetryCooldown re-arms a spent start budget after this much quiet
+	// time. The reconciler retries a failed start until start_max_attempts is
+	// spent and then stops, which is right: a control plane that hammers a
+	// broken launch hides the problem. What it must not do is stop forever,
+	// because most of the causes are outside the control plane - the machine's
+	// cards were still held by another tenant, the registry was unreachable,
+	// the weights were still being written - and those pass. Without this, one
+	// bad window strands a container for good, and not merely retry-less: the
+	// row keeps a valid role so the planner cannot see it either, and the only
+	// remaining verbs destroy capacity the operator wants to keep.
+	//
+	// Zero (the default) keeps the operator-gated behaviour: a spent budget
+	// stays spent until RequeueService is called.
+	StartRetryCooldown Duration `yaml:"start_retry_cooldown" json:"start_retry_cooldown"`
+	// StartRetryMaxRearms bounds how many times a spent budget may be re-armed
+	// automatically before the instance is parked for good. It is required
+	// whenever start_retry_cooldown is set: an unbounded automatic retry of a
+	// genuinely broken launch loads eight GPUs of weights every cooldown
+	// forever, which is worse than the outage it is trying to fix. Once the
+	// budget has been re-armed this many times without the service ever
+	// serving, escalation to an operator is the answer, and RequeueService is
+	// the verb.
+	StartRetryMaxRearms int      `yaml:"start_retry_max_rearms" json:"start_retry_max_rearms"`
+	ReleaseMaxAttempts  int      `yaml:"release_max_attempts" json:"release_max_attempts"`
+	DrainGrace          Duration `yaml:"drain_grace" json:"drain_grace"`
+	OperationRetry      Duration `yaml:"operation_retry" json:"operation_retry"`
+	CallTimeout         Duration `yaml:"call_timeout" json:"call_timeout"`
+	// HealthFailureThreshold is how many consecutive reconcile rounds must find
+	// a running model unhealthy before the control plane condemns it. The
+	// container bootstrap answers "degraded" whenever a single /health_generate
+	// call misses - during warm-up, or under a burst of load - and Healthy()
+	// only accepts "ok". Condemning on the first miss therefore turns one flaky
+	// probe into a failed start, and a failed start into a full multi-GPU
+	// reload of a model that was serving.
+	HealthFailureThreshold int `yaml:"health_failure_threshold" json:"health_failure_threshold"`
 	// StartTimeout bounds how long the control plane waits for a freshly
 	// started SGLang to answer its health check. Loading a model legitimately
 	// takes minutes, so this is deliberately not call_timeout: that bounds one
@@ -125,6 +156,15 @@ type RouterConfig struct {
 	// from the registration, which leaves the Router nothing to inject and
 	// breaks PD routing - so a PD deployment must set it.
 	PrefillBootstrapPort int `yaml:"prefill_bootstrap_port" json:"prefill_bootstrap_port"`
+	// RemovalTimeout bounds RemoveStaleMembership, the abnormal role-recovery
+	// path used when the Router still tracks a process under its old role. The
+	// Router drops a membership through an asynchronous workflow whose own
+	// budget runs to several minutes, so borrowing the ordinary call timeout
+	// (seconds) can only ever observe a timeout: the delete is accepted, the
+	// entry stays listed, and every retry reproduces the identical failure
+	// forever. It is deliberately separate from Timeout, which bounds a single
+	// HTTP request.
+	RemovalTimeout Duration `yaml:"removal_timeout" json:"removal_timeout"`
 }
 
 // ToAdapter converts the configuration into an adapter configuration.
@@ -270,6 +310,21 @@ type PartnerKubernetesConfig struct {
 	HostIPC     bool `yaml:"host_ipc" json:"host_ipc"`
 	Privileged  bool `yaml:"privileged" json:"privileged"`
 
+	// LivenessProbe asks the kubelet to restart a worker that is alive but has
+	// stopped answering. Nothing else would: the container has no owner and
+	// its worker never exits, so a process tree that stops serving holds its
+	// GPUs until an operator intervenes.
+	//
+	// It requires a worker image whose bootstrap serves /bootstrap/liveness -
+	// an older image answers 404, which the kubelet reads as a failed probe,
+	// and the container would be restarted forever without ever serving. That
+	// is why this is off by default rather than on: the failure it prevents is
+	// an outage, the failure it can cause is a worker that never starts.
+	//
+	// The timing is not configurable. It is chosen so no healthy worker can be
+	// killed by it - see the constants in partners/kubernetes/manifest.go.
+	LivenessProbe bool `yaml:"liveness_probe" json:"liveness_probe"`
+
 	BootstrapPort int `yaml:"bootstrap_port" json:"bootstrap_port"`
 	ServicePort   int `yaml:"service_port" json:"service_port"`
 
@@ -396,22 +451,24 @@ func Default() Config {
 		},
 		Storage: StorageConfig{SQLitePath: "tai-talea.db"},
 		Controller: ControllerConfig{
-			ReconcileInterval:  Duration(10 * time.Second),
-			PrepareMaxAttempts: 3,
-			StartMaxAttempts:   3,
-			ReleaseMaxAttempts: 3,
-			DrainGrace:         Duration(300 * time.Second),
-			OperationRetry:     Duration(15 * time.Second),
-			CallTimeout:        Duration(10 * time.Second),
-			StartTimeout:       Duration(10 * time.Minute),
-			ProvisionTimeout:   Duration(45 * time.Minute),
-			LeaseWarning:       Duration(120 * time.Second),
-			LostRateThreshold:  0.2,
+			ReconcileInterval:      Duration(10 * time.Second),
+			PrepareMaxAttempts:     3,
+			StartMaxAttempts:       3,
+			ReleaseMaxAttempts:     3,
+			DrainGrace:             Duration(300 * time.Second),
+			OperationRetry:         Duration(15 * time.Second),
+			CallTimeout:            Duration(10 * time.Second),
+			HealthFailureThreshold: 3,
+			StartTimeout:           Duration(10 * time.Minute),
+			ProvisionTimeout:       Duration(45 * time.Minute),
+			LeaseWarning:           Duration(120 * time.Second),
+			LostRateThreshold:      0.2,
 		},
 		Router: RouterConfig{
-			Name:    "primary",
-			Mode:    routeradapter.ModeReadinessV1,
-			Timeout: Duration(10 * time.Second),
+			Name:           "primary",
+			Mode:           routeradapter.ModeReadinessV1,
+			Timeout:        Duration(10 * time.Second),
+			RemovalTimeout: Duration(8 * time.Minute),
 		},
 		Planner: PlannerConfig{
 			Mode:              planner.ModeFixed,
@@ -481,6 +538,9 @@ func (c Config) Validate() error {
 	if err := c.Router.ToAdapter().Validate(); err != nil {
 		return fmt.Errorf("router: %w", err)
 	}
+	if c.Router.RemovalTimeout.Duration() <= 0 {
+		return errors.New("router.removal_timeout must be positive")
+	}
 	if err := c.Planner.ToPlanner().Validate(); err != nil {
 		return fmt.Errorf("planner: %w", err)
 	}
@@ -489,6 +549,9 @@ func (c Config) Validate() error {
 	}
 	if c.Controller.CallTimeout.Duration() <= 0 {
 		return errors.New("controller.call_timeout must be positive")
+	}
+	if c.Controller.HealthFailureThreshold <= 0 {
+		return errors.New("controller.health_failure_threshold must be positive")
 	}
 	if c.Controller.StartTimeout.Duration() <= 0 {
 		return errors.New("controller.start_timeout must be positive")
@@ -507,6 +570,17 @@ func (c Config) Validate() error {
 	}
 	if c.Controller.PrepareMaxAttempts <= 0 || c.Controller.StartMaxAttempts <= 0 || c.Controller.ReleaseMaxAttempts <= 0 {
 		return errors.New("controller attempt limits must be positive")
+	}
+	if c.Controller.StartRetryCooldown.Duration() < 0 {
+		return errors.New("controller.start_retry_cooldown must not be negative")
+	}
+	if c.Controller.StartRetryCooldown.Duration() > 0 && c.Controller.StartRetryMaxRearms <= 0 {
+		// Refused rather than defaulted. A silent default here would decide how
+		// many times eight GPUs may be reloaded without anyone having said so.
+		return errors.New("controller.start_retry_max_rearms must be positive when start_retry_cooldown is set")
+	}
+	if c.Controller.StartRetryMaxRearms < 0 {
+		return errors.New("controller.start_retry_max_rearms must not be negative")
 	}
 	if strings.TrimSpace(c.Controller.ModelID) == "" {
 		return errors.New("controller.model_id is required")
