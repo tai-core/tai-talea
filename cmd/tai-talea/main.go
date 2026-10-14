@@ -264,7 +264,21 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 
 // bootstrapVersion is the runtime launcher contract the control plane requires
 // from a container (development document §9 and §10).
-const bootstrapVersion = "tai-talea-bootstrap/1"
+//
+// It is bumped whenever the container side of that contract changes, because
+// the control plane cannot inspect a worker image - it only knows what that
+// image's bootstrap claims about itself. /2 is the version whose HTTP surface
+// includes GET /bootstrap/liveness, the endpoint the worker livenessProbe
+// points at. A worker still answering /1 is refused during preparation with
+// bootstrap_version_mismatch, and that refusal is the entire point: the other
+// pairing - probe enabled, image without the endpoint - fails as a 404 that the
+// kubelet reads as a dead container, so the worker restarts forever without
+// ever serving.
+//
+// Moving this value is a two-sided change. The worker image must carry a
+// matching bootstrap, and this binary must be rebuilt and rolled; either half
+// alone leaves the two disagreeing. That disagreement is loud on purpose.
+const bootstrapVersion = "tai-talea-bootstrap/2"
 
 // capacityBridge hands the controller a way to ask for capacity without giving
 // it the provisioning pipeline. The pipeline needs the SSH onboarding intake,

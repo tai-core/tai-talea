@@ -13,7 +13,7 @@ data:
       "sglang": {{ .Values.runtime.sglang | quote }},
       "wheelhouse": "/opt/tai-talea/wheelhouse",
       "virtualenv": "/opt/tai-talea/venv",
-      "bootstrap_version": "tai-talea-bootstrap/1",
+      "bootstrap_version": "tai-talea-bootstrap/2",
       "model_id": {{ .Values.model.id | quote }}
     }
   worker.json: |

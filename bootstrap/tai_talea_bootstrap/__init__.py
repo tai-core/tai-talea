@@ -12,6 +12,6 @@ It does **not** do capacity orchestration, Prefill/Decode decisions, Router stat
 management, partner API calls or cross-container coordination.
 """
 
-BOOTSTRAP_VERSION = "tai-talea-bootstrap/1"
+BOOTSTRAP_VERSION = "tai-talea-bootstrap/2"
 
 __all__ = ["BOOTSTRAP_VERSION"]
