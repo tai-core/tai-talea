@@ -4,6 +4,10 @@
 > 与 `nightshift-outage-and-host-contention-2026-10-14.md`（worker 冻住那一晚的取证）。
 > 那两篇解释**为什么做不到**；本篇交付**代码**，并如实标出**哪些还不能立刻生效、为什么**。
 > 时间一律 **UTC**（CST = UTC+8）。
+>
+> **更新（2026-10-15）**：A2/A3 与 A1 **已随控制面 v0.7 上线**，见
+> `nightshift-control-plane-v07-deploy-2026-10-15.md`；§8 的状态表已同步。
+> **B 仍未做** —— 它需要先重建 worker 镜像，本篇 §2/§3 的结论不变。
 
 ---
 
@@ -156,12 +160,15 @@ git diff --check                # 无空白错误
 
 | 目标 | 动作 | 是否已做 |
 | --- | --- | --- |
-| A2 / A3 | 重建控制面镜像 → 按 `ns-deploy-cp.py` 滚动部署（含 `--check-config` 预检 + `imageID` 逐字校验） | ❌ 待做（代码就绪） |
-| A1 | 在上面那份配置里加 `start_retry_cooldown: 30m` + `start_retry_max_rearms: 3`（配置**只在启动时读一次**） | ❌ 待做 |
-| B（nightshift） | ① 用本仓 `bootstrap/` 重建 worker 镜像并推 ecis；② 把 `kubernetes.image` 换到新 tag；③ 置 `kubernetes.liveness_probe: true`；④ 重建 worker Pod（一次 drain + 约 7 分钟重载） | ❌ 待做（镜像重建是前置） |
+| A2 / A3 | 重建控制面镜像 → 按 `ns-deploy-cp.py` 滚动部署（含 `--check-config` 预检 + `imageID` 逐字校验） | ✅ **已上线 v0.7**（2026-10-15，见 `nightshift-control-plane-v07-deploy-2026-10-15.md`） |
+| A1 | 在上面那份配置里加 `start_retry_cooldown` + `start_retry_max_rearms`（配置**只在启动时读一次**） | ✅ **已打开 30m / 1**（比本篇建议的 3 保守，理由见 v0.7 文档 §3.1）；但**尚未被真实触发** |
+| B（nightshift） | ① 用本仓 `bootstrap/` 重建 worker 镜像并推 ecis；② 把 `kubernetes.image` 换到新 tag；③ 置 `kubernetes.liveness_probe: true`；④ 重建 worker Pod（一次 drain + 约 7 分钟重载） | ❌ 待做（镜像重建是前置；线上仍是 `talea-worker:v0.2`） |
 | B（九章） | 同 ①；但九章侧没有容器重启原语 —— liveness 是 k8s 的机制 | n/a |
 
-**注意 rollback 语义**：迁移只 **加列**，回滚到旧二进制不会坏（旧代码不读这两列）。但一旦 `liveness_probe` 打开且镜像 tag 回退，容器会进 CrashLoop —— 这两个值必须一起回退。
+**注意 rollback 语义**：迁移只 **加列**，回滚到旧二进制不会坏（旧代码不读这两列）。但一旦
+`liveness_probe` 打开且镜像 tag 回退，容器会进 CrashLoop —— 这两个值必须一起回退。
+另外 **A1 上线后，回退镜像也必须同时回退配置**：旧二进制配置解码是 `KnownFields(true)`，
+不认识 `start_retry_*` 会直接启动失败。
 
 ---
 
