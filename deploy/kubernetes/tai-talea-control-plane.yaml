@@ -69,9 +69,19 @@ spec:
       # which could only ever observe its own deadline, and makes the bootstrap
       # keep a single owner of SIGTERM/SIGINT.
       #
+      # v0.7 is the recovery half. A launch that spent start_max_attempts used to
+      # be parked for good, and not merely retry-less: the row kept a valid role,
+      # so the planner could not see it either. controller.start_retry_cooldown
+      # re-arms the budget after quiet time and start_retry_max_rearms bounds how
+      # often it may. The planner now also counts instances that hold a role and
+      # are not serving - the ones being restarted and the ones only an operator
+      # can rescue - so the shortfall is visible without being mistaken for
+      # capacity, and a worker already being restarted holds provisioning rather
+      # than letting the difference be filled by converting healthy workers.
+      #
       # A tag is not a version: imagePullPolicy Always only guarantees the
       # newest digest behind the tag, so every bundle change takes a new tag.
-      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/tai-talea:v0.6
+      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/tai-talea:v0.7
       # Always: the image is not preloaded into any node's containerd, so a
       # conditional pull would hunt for a local copy and give up.
       imagePullPolicy: Always
