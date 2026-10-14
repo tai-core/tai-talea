@@ -79,9 +79,19 @@ spec:
       # capacity, and a worker already being restarted holds provisioning rather
       # than letting the difference be filled by converting healthy workers.
       #
+      # v0.8 moves the launcher contract to bootstrap version /2. The worker
+      # image v0.3 is the first one whose bootstrap serves GET /bootstrap/liveness,
+      # which is what lets a kubelet restart a wedged process tree instead of
+      # waiting for an operator. The probe may only be switched on for an image
+      # that answers it, and the only thing the control plane can check is what
+      # a container claims about itself - so the contract version is the check,
+      # and it fails at preparation time (bootstrap_version_mismatch) rather
+      # than at the probe. Deploy v0.8 and worker v0.3 together: v0.8 expects
+      # /2 and a v0.2 container answers /1.
+      #
       # A tag is not a version: imagePullPolicy Always only guarantees the
       # newest digest behind the tag, so every bundle change takes a new tag.
-      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/tai-talea:v0.7
+      image: shenhaoyuan-73767fb9.ecis.shanxi-1.cmecloud.cn/library/tai-talea:v0.8
       # Always: the image is not preloaded into any node's containerd, so a
       # conditional pull would hunt for a local copy and give up.
       imagePullPolicy: Always
