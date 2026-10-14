@@ -244,6 +244,13 @@ t+0s | 172229=IDLE/SERVING/prefill(a=0) 172229-1=IDLE/SERVING/decode(a=0) | rout
 - 顺带欠债：`bootstrap_version` 仍是 `tai-talea-bootstrap/1`。加端点其实是契约变化，应升 `/2`，
   否则「旧镜像 + 新探针」是**无声的 CrashLoop** 而不是显式错误。正确顺序是**随镜像重建一起升**。
 
+> **更新（2026-10-15，同日晚）**：这一节的欠债已经还掉了一半，记录见
+> [`talea-worker-v03-and-the-liveness-contract-2026-10-15.md`](talea-worker-v03-and-the-liveness-contract-2026-10-15.md)。
+> worker 镜像 `v0.3`（增量层，19 KB）已推送并在真机上验透，`bootstrap_version` 已升 `/2`，
+> 控制面 `v0.8` 已预检通过。但**控制面没滚、worker Pod 没重建**——因为滚控制面单独的收益是零
+> （探针写在 Pod spec 里，不重建 Pod 就不生效），代价却是在线 worker 会在一次探针抖动里被判死
+> 且自愈不了。两件事必须合并进同一个窗口，见该文档 §5 与 §7。
+
 **另一个遗留**：`start_parked_at` 的零值在接口里被序列化成 `"0001-01-01T00:00:00Z"` 而不是省略 ——
 Go 的 `omitempty` 对 `time.Time` 这种结构体不生效。语义无歧义，但读起来难看；要修就把它换成
 `*time.Time` 或在 DTO 层格式化。纯外观问题。

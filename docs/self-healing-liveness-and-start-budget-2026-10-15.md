@@ -175,5 +175,17 @@ git diff --check                # 无空白错误
 ## 9. 仍未闭环
 
 1. **九章 / SSH 伙伴没有容器级重启原语**。worker 冻住时 B 的原理（kubelet 看探针）不存在，能自愈的只有 SGLang 自带的进程内 watchdog（默认 300s，且**不覆盖权重加载期**）。要让那一侧也自愈，需要伙伴侧提供一个 stop/start 原语，或让控制面用 SSH 重新拉起 entrypoint（这是一条新链路，不在本轮范围）。
-2. **B 的真机验证缺口**：代码、单测、配置前置条件都就绪，但 nightshift 上跑着的还是 v0.2 worker 镜像，**没有** `/bootstrap/liveness`。本轮**没有**把探针打开，也没有重建镜像 —— 所以「kubelet 真的会重启冻住的容器」这条结论，目前只有**单元级 + 机制级**证据，没有真机证据。
-3. **`bootstrap_version` 仍是 `tai-talea-bootstrap/1`**。加了端点其实是契约变化，严格说应升到 `/2` 并用 `image_profile.bootstrap_version` 的握手把「旧镜像 + 新探针」这种组合变成**显式错误**而不是 CrashLoop。没有现在做，是因为它牵动 `deploy/container/profile.json`、helm configmap、文档与**正在运行**的部署（v0.6 控制面编译进去的是 `/1`，一升就会在下次 prepare 时拒掉现役 worker）。正确顺序是：重建镜像时一并升级，与控制面一起滚动。
+2. **B 的真机验证缺口（部分收口）**：代码、单测、配置前置条件都就绪，nightshift 上跑着的仍是 v0.2 worker 镜像。
+   2026-10-15 晚建了 **`talea-worker:v0.3`**（在 v0.2 的 12 GiB 整机层之上追加一个 19 KB 的 bootstrap 层），
+   并在 h100-04 上用一次性 Pod 把端点验透：`/bootstrap/liveness` 200、不带 `X-Bootstrap-Token` 401、
+   `health`/`status` 200、未知路径 404、`imageID` 与推送的 manifest digest 逐字一致。
+   **但探针本身仍未在任何 Pod 上启用**，所以「kubelet 真的会重启冻住的容器」这条结论依旧只有机制级证据。
+   见 [`talea-worker-v03-and-the-liveness-contract-2026-10-15.md`](talea-worker-v03-and-the-liveness-contract-2026-10-15.md)。
+3. **`bootstrap_version` 已升 `/2`**（提交 `93063d8`，随 B 的实现一起）。
+   订正本节早先的说法：承载握手的**不是** `image_profile.bootstrap_version` ——
+   `internal/config.ImageProfile`（`config.go:227-235`）根本没有这个字段。
+   真正被比较的是**编译期常量** `cmd/tai-talea/main.go:267`，它经 `manager.go:113` 进入
+   `instancemanager.Profile`，唯一校验点在 `manager.go:130` 的 `Prepare()`。
+   所以升它要改 Go 代码并重滚控制面（v0.8 已构建、已预检），而**改配置或 helm 都不会影响它**。
+   配套的镜像与控制面都已就绪，但刻意未上线：滚控制面单独的收益是零（探针写在 Pod spec 里），
+   代价却是窗口期内一次探针抖动就能把现役 worker 判死且自愈不了。必须与 Pod 重建合并进同一窗口。
