@@ -57,7 +57,13 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: router
-          image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:talea-control-0.9.2
+          # The base image with our Router binary appended as one layer. It is a
+          # different tag from the control plane's image on purpose: the two
+          # carry binaries that change for different reasons, and pinning them
+          # together would mean rebuilding the control plane to ship a router
+          # fix. Only the extra layer is pulled; the base layers are already
+          # local from the workers.
+          image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:glm-5.3-flash-ailog2
           imagePullPolicy: Always
           # --enable-ai-access-log writes to stdout and nowhere else: the only
           # other log knob, --log-dir, redirects the tracing subscriber and has
@@ -89,7 +95,8 @@ spec:
                 --health-failure-threshold 5 \
                 --health-check-interval-secs 30 \
                 --log-level info \
-                --enable-ai-access-log
+                --enable-ai-access-log \
+                --force-stream-usage
           ports:
             - name: http
               containerPort: 8000

@@ -159,10 +159,11 @@ def main(path):
     print("unique request ids ..... %d" % len(seen_request_ids))
 
     if counts["stream_without_tokens"]:
-        print("\nWARNING: %d streamed request(s) carry no usage. The router can only"
+        print("\nWARNING: %d streamed request(s) carry no usage. The Router is run"
               % counts["stream_without_tokens"])
-        print("         log tokens for a stream when the caller sends")
-        print("         \"stream_options\": {\"include_usage\": true}.")
+        print("         with --force-stream-usage, so this should not happen for")
+        print("         traffic that went through it: check whether these lines")
+        print("         predate that flag or came from another gateway.")
     for message in warnings[:5]:
         print("WARN  " + message)
     if failures:

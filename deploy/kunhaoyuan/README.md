@@ -27,7 +27,9 @@ client ── NodePort 31280 ──> talea-router (8000 serving, 30001 control)
   ```
 - Weights at `/data02/model-weight/GLM-5.3-Flash-NVFP4` on both nodes, and a
   writable `/data02` for the compile cache and the token log.
-- Images `talea-worker-0.9.2` and `talea-control-0.9.2` in the registry above.
+- Images `talea-worker-0.9.2`, `talea-control-0.9.2`, and `glm-5.3-flash-ailog2`
+  (the last is the official SGLang image with our Router binary appended as one
+  extra layer; the Router runs from it, the control plane from its own tag).
 
 ## Deploy
 
@@ -54,13 +56,23 @@ reads the same file, so a re-apply does not by itself restart anything.
 over `/v1/chat/completions` proves the deployment is usable — that is what
 `taleactl.sh up` and `verify.sh` wait for.
 
-**A streamed request carries no tokens unless the caller asks.**
+**A streamed request carries no tokens unless someone asks.**
 `--enable-ai-access-log` writes the token fields from the upstream `usage`, and
-OpenAI-compatible streaming omits `usage` by default. Without
-`{"stream_options": {"include_usage": true}}` in the request the log line has
+OpenAI-compatible streaming omits `usage` unless the request says
+`{"stream_options": {"include_usage": true}}`. Upstream the Router has no way to
+force it, and a stream without it produces a log line with
 `response_type: "stream"` and no `input_token`/`output_token`/`total_token` at
-all. The Router has no flag to force it; a production gateway has to inject it.
-`ops/check-ailog.py` counts these so the gap stays visible.
+all — the one traffic shape a production gateway sees most of, unbillable.
+
+So this deployment runs a Router built with one added flag,
+`--force-stream-usage`: it rewrites streaming chat and completion requests to ask
+for their usage, whether or not the client did. The rewrite is confined to the
+two OpenAI routes; `/generate` reports usage in `meta_info` and has no
+`stream_options` field to set. An explicit `include_usage: false` is overridden
+rather than respected — the log is the billing record, and a client that opts out
+makes the operator pay for traffic it cannot account for. `ops/check-ailog.py`
+still counts token-less lines so the gap would reappear visibly if the flag were
+ever dropped.
 
 ## Nightly start and stop
 
@@ -124,14 +136,31 @@ token lines are a few hundred bytes per request. The Router already emits the
 nightgw-compatible shape (`gateway_type: "nightgw"`, `nightgw-` request ids), so
 no translation layer is needed before the log reaches Vector.
 
+### Cache hits do show up, once there is a cache to hit
+
+`input_token_details.cached_tokens` was recorded here as permanently absent,
+with `--enable-cache-report` named as the missing piece. That was wrong: the flag
+is in the worker arguments (`extra_sglang_args_by_role.regular`), and the field
+appears as soon as a request actually hits the worker's radix cache. Measured on
+2026-11-01 by sending the same 2546-token prefix twice:
+
+```
+request 1   usage={..., "prompt_tokens_details": null}
+request 2   usage={..., "prompt_tokens_details": {"cached_tokens": 2496}}
+```
+
+The first request is a miss, and a miss is reported as `null`, not as zero. Every
+test before this one had used a fresh prompt, so the conclusion "the feature is
+off" came from a measurement that could not have shown anything else. Anyone
+checking this later should repeat a prefix, not a request.
+
 ## Left as known gaps
 
 - A generation longer than the 20 s settle window can still be cut by the Pod
   deletion; the fix belongs on the worker side (stop waiting for
   `running_req == 0`), not in the scale-down script.
-- `input_token_details.cached_tokens` never appears: the worker reports
-  `prompt_tokens_details: null`. Enabling `--enable-cache-report` on the workers
-  would populate it and let the cache-hit statistic leave zero.
+- `--force-stream-usage` means a client cannot get a stream without the trailing
+  usage chunk. That is deliberate, but it is a behaviour a client could notice.
 - The Router's worker registry keeps an entry per registration, not per address,
   so a scaled-down pool leaves entries behind. They show as unhealthy and are
   skipped by the drain script, but the list grows across restarts.
