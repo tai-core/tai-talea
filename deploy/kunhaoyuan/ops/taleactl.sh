@@ -35,7 +35,10 @@ LOCK_FILE=${LOCK_FILE:-/root/.taleactl.lock}
 POD_READY_TIMEOUT=${POD_READY_TIMEOUT:-2400}   # 40 min: a cold load is 11-12 min
 POD_GONE_TIMEOUT=${POD_GONE_TIMEOUT:-900}      # 15 min
 SERVE_TIMEOUT=${SERVE_TIMEOUT:-2400}
-QUIESCE_TIMEOUT=${QUIESCE_TIMEOUT:-90}         # how long in-flight may take to finish
+# How long an in-flight generation may take to finish. The wait is driven by the
+# worker's own running-request gauge, not by a fixed pause, so this is a ceiling
+# rather than a delay: 32k tokens at ~250 tok/s is about two minutes.
+QUIESCE_TIMEOUT=${QUIESCE_TIMEOUT:-300}
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 die() { log "FAILED: $*"; exit 1; }
@@ -159,9 +162,12 @@ do_up() {
 # not the ones already in flight.
 #
 # This runs as a Pod because the Router's control port is a ClusterIP, and the
-# jump host can reach neither that nor any Pod address. Best effort on purpose:
-# at 08:00 the cards have to come back either way, so a failed drain is logged
-# and the scale-down proceeds.
+# jump host can reach neither that nor any Pod address. It reads each worker's
+# `sglang:num_running_reqs`, so it depends on `--enable-metrics` in the worker
+# arguments - without metrics there is no way to tell a generating worker from an
+# idle one, and the wait falls back to the timeout. Best effort on purpose: at
+# 08:00 the cards have to come back either way, so a failed drain is logged and
+# the scale-down proceeds.
 do_drain() { # $1 = close (default) | open
   local image pod=talea-drain rc mode=${1:-close}
   image=$(kubectl -n "$NS" get deploy talea-router -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)

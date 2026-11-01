@@ -116,11 +116,22 @@ Two details that cost real debugging:
 - `reason` on that endpoint is a closed enum (`manual` | `health_check`); a
   free-text explanation is answered with 422.
 
-The wait is a settle window (20 s) plus a load probe, because `/get_load` counts
-what is queued at the worker, not what is generating: four concurrent requests
-were observed reading as zero load. A generation longer than the window can
-still be cut when the Pod is deleted. `TALEA_SKIP_DRAIN=1` restores the old
-scale-immediately behaviour.
+The wait is driven by each worker's own `sglang:num_running_reqs` (plus
+`num_queue_reqs`), read from its Prometheus endpoint: that is the number of
+requests the scheduler is generating for, and it is zero only when nothing is
+generating. It has to be confirmed twice, two polls apart, because a request that
+finished between polls and one that has not started yet look the same in a single
+sample. `QUIESCE_TIMEOUT` (300 s) is a ceiling, not a delay — an idle pool drains
+in about 10 s.
+
+The first version of this used the Router's `/get_load`, which counts only what
+is *queued* at a worker. Four concurrent generations read as zero load there, so
+the wait degenerated into a fixed 20 s pause, and any generation longer than that
+was still cut. Measured on 2026-11-01: 4096 tokens take about 16 s, which is
+exactly why the earlier four-request test appeared to pass — the requests
+happened to fit inside the pause. 8192 tokens do not.
+
+`TALEA_SKIP_DRAIN=1` restores the previous scale-immediately behaviour.
 
 ## Token log
 
@@ -161,9 +172,11 @@ lines have aged out of the window.
 
 ## Left as known gaps
 
-- A generation longer than the 20 s settle window can still be cut by the Pod
-  deletion; the fix belongs on the worker side (stop waiting for
-  `running_req == 0`), not in the scale-down script.
+- A generation that outlives `QUIESCE_TIMEOUT` (300 s, roughly 75k tokens) is
+  still cut by the Pod deletion, and the scale-down proceeds with a warning: at
+  08:00 the cards have to come back. Raising the ceiling only moves the problem;
+  the durable fix is on the worker side, where stop should refuse to return while
+  `running_req > 0`.
 - `--force-stream-usage` means a client cannot get a stream without the trailing
   usage chunk. That is deliberate, but it is a behaviour a client could notice.
 - The Router's worker registry keeps an entry per registration, not per address,
