@@ -269,6 +269,96 @@ func TestReclaimOfAnUnreachableContainerReleasesWithoutStopping(t *testing.T) {
 	}
 }
 
+// droppedAdapter answers the lease view the way the platform does once the
+// container is gone: the identity is simply absent. Nothing errors, so the
+// absence is an authoritative statement about the world.
+type droppedAdapter struct {
+	partner.PartnerAdapter
+	hidden string
+}
+
+func (a *droppedAdapter) ListActiveLeases(ctx context.Context) ([]partner.CapacityInstance, error) {
+	leases, err := a.PartnerAdapter.ListActiveLeases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	kept := make([]partner.CapacityInstance, 0, len(leases))
+	for _, lease := range leases {
+		if lease.ID == a.hidden {
+			continue
+		}
+		kept = append(kept, lease)
+	}
+	return kept, nil
+}
+
+// unreadableLeases models a partner whose lease view cannot be fetched. It is
+// not evidence that the container is gone, so the drain must still stop it.
+type unreadableLeases struct{ partner.PartnerAdapter }
+
+func (unreadableLeases) ListActiveLeases(context.Context) ([]partner.CapacityInstance, error) {
+	return nil, errors.New("lease view unavailable")
+}
+
+// A scale-down drops the container before the control plane finishes draining
+// it, and the revocation arrives as a pending release - not as a lost endpoint.
+// The row therefore never goes LOST, so the LOST shortcut cannot save it: the
+// drain would call /bootstrap/stop on an address that no longer has a listener,
+// burn the caller timeout, and retry that on every round. The lease view is the
+// authoritative answer, and reading it turns the drain into a no-op.
+func TestDrainOfAContainerThePartnerDroppedCompletesWithoutStopping(t *testing.T) {
+	h := servingHarness(t)
+	ctx := t.Context()
+	id := "container-1"
+
+	h.ctrl.partners = &staticRegistry{adapter: &droppedAdapter{PartnerAdapter: h.adapter, hidden: id}}
+	stop := &stopRecorder{Launcher: h.ctrl.launcher, fail: true}
+	h.ctrl.launcher = stop
+
+	if err := h.ctrl.RequestReclaim(ctx, id, "operator", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	// No clock advance: a dropped container must not wait out a grace period
+	// for traffic that cannot reach it either.
+	h.reconcile()
+
+	got := h.instance(id)
+	if got.InstanceState != domain.InstanceReleased {
+		t.Fatalf("a dropped container must be released at once: %+v (last_error=%q)", got, got.LastError)
+	}
+	if len(stop.forces) != 0 {
+		t.Fatalf("a dropped container must not be asked to stop: %d call(s)", len(stop.forces))
+	}
+	if !h.adapter.Released(id) {
+		t.Fatal("the row was not handed back to the partner")
+	}
+}
+
+// An unreadable lease view proves nothing about the container, so it must not
+// be mistaken for a dropped one: skipping a stop that was still needed leaves a
+// process holding cards nobody is accounting for.
+func TestDrainStopsTheContainerWhenTheLeaseViewIsUnreadable(t *testing.T) {
+	h := servingHarness(t)
+	ctx := t.Context()
+	id := "container-1"
+
+	h.ctrl.partners = &staticRegistry{adapter: unreadableLeases{PartnerAdapter: h.adapter}}
+	stop := &stopRecorder{Launcher: h.ctrl.launcher}
+	h.ctrl.launcher = stop
+
+	if err := h.ctrl.RequestReclaim(ctx, id, "operator", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile()
+
+	if len(stop.forces) != 1 {
+		t.Fatalf("an unreadable lease view must still stop the service: %d call(s)", len(stop.forces))
+	}
+	if got := h.instance(id); got.InstanceState != domain.InstanceReleased {
+		t.Fatalf("drain did not complete: %+v (last_error=%q)", got, got.LastError)
+	}
+}
+
 // absentReleaseAdapter answers every release with partner.ErrInstanceNotFound,
 // which is what the platform says about a container it has already recycled.
 type absentReleaseAdapter struct {

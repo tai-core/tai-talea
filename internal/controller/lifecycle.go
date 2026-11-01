@@ -992,18 +992,32 @@ func (c *Controller) finishDrain(ctx context.Context, instance domain.Instance) 
 	if instance.ServiceState != domain.ServiceDraining {
 		return nil
 	}
-	load, loadKnown, err := c.workerLoad(ctx, instance)
-	if err != nil {
-		c.log().Warn("drain load probe failed", "instance_id", instance.ID, "error", err.Error())
+	// A container the partner no longer lists has nothing left to drain. No
+	// request can arrive at it, and the process that would answer
+	// /bootstrap/stop went away with it. Asking before the load gate keeps the
+	// drain from waiting out the whole grace period on an unknown load, and
+	// asking before the stop call keeps it from spending the caller timeout on
+	// every retry. Without this, a scale-down leaves one row per Pod generation
+	// pinned in DRAINING for as long as the deployment stays at zero, and each
+	// of those rows delays the work that is still real.
+	gone := c.drainTargetGone(ctx, instance)
+
+	load, loadKnown := int64(0), true
+	if !gone {
+		var loadErr error
+		load, loadKnown, loadErr = c.workerLoad(ctx, instance)
+		if loadErr != nil {
+			c.log().Warn("drain load probe failed", "instance_id", instance.ID, "error", loadErr.Error())
+		}
 	}
 	deadline := instance.DrainDeadlineAt
 	timedOut := !deadline.IsZero() && !c.now().Before(deadline)
-	if (!loadKnown || load > 0) && !timedOut {
+	if !gone && (!loadKnown || load > 0) && !timedOut {
 		return nil
 	}
 
 	force := false
-	if timedOut && (!loadKnown || load > 0) {
+	if !gone && timedOut && (!loadKnown || load > 0) {
 		force = true
 		if c.metrics != nil {
 			c.metrics.IncCounter(obs.MetricServiceDrainTimeout,
@@ -1023,19 +1037,23 @@ func (c *Controller) finishDrain(ctx context.Context, instance domain.Instance) 
 		})
 	}
 
-	// Stopping is the only step that needs a live container, and a LOST one has
-	// none: its endpoint stopped answering inside its own network, so the
-	// bootstrap that would serve /stop died with it. Retrying that call fails
-	// on every round and wedges the drain in DRAINING for good — which also
-	// means the container is never handed back and keeps costing quota. Once
-	// the grace has expired there is nothing left to wait for, so the drain
-	// records the service as stopped.
+	// Stopping is the only step that needs a live container, so the two cases
+	// where there is none skip it. A LOST container stopped answering inside
+	// its own network; a gone one is not in the partner's lease view at all.
+	// Both would fail on every retry and wedge the drain in DRAINING for good,
+	// which also means the container is never handed back and keeps costing
+	// quota - so the drain records the service as stopped instead.
 	var result launcher.StopResult
-	if instance.InstanceState == domain.InstanceLost {
+	switch {
+	case gone:
+		result = launcher.StopResult{Phase: launcher.PhaseStopped}
+		c.log().Info("service drain skipped the stop call", "instance_id", instance.ID,
+			"reason", "the partner no longer lists the container")
+	case instance.InstanceState == domain.InstanceLost:
 		result = launcher.StopResult{Phase: launcher.PhaseStopped}
 		c.log().Info("service drain skipped the stop call", "instance_id", instance.ID,
 			"reason", "container is LOST")
-	} else {
+	default:
 		callCtx, cancel := c.callContext(ctx)
 		var stopErr error
 		result, stopErr = c.launcher.Stop(callCtx, instance.Endpoint, launcher.StopRequest{
@@ -1143,6 +1161,41 @@ func (c *Controller) failDrain(ctx context.Context, instance domain.Instance, ca
 		Details:    map[string]string{"error": cause.Error()},
 	})
 	return cause
+}
+
+// drainTargetGone reports whether the partner still holds the container the
+// drain belongs to. A drain exists to stop a service inside a container, so
+// when the container is gone the only honest answer to /bootstrap/stop is
+// "already satisfied" - and the lease view is where that answer is
+// authoritative: it is the same view whose absence ReleaseInstance treats as a
+// completed release.
+//
+// A view that cannot be read is not evidence of absence. The drain then
+// proceeds exactly as before, because skipping a stop that was still needed
+// would leave a process holding cards nobody is accounting for.
+func (c *Controller) drainTargetGone(ctx context.Context, instance domain.Instance) bool {
+	if instance.InstanceState == domain.InstanceLost {
+		// Already covered by the LOST branch, which needs no round trip.
+		return false
+	}
+	adapter, ok := c.PartnerAdapter(instance.PartnerID)
+	if !ok {
+		return false
+	}
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	leases, err := adapter.ListActiveLeases(callCtx)
+	if err != nil {
+		c.log().Warn("drain could not read the partner lease view",
+			"instance_id", instance.ID, "partner_id", instance.PartnerID, "error", err.Error())
+		return false
+	}
+	for _, lease := range leases {
+		if lease.ID == instance.ID {
+			return false
+		}
+	}
+	return true
 }
 
 // workerLoad reads the Router load of one worker. loadKnown is false when the
