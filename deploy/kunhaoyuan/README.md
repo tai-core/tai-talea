@@ -104,6 +104,57 @@ counted, logged and alerted through the same path as an unreachable partner,
 from one deferred hook rather than at each return, so a stage added later cannot
 be the one that forgets.
 
+## Reaching it from outside: the WireGuard tunnel
+
+The platform opens exactly one UDP port to this host — public `51820` forwarded
+to `10.5.0.2:51820`, same number — and that forward carries the deployment. The
+TCP entry is not usable (the EIP answers in the platform proxy's own format
+before anything reaches nginx), which is what makes the tunnel the way in rather
+than a second option.
+
+It is a management link, not a data path. A peer's `AllowedIPs` is
+`10.66.0.0/24`, never `0.0.0.0/0`: a client on this tunnel keeps its own route to
+the internet and its own DNS, and only traffic for `10.66.0.1` comes here. The
+server does no NAT and no forwarding — what a peer reaches is nginx listening on
+that same host, so the packets never leave it:
+
+```
+peer 10.66.0.x ──UDP 51820──> wg0 10.66.0.1 ──> nginx :80 / :8000 ──> 192.168.239.x:31280
+```
+
+`wg0.conf` is generated, never edited. One file per peer means adding or
+removing a client is a file operation, and the config the daemon reads at boot
+cannot drift from the interface that is running:
+
+| path | what it holds |
+| --- | --- |
+| `header.conf` | the `[Interface]` block |
+| `peers/<label>/peer.conf` | one `[Peer]` stanza |
+| `wg0.conf` | generated: the header plus every stanza |
+| `server.key`, `server.pub` | this host's identity, `0600` |
+| `peers/<label>/client.conf` | what that client loads, private key included |
+
+```bash
+bash ops/wg-add-peer.sh <label> [last-octet]   # prints the client config
+bash ops/wg-del-peer.sh <label>
+```
+
+Both rebuild the file and `wg syncconf`, so the running interface and the
+on-disk config change together. `wg-quick@wg0` is enabled, so the tunnel comes
+back with the host.
+
+Verified 2026-11-01, on the host the tunnel terminates on: a throwaway peer on
+loopback handshook in 1 s, answered `ping` in 0.03 ms, and got 200 from
+`http://10.66.0.1/health` on both 80 and 8000; six datagrams sent from outside
+to `36.138.20.89:51820` all arrived (`/proc/net/snmp` Udp InDatagrams +6), so
+the forward works with `wg0` holding the port rather than a test listener; and
+the default route is untouched — `default via 10.5.0.1 dev eth0`, plus one added
+`10.66.0.0/24 dev wg0`.
+
+Not verified: a real client across the public path. That needs a machine with
+`wg-quick` outside this network, and it is the one step no local test can stand
+in for.
+
 ## Nightly start and stop
 
 ```bash
@@ -306,11 +357,12 @@ lines have aged out of the window.
   round, not a reload — `/bootstrap/start` against a worker that is already
   serving answers "already running" and the control plane adopts it, which is what
   the 03:21 re-adoption did in four seconds.
-- **The public entry is not reachable from the internet yet**, and the fix is not
-  on this host. nginx on the jump host listens on `0.0.0.0:80` and `:8000`, has no
-  local firewall, and answers 200 to `127.0.0.1:8000/health`. But the host's only
+- **The TCP entry is not reachable from the internet, and the fix is not on this
+  host.** nginx on the jump host listens on `0.0.0.0:80` and `:8000`, has no local
+  firewall, and answers 200 to `127.0.0.1:8000/health`. But the host's only
   address is `10.5.0.2`; `36.138.20.89` is a platform EIP, and that EIP answers
   `502 upstream connect failed: connection timed out` in the platform proxy's own
   `text/plain` format — nothing reaches nginx. The EIP has to be mapped to
-  `10.5.0.2:80` and the port opened in the console's security group; until then
-  the deployment is only reachable as `192.168.239.{2,3,4}:31280` from inside.
+  `10.5.0.2:80` and the port opened in the console's security group. This is why
+  the deployment is reached through a WireGuard tunnel instead: the platform
+  forwards one UDP port, and that forward works. See the section above.
