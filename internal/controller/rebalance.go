@@ -169,38 +169,82 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 	return decision, nil
 }
 
-// applyStarts assigns roles concurrently and returns once every start has
-// finished, so a round still ends with all of its work done.
+// applyStarts dispatches the round's assignments and returns without waiting.
 //
-// The limit comes from the controller rather than from the number of actions:
-// the workers of one machine share its page cache and its host memory
-// bandwidth, so loading every worker of a large pool at once makes each of them
-// slower without making the pool ready any sooner.
+// It used to wait for every start it dispatched, and that cost a cold start a
+// whole extra load whenever the prepare step finished unevenly. Measured: four
+// containers created together, two prepared at 05:43:56 and two at 05:44:16, so
+// the round in between saw two IDLE instances and assigned two. Waiting for
+// them meant the other two were not noticed until 05:47:47 - 7 min 24 s for a
+// pool that needs 3 min 45 s when it starts in one wave.
+//
+// The bound still exists, it just belongs to the controller: the workers of one
+// machine share its page cache and its host memory bandwidth, so loading every
+// worker of a large pool at once makes each of them slower without making the
+// pool ready any sooner. A round that finds every slot taken now leaves those
+// instances to the next round instead of holding the loop.
 func (c *Controller) applyStarts(ctx context.Context, actions []planner.Action) {
-	if len(actions) == 0 {
+	for _, action := range actions {
+		if !c.reserveStart(action.InstanceID) {
+			// A previous round's start still owns this container. It will be
+			// SERVING or FAILED by the time the next round looks, and the
+			// planner decides from that state rather than from this list.
+			c.log().Debug("skipped an assignment whose start is still in flight",
+				"instance_id", action.InstanceID, "role", string(action.Role))
+			continue
+		}
+		c.startsRunning.Add(1)
+		go c.runStart(ctx, action)
+	}
+}
+
+func (c *Controller) runStart(ctx context.Context, action planner.Action) {
+	defer c.startsRunning.Done()
+	defer c.releaseStart(action.InstanceID)
+	select {
+	case c.startGate() <- struct{}{}:
+	case <-ctx.Done():
 		return
 	}
-	limit := c.StartParallelism()
-	if limit > len(actions) {
-		limit = len(actions)
+	defer func() { <-c.startGate() }()
+	if err := c.StartService(ctx, action.InstanceID, action.Role); err != nil {
+		c.log().Warn("planner assign failed",
+			"instance_id", action.InstanceID, "role", string(action.Role), "error", err.Error())
+		return
 	}
-	slots := make(chan struct{}, limit)
-	var wg sync.WaitGroup
-	for _, action := range actions {
-		wg.Add(1)
-		go func(action planner.Action) {
-			defer wg.Done()
-			slots <- struct{}{}
-			defer func() { <-slots }()
-			if err := c.StartService(ctx, action.InstanceID, action.Role); err != nil {
-				c.log().Warn("planner assign failed",
-					"instance_id", action.InstanceID, "role", string(action.Role), "error", err.Error())
-				return
-			}
-			c.recordPlannerAction(ctx, action)
-		}(action)
-	}
-	wg.Wait()
+	c.recordPlannerAction(ctx, action)
+}
+
+// startGate is the controller-wide concurrency bound for model loads.
+func (c *Controller) startGate() chan struct{} {
+	c.startSlotsOnce.Do(func() {
+		limit := c.StartParallelism()
+		if limit < 1 {
+			limit = 1
+		}
+		c.startSlots = make(chan struct{}, limit)
+	})
+	return c.startSlots
+}
+
+// reserveStart claims an instance for one dispatched start. It reports false
+// when a start already owns the container, which is a window the state machine
+// cannot close on its own: StartService writes STARTING only after it has taken
+// the instance lock, and until then the row still reads IDLE.
+func (c *Controller) reserveStart(instanceID string) bool {
+	_, already := c.startsInFlight.LoadOrStore(instanceID, struct{}{})
+	return !already
+}
+
+func (c *Controller) releaseStart(instanceID string) {
+	c.startsInFlight.Delete(instanceID)
+}
+
+// AwaitStarts waits for every dispatched start to return. Nothing in the
+// control loop calls it - returning early is the whole point - but a caller
+// that reads the state a round produced has to.
+func (c *Controller) AwaitStarts() {
+	c.startsRunning.Wait()
 }
 
 // recordPlannerAction counts and audits one applied decision. A failed action is

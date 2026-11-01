@@ -126,6 +126,20 @@ type Controller struct {
 	eventRecovery      sync.Mutex
 	eventRecoveryAfter string
 	eventRecoveryTime  time.Time
+	// startSlots bounds how many model loads the control plane drives at once.
+	// The bound belongs to the controller rather than to one planner round: a
+	// round that waited for its own starts could not dispatch a worker that
+	// became ready a few seconds after its siblings.
+	startSlotsOnce sync.Once
+	startSlots     chan struct{}
+	// startsInFlight holds the instances a dispatched start still owns, so a
+	// later round does not hand the same container a second start during the
+	// window between dispatch and the state transition that claims it.
+	startsInFlight sync.Map
+	// startsRunning lets a caller wait for the starts it dispatched. Production
+	// never waits - that is the point of the gate - but a test that reads the
+	// state a round produced has to.
+	startsRunning sync.WaitGroup
 }
 
 func (c *Controller) eventOperation(id string) *sync.Mutex {

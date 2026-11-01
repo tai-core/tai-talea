@@ -32,6 +32,10 @@ type endpointGate struct {
 	mu      sync.Mutex
 	failing string
 	passed  int
+	// attempts counts every Start call per endpoint, including the ones parked
+	// inside the gate. A round that dispatched the same container twice would
+	// show up here even though the second call never got to run.
+	attempts map[string]int
 
 	entered chan string
 	release chan struct{}
@@ -50,6 +54,12 @@ func (g *endpointGate) isFailing(endpoint string) bool {
 }
 
 func (g *endpointGate) Start(ctx context.Context, endpoint string, request launcher.StartRequest) error {
+	g.mu.Lock()
+	if g.attempts == nil {
+		g.attempts = make(map[string]int)
+	}
+	g.attempts[endpoint]++
+	g.mu.Unlock()
 	if endpoint != g.hold || g.isFailing(endpoint) {
 		return g.Launcher.Start(ctx, endpoint, request)
 	}
@@ -75,6 +85,14 @@ func (g *endpointGate) heldStartHasPassed() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.passed > 0
+}
+
+// attemptsFor counts how many times the control plane asked this container to
+// start, including calls that are still parked inside the gate.
+func (g *endpointGate) attemptsFor(endpoint string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.attempts[endpoint]
 }
 
 func (g *endpointGate) Health(ctx context.Context, endpoint string) (launcher.Health, error) {

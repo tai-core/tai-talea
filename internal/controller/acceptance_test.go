@@ -1126,6 +1126,9 @@ func TestAcceptancePlannerAppliesTheFixedRatioGear(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rebalance: %v", err)
 	}
+	// The round dispatches its assignments and returns; the roles it decided are
+	// written by each start, so wait for them before reading the result.
+	h.ctrl.AwaitStarts()
 	if decision.Gear != "1:1" {
 		t.Fatalf("gear=%s, want 1:1", decision.Gear)
 	}
