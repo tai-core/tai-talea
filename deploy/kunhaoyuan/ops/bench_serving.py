@@ -85,7 +85,8 @@ def one_request(session, url, prompt, max_new, timeout):
     }
 
 
-def run_stage(base_url, model, concurrency, num_prompts, input_len, output_len, vocab, timeout, seed):
+def run_stage(base_url, model, concurrency, num_prompts, input_len, output_len, vocab, timeout, seed,
+              distinct_prompts=False):
     prompt_seed = build_prompt(vocab, 8, seed)  # warm the token id range only
     del prompt_seed
     url = base_url.rstrip("/") + "/generate"
@@ -101,13 +102,38 @@ def run_stage(base_url, model, concurrency, num_prompts, input_len, output_len, 
 
     prompts = [build_prompt(vocab, input_len, seed + i) for i in range(min(num_prompts, 8))]
 
+    def prompt_for(index):
+        # With a handful of shared prompts the Router's cache_aware policy sends
+        # every copy of a prefix to the worker that already has it cached, so a
+        # run at concurrency 192 measures one or two workers being hammered
+        # rather than the pool. Distinct prompts are the honest shape for a
+        # capacity or backpressure test; shared ones are the honest shape for a
+        # cache-hit benchmark. Neither default is right for both.
+        if distinct_prompts:
+            return build_prompt(vocab, input_len, seed + index)
+        return prompts[index % len(prompts)]
+
     results = []
     errors = []
+    # A refusal is a result, not a failure: the point of the concurrency limit is
+    # that the router says no quickly instead of accepting work it cannot start.
+    # Recording the status, the latency and the advertised Retry-After is what
+    # separates "the pool pushed back" from "something broke".
+    refusals = []
 
     def task(index):
-        prompt = prompts[index % len(prompts)]
+        prompt = prompt_for(index)
+        began = time.perf_counter()
         try:
             return one_request(session_for_thread(), url, prompt, output_len, timeout)
+        except requests.HTTPError as exc:
+            response = exc.response
+            refusals.append((
+                response.status_code if response is not None else None,
+                time.perf_counter() - began,
+                response.headers.get("Retry-After") if response is not None else None,
+            ))
+            return None
         except Exception as exc:  # noqa: BLE001 - a failed request is data too
             errors.append(f"{type(exc).__name__}: {exc}")
             return None
@@ -119,8 +145,31 @@ def run_stage(base_url, model, concurrency, num_prompts, input_len, output_len, 
                 results.append(outcome)
     wall = time.perf_counter() - started
 
+    def pct(values, p):
+        if not values:
+            return 0.0
+        k = min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1))))
+        return values[k]
+
+    codes = {}
+    for status, _, _ in refusals:
+        codes[str(status)] = codes.get(str(status), 0) + 1
+    retry_after = sorted({value for _, _, value in refusals if value})
+    refusal_latencies = sorted(latency for _, latency, _ in refusals)
+
     if not results:
-        return {"concurrency": concurrency, "failed": len(errors), "error": errors[:3]}
+        return {
+            "concurrency": concurrency,
+            "requested": num_prompts,
+            "ok": 0,
+            "failed": len(errors) + len(refusals),
+            "refused": len(refusals),
+            "refused_by_status": codes,
+            "refuse_ms_p95": round(pct(refusal_latencies, 95) * 1000, 1) if refusal_latencies else 0.0,
+            "retry_after": retry_after,
+            "wall_s": round(wall, 2),
+            "error": errors[:3] or None,
+        }
 
     ttfts = sorted(r["ttft"] for r in results)
     e2es = sorted(r["total"] for r in results)
@@ -131,17 +180,15 @@ def run_stage(base_url, model, concurrency, num_prompts, input_len, output_len, 
         steps = max(r["tokens"] - 1, 1)
         itls.append(max(r["total"] - r["ttft"], 0) / steps)
 
-    def pct(values, p):
-        if not values:
-            return 0.0
-        k = min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1))))
-        return values[k]
-
     return {
         "concurrency": concurrency,
         "requested": num_prompts,
         "ok": len(results),
-        "failed": len(errors),
+        "failed": len(errors) + len(refusals),
+        "refused": len(refusals),
+        "refused_by_status": codes,
+        "refuse_ms_p95": round(pct(refusal_latencies, 95) * 1000, 1) if refusal_latencies else 0.0,
+        "retry_after": retry_after,
         "error": errors[:3],
         "wall_s": round(wall, 2),
         "req_per_s": round(len(results) / wall, 3),
@@ -173,6 +220,9 @@ def main():
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tag", default="run")
+    ap.add_argument("--distinct-prompts", action="store_true",
+                    help="give every request its own prompt instead of cycling a few; "
+                         "shared prefixes let cache_aware pile a run onto one worker")
     ap.add_argument("--json-out", default="")
     args = ap.parse_args()
 
@@ -187,7 +237,8 @@ def main():
     stages = []
     for c, n in zip(args.concurrency, args.num_prompts):
         stage = run_stage(args.base_url, args.model, c, n, args.input_len,
-                          args.output_len, args.vocab, args.timeout, args.seed)
+                          args.output_len, args.vocab, args.timeout, args.seed,
+                          args.distinct_prompts)
         stages.append(stage)
         print(f"\n########## {args.tag} concurrency={c} prompts={n} ##########")
         for key, value in stage.items():
