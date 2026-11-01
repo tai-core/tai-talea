@@ -227,6 +227,9 @@ kubectl -n kunhaoyuan logs deploy/talea-router  -f     # 请求级日志（每�
 /root/talea-deploy/ops/export-ailog.sh 2000            # 起只读 Pod 把它捞出来并校验格式
 ```
 
+token 日志是否符合《第三方网关 Token 日志规范》v1.2、还缺什么、以及后续该由谁采到哪里，
+单独写在 `docs/ailog-conformance-2026-11-01.md`；`ops/analyze_ailog.py` 是可复跑的严格校验。
+
 控制面日志里两个关键词的含义：
 
 - `model health probe failed; instance taken out of rotation` —— 探针没答，摘流。
