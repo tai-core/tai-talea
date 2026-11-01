@@ -154,6 +154,11 @@ test before this one had used a fresh prompt, so the conclusion "the feature is
 off" came from a measurement that could not have shown anything else. Anyone
 checking this later should repeat a prefix, not a request.
 
+One caveat on the checker: the log is one append-only file, so a window exported
+right after a Router upgrade still contains lines written by the previous binary.
+A partial token triple there is history, not a regression — re-run once those
+lines have aged out of the window.
+
 ## Left as known gaps
 
 - A generation longer than the 20 s settle window can still be cut by the Pod
