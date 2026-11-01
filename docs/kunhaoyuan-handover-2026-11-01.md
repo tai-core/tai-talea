@@ -210,7 +210,7 @@ nginx 用一张 `map` 匹配 `Authorization`，`Bearer <key>` 和裸 `<key>` 都
 
 | 症状 | 判据 | 处置 |
 | --- | --- | --- |
-| 端点 503 `no_available_workers` | Router 日志里 `circuit` 出现 **0** 次？那就是没 worker 可路由，不是熔断 | 跑 `/root/taleactl.sh status` 看 registry；若 08:00 前后，是缩容窗口，等 1 分钟 |
+| 端点 503 `no_available_workers` | 先看 pod `startTime`：在 4~6 分钟内 ⇒ 模型加载中，等；否则看 Router 日志 `circuit` 是否为 0 次（是 ⇒ 没 worker 可路由，不是熔断）。三种成因见 §7.11 | 跑 `/root/taleactl.sh status` 看 registry；加载窗口只能等，客户端应退避重试 |
 | 端点 429 | body 里 `concurrency_limit` | 正常背压，退避重试 |
 | 端点 401 | 没带 key 或带错 | key 在 nginx 的 `map` 里；401 与 403 含义不同，见 §5 |
 | 端点 502/504 | n2 上逐个 `curl -m 3 <ip>:31280/health`（3 台 master） | 全不通 ⇒ 集群/NodePort 服务有问题；单个不通 ⇒ nginx `least_conn` 会自动跳过 |
@@ -267,9 +267,25 @@ control 都不动，模型不重载。
 8. **没有 `pods/exec` 和 `pods/portforward`**：读节点本地文件只能起只读 hostPath Pod；
    读 control 的 admin 接口只能临时建 NodePort Service（用完删）。这是平台的 RBAC 边界，
    不是可以绕的配置问题。
-9. **cron 到 11-01 20:00 才第一次真跑**：之前只有手动执行记录。
+9. **cron 已在 11-01 20:00 首跑通过**：`/var/log/taleactl.log` 20:00:01 `up` → 20:00:02 pods
+   4/4 + inference 200 → 20:00:17 `up: complete, 4/4` → 20:00:33 status 全 `ready/live`
+   + endpoint 200。服务本来就在跑，幂等路径 **32 s**。
 10. **`up` 故意会失败**：4 台里有一台没注册就 `die`，因为"在 1/4 容量上假装成功"
     比失败严重得多。看到 `FAILED` 先看是哪一台。
+11. **503 有三种成因，都不是"排队"**（11-01 逐条查过，别再自己吓自己）：
+    - **整池空**：worker 被删/重建、模型加载中的那 4~6 分钟，谁来都是 503。
+      判据：`kubectl get pods` 的 `startTime` 正好在这个窗口，且 control 日志里同时有
+      `instance is LOST` + `service draining ... capacity revoked by partner`。
+    - **池子还没注册好**：`up` 之后立刻开打，Router 的 worker 列表还是空的 —— 同一客户端
+      隔 10 秒重试就全 200（16:41 实测：192 个 503 → 10 秒后 192 个 200）。
+    - **池级配额放行但没空闲 worker**：`--queue-size 0` 下 `select_worker` 返回 None，
+      也记成 503。这一种本质是背压，语义上更该是 429，**当前版本没改**（要改得重出 Router 镜像）。
+    三者共同的形态：耗时只有 360–500 ms、`ai_log` 里**没有任何 token 字段**。
+    对照——真排队长这样：429 + `concurrency_limit` + `Retry-After: 1`、耗时 0 ms；
+    或者在算但慢：200、`duration` 长、`cached_tokens` 高。
+    ⚠️ 503 的 `message` 写的是 `No available workers (all circuits open or unhealthy)`，
+    这是 Router 的默认话术，**这套部署没有熔断器**（日志里 `circuit` 出现 0 次），别按熔断去查。
+    503 也不带 `Retry-After`，客户端只能按经验退避。
 
 ---
 
