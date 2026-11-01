@@ -1,0 +1,139 @@
+# talea-router: the OpenAI-compatible entry point plus the control-plane API the
+# controller registers workers through.
+#
+# Port 8000 is the inference surface and 30001 is PUT /state/workers/{id}. They
+# are two listeners of one process, which is why the controller's router.url
+# points at :30001 and clients at :8000.
+#
+# The token log goes to a hostPath as well as the container log. See the comment
+# on the container's command for why that is done with tee rather than a flag.
+apiVersion: v1
+kind: Service
+metadata:
+  name: talea-router
+  namespace: kunhaoyuan
+  labels:
+    app: talea-router
+spec:
+  selector:
+    app: talea-router
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+    - name: control
+      port: 30001
+      targetPort: control
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: talea-router
+  namespace: kunhaoyuan
+  labels:
+    app: talea-router
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 3600
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: talea-router
+  template:
+    metadata:
+      labels:
+        app: talea-router
+    spec:
+      # Pinned so the access log always lands on the same node's disk; collecting
+      # it from a different machine every restart would make the copy-out manual
+      # step depend on asking the cluster where the Pod happens to be.
+      nodeSelector:
+        kubernetes.io/hostname: sdsc-aic-mdmz-pm-os01-aicube-7
+      imagePullSecrets:
+        - name: harbor-cred
+      # SIGTERM stops accepting, drains, then exits; give it room so the last
+      # in-flight request still produces its access log line.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: router
+          image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:talea-control-0.9.2
+          imagePullPolicy: Always
+          # --enable-ai-access-log writes to stdout and nowhere else: the only
+          # other log knob, --log-dir, redirects the tracing subscriber and has
+          # no effect on token lines. So the stream is mirrored here instead of
+          # asking the router for a file sink it does not have.
+          #
+          # exec on both lines matters. Process substitution puts tee in a
+          # sibling process, and exec'ing the router makes it PID 1 with that
+          # fd, so SIGTERM from the kubelet reaches the router directly and the
+          # tee child sees EOF and exits on its own. Running the router as a
+          # plain child would swallow the signal and cost a 60 s SIGKILL.
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              log_dir="${TALEA_AI_LOG_DIR:-/logs}"
+              mkdir -p "$log_dir"
+              log_file="$log_dir/talea-router.log"
+              echo "talea-router: mirroring stdout to $log_file" >&2
+              exec > >(tee -a "$log_file") 2>&1
+              exec /opt/sglang/bin/sgl-model-gateway launch \
+                --host 0.0.0.0 \
+                --port 8000 \
+                --control-plane-host 0.0.0.0 \
+                --control-plane-port 30001 \
+                --model-path /models/GLM-5.3-Flash-NVFP4 \
+                --policy cache_aware \
+                --health-check-endpoint /server_info \
+                --health-failure-threshold 5 \
+                --health-check-interval-secs 30 \
+                --log-level info \
+                --enable-ai-access-log
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: control
+              containerPort: 30001
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 240
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "16"
+              memory: 32Gi
+          volumeMounts:
+            # --model-path is read for the tokenizer, nothing else.
+            - name: weights
+              mountPath: /models
+              readOnly: true
+            - name: ai-log
+              mountPath: /logs
+      volumes:
+        - name: weights
+          hostPath:
+            path: /data02/model-weight
+            type: Directory
+        # One file, appended across restarts. At the measured rate (~21 MB/day
+        # for this traffic mix) rotation is a housekeeping chore, not a capacity
+        # problem; a date-stamped name per start would instead make "the log"
+        # ambiguous and complicates the file-based Vector source.
+        - name: ai-log
+          hostPath:
+            path: /data02/talea-ai/logs
+            type: DirectoryOrCreate

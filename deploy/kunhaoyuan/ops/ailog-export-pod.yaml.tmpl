@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: talea-ailog-export
+  namespace: kunhaoyuan
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: __NODE__
+  imagePullSecrets:
+    - name: harbor-cred
+  containers:
+    - name: dump
+      image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:talea-control-0.9.2
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -uo pipefail
+          f=/data02/talea-ai/logs/talea-router.log
+          echo "@@@ NODE $(hostname)"
+          if [ ! -f "$f" ]; then
+            echo "@@@ MISSING $f"
+            ls -la /data02/talea-ai /data02/talea-ai/logs 2>&1
+            exit 0
+          fi
+          echo "@@@ SIZE $(wc -lc < "$f" | tr -s ' ')"
+          echo "@@@ COUNT $(grep -ac '^{"ai_log"' "$f")"
+          echo "@@@ TOTAL_LINES $(wc -l < "$f")"
+          echo "@@@ AI_BEGIN"
+          # grep before tail: the token lines are rare, the tracing noise is not,
+          # so "the last N token lines" and "token lines among the last N lines"
+          # are very different requests and only the first one is useful.
+          grep -a '^{"ai_log"' "$f" | tail -n __LINES__
+          echo "@@@ AI_END"
+      resources:
+        requests: {cpu: "1", memory: 1Gi}
+        limits: {cpu: "2", memory: 2Gi}
+      volumeMounts:
+        - name: data02
+          mountPath: /data02
+          readOnly: true
+  volumes:
+    - name: data02
+      hostPath:
+        path: /data02

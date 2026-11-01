@@ -1,0 +1,22 @@
+# The inference surface, reachable from the jump host.
+#
+# NodePort rather than LoadBalancer: this cluster has no CCM, so an EXTERNAL-IP
+# would stay pending forever while the NodePort is still allocated. The port is
+# written down explicitly for the same reason - letting Kubernetes pick one
+# means the address changes on every re-create.
+apiVersion: v1
+kind: Service
+metadata:
+  name: talea-api
+  namespace: kunhaoyuan
+  labels:
+    app: talea-router
+spec:
+  type: NodePort
+  selector:
+    app: talea-router
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      nodePort: 31280

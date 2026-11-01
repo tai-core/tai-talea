@@ -1,0 +1,169 @@
+# talea control plane on the China Mobile B300 cluster (kunhaoyuan).
+#
+# Aggregated shape: every worker is a self-contained TP4 server. There is no
+# prefill/decode split, no gear and no capacity verb - the planner only hands
+# the idle instances the role "regular" and the Router load balances them.
+#
+# The control plane runs in the same namespace as the workers because the
+# Kubernetes partner addresses them by Pod IP, which is not routable from n2.
+
+server:
+  listen: 0.0.0.0:8787
+  admin_token: __ADMIN_TOKEN__
+  max_push_body_bytes: 1048576
+  read_timeout: 15s
+  write_timeout: 30s
+  shutdown_timeout: 10s
+
+storage:
+  sqlite_path: /var/lib/tai-talea/tai-talea.db
+
+controller:
+  reconcile_interval: 10s
+  prepare_max_attempts: 3
+  start_max_attempts: 3
+  release_max_attempts: 3
+  start_retry_cooldown: 0s
+  start_retry_max_rearms: 0
+  drain_grace: 300s
+  operation_retry: 15s
+  call_timeout: 10s
+  health_failure_threshold: 3
+  # A cold worker takes 11-12 minutes on this hardware: 102 s of weight loading
+  # plus the FlashInfer first compile. 20 m leaves room for a cold Triton cache.
+  start_timeout: 20m
+  provision_timeout: 45m
+  bootstrap_token: __BOOTSTRAP_TOKEN__
+  # What clients ask for by name. It must equal kubernetes.model_support below
+  # and --served-model-name in the extra arguments, or the Router ends up with
+  # three names for one model.
+  model_id: glm-5.3-flash
+  model_path: /models/GLM-5.3-Flash-NVFP4
+  extra_sglang_args: []
+  extra_sglang_args_by_role:
+    regular:
+      # The flags below are the ones docs/glm53-*.md validated on B300; every
+      # entry keeps its flag and value together because the bootstrap checks
+      # the first token of each entry against its allowlist.
+      - "--served-model-name glm-5.3-flash"
+      - "--quantization modelopt_fp4"
+      - "--tp-size 4"
+      - "--dsa-prefill-backend trtllm"
+      - "--dsa-decode-backend trtllm"
+      - "--kv-cache-dtype fp8_e4m3"
+      - "--moe-runner-backend flashinfer_cutlass"
+      - "--reasoning-parser glm45"
+      - "--tool-call-parser glm47"
+      - "--trust-remote-code"
+      # Without these two the control plane's load input silently switches off
+      # and the Router's readiness view stays incomplete.
+      - "--enable-metrics"
+      - "--enable-cache-report"
+      # Speculative decoding only starts in the aggregated shape, which is one
+      # of the reasons this shape exists. --speculative-adaptive follows the
+      # load instead of using a fixed draft length.
+      - "--speculative-algorithm NEXTN"
+      - "--speculative-num-steps 5"
+      - "--speculative-num-draft-tokens 6"
+      - "--speculative-adaptive"
+  lease_warning: 120s
+  lost_rate_threshold: 0.2
+
+router:
+  name: primary
+  # The control plane API (PUT /state/workers/{id}), not the OpenAI port.
+  url: http://talea-router:30001
+  mode: readiness-v1
+  timeout: 10s
+  removal_timeout: 8m
+  # Unused in the aggregated shape; kept at the SGLang default so switching the
+  # deployment back to a disaggregated pair needs no edit here.
+  prefill_bootstrap_port: 8998
+
+planner:
+  mode: aggregated
+  # Four workers, four actions: the first round can take the whole pool instead
+  # of walking it one worker at a time.
+  max_change_per_round: 4
+  min_hold: 120s
+  cooldown: 60s
+  max_serving: 0
+  # There is no load signal to drive PROVISION/RELEASE in this shape, and the
+  # validation refuses the combination rather than ignoring it.
+  capacity_actions: false
+
+# The Kubernetes partner's snapshot is a live Pod list, so pull is the adoption
+# path: workers created as Deployments enter the control plane from here.
+pull:
+  enabled: true
+  interval: 30s
+  failure_threshold: 3
+
+alerts:
+  webhook_url: ""
+  cooldown: 5m
+  ratio_tolerance: 0.15
+
+# Must match /etc/tai-talea/profile.json inside talea-worker-0.9.2 field by
+# field. sglang is exact on purpose: "_matches" accepts a trailing ".x" and
+# nothing else, so a prefix wildcard would not even be read as one.
+image_profile:
+  os: ubuntu-24.04
+  cuda: "13.x"
+  python: "3.12"
+  sglang: "0.0.0.dev1+gfe236ea6c3.mmfix1"
+  wheelhouse: /opt/tai-talea/wheelhouse
+  virtualenv: /opt/tai-talea/venv
+
+partners:
+  - id: kunhaoyuan
+    adapter: kubernetes
+    # No partner API calls us here; these exist because the schema requires
+    # them and the Push API stays available for manual capacity events.
+    push_token: __PUSH_TOKEN__
+    push_secret: __PUSH_SECRET__
+    hmac_tolerance: 5m
+    replay_cache_size: 4096
+    kubernetes:
+      # Client-certificate credentials in a Secret. The namespace's default
+      # ServiceAccount has no RBAC, and a tenant cannot create a RoleBinding to
+      # give it any - so the control plane authenticates as the tenant user.
+      kubeconfig: /etc/tai-talea/kubeconfig
+      namespace: kunhaoyuan
+      image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:talea-worker-0.9.2
+      # Always, because this tag was re-pushed today and the nodes may still
+      # hold the earlier copy: the layer list is re-resolved on every start and
+      # the shared layers are already local.
+      image_pull_policy: Always
+      entrypoint: ["/usr/local/bin/tai-talea-entrypoint", "serve"]
+      gpu_resource: nvidia.com/gpu
+      gpu_count: 4
+      nodes:
+        - host: sdsc-aic-mdmz-pm-os01-aicube-7
+        - host: sdsc-aic-mdmz-pm-os01-aicube-8
+      volumes:
+        - name: weights
+          host_path: /data02/model-weight
+          mount_path: /models
+          read_only: true
+        # The Triton/FlashInfer compile cache. It already holds the 4xTP4
+        # artefacts from the previous topology, so a restarted worker reuses
+        # them instead of paying the first-compile cost again.
+        - name: compile-cache
+          host_path: /data02/talea-glm53/cache
+          mount_path: /root/.cache
+        - name: worker-logs
+          host_path: /data02/talea-glm53/logs
+          mount_path: /logs
+      # 64 MB of /dev/shm is far below what four tensor-parallel ranks need.
+      shm_size: 16Gi
+      profile_path: /etc/tai-talea/profile.json
+      # The image serves /bootstrap/liveness, so a worker that is alive but mute
+      # is restarted on the same Pod, address and lease.
+      liveness_probe: true
+      bootstrap_port: 9001
+      service_port: 9002
+      model_support:
+        - glm-5.3-flash
+      timeout: 30s
+      wait_timeout: 10m

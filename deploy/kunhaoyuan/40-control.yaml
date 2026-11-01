@@ -1,0 +1,100 @@
+# talea-control: the capacity control plane itself.
+#
+# It runs inside the namespace because the Kubernetes partner addresses workers
+# by Pod IP (10.222.x), and those addresses are not routable from the jump host.
+apiVersion: v1
+kind: Service
+metadata:
+  name: talea-control
+  namespace: kunhaoyuan
+  labels:
+    app: talea-control
+spec:
+  selector:
+    app: talea-control
+  ports:
+    - name: admin
+      port: 8787
+      targetPort: admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: talea-control
+  namespace: kunhaoyuan
+  labels:
+    app: talea-control
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 600
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: talea-control
+  template:
+    metadata:
+      labels:
+        app: talea-control
+    spec:
+      imagePullSecrets:
+        - name: harbor-cred
+      containers:
+        - name: control
+          image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:talea-control-0.9.2
+          imagePullPolicy: Always
+          command: ["/opt/tai-talea/bin/tai-talea"]
+          args:
+            - --config
+            - /etc/tai-talea/config.yaml
+            - --log-level
+            - info
+          ports:
+            - name: admin
+              containerPort: 8787
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tai-talea/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: kubeconfig
+              mountPath: /etc/tai-talea/kubeconfig
+              subPath: kubeconfig
+              readOnly: true
+            # The instance store. Losing it costs a re-adoption from the pull
+            # snapshot, not a rollout: instance ids are the Pod names.
+            - name: state
+              mountPath: /var/lib/tai-talea
+      volumes:
+        - name: config
+          configMap:
+            name: talea-config
+        - name: kubeconfig
+          secret:
+            secretName: talea-kubeconfig
+            defaultMode: 0400
+        - name: state
+          emptyDir: {}
