@@ -194,6 +194,8 @@ OpenAI SDK 直接把 `base_url` 指到 `http://10.66.0.1/v1` 即可。
 
 `/health` 免鉴权可直接探活（回 200）。`/metrics`、`/server_info` 对外 **403**（只有 nginx
 放行 `/v1/*` 和 `/health`）。鉴权只在 nginx 上做——NodePort 本身不校验，但从集群外到不了它。
+nginx 用一张 `map` 匹配 `Authorization`，`Bearer <key>` 和裸 `<key>` 都接受；
+**key 不对是 401，不是 403**，两者含义不同：401 = 没带/带错 key，403 = 路径没放行。
 
 客户端侧的完整说明（含 WireGuard 客户端导入步骤、实测结果）在
 `C:\Users\Tkis1\Documents\talea-api\接入说明.md`，同目录 `test_api.py` 是不依赖第三方库的自检脚本。
@@ -206,6 +208,7 @@ OpenAI SDK 直接把 `base_url` 指到 `http://10.66.0.1/v1` 即可。
 | --- | --- | --- |
 | 端点 503 `no_available_workers` | Router 日志里 `circuit` 出现 **0** 次？那就是没 worker 可路由，不是熔断 | 跑 `/root/taleactl.sh status` 看 registry；若 08:00 前后，是缩容窗口，等 1 分钟 |
 | 端点 429 | body 里 `concurrency_limit` | 正常背压，退避重试 |
+| 端点 401 | 没带 key 或带错 | key 在 nginx 的 `map` 里；401 与 403 含义不同，见 §5 |
 | 端点 502/504 | n2 上逐个 `curl -m 3 <ip>:31280/health`（3 台 master） | 全不通 ⇒ 集群/NodePort 服务有问题；单个不通 ⇒ nginx `least_conn` 会自动跳过 |
 | 隧道不通 | `wg show wg0` 看 `latest handshake`；客户端 `AllowedIPs` 必须**只有** `10.66.0.0/24` | 握手不刷新 ⇒ 查公网 UDP 51820 转发；能握手但打不开页面 ⇒ 查 nginx |
 | `up` 中途 `FAILED` | 日志最后一行是哪一类 | `workers did not become Ready` → 看 Pod events；`endpoint never answered` → 看 worker 日志/权重路径；`not every worker registered` → 单台没起来，见下 |
