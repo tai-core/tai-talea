@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tai-core/tai-talea/internal/domain"
@@ -119,14 +120,16 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 	c.publishPlanMetrics(prefillServing, decodeServing, regularServing, decision)
 	c.recordGearChange(ctx, decision)
 
+	// Starts are the only actions that take minutes, and applying them one after
+	// another is what makes a cold pool cost the sum of every load. They are
+	// hoisted out of the loop and run together; everything else is a fast call
+	// that keeps its place in the decision's order.
+	var starts []planner.Action
 	for _, action := range decision.Actions {
 		switch action.Kind {
 		case planner.ActionAssign:
-			if err := c.StartService(ctx, action.InstanceID, action.Role); err != nil {
-				c.log().Warn("planner assign failed",
-					"instance_id", action.InstanceID, "role", string(action.Role), "error", err.Error())
-				continue
-			}
+			starts = append(starts, action)
+			continue
 		case planner.ActionReassign:
 			// Role conversion is staged through a drain: readiness closes first,
 			// the next round assigns the new role once the port is free.
@@ -156,18 +159,59 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 				continue
 			}
 		}
-		if c.metrics != nil {
-			c.metrics.IncCounter(obs.MetricPlannerChangesTotal,
-				"PD planner changes applied, including capacity requests.",
-				[]string{"kind", "role"}, "kind", string(action.Kind), "role", string(action.Role))
-		}
-		c.audit(ctx, auditForAction(action))
+		c.recordPlannerAction(ctx, action)
 	}
+	c.applyStarts(ctx, starts)
 	if len(decision.Actions) > 0 {
 		c.log().Info("planner round applied", "summary", decision.DecisionSummary())
 	}
 	c.checkRatioDrift(ctx, decision)
 	return decision, nil
+}
+
+// applyStarts assigns roles concurrently and returns once every start has
+// finished, so a round still ends with all of its work done.
+//
+// The limit comes from the controller rather than from the number of actions:
+// the workers of one machine share its page cache and its host memory
+// bandwidth, so loading every worker of a large pool at once makes each of them
+// slower without making the pool ready any sooner.
+func (c *Controller) applyStarts(ctx context.Context, actions []planner.Action) {
+	if len(actions) == 0 {
+		return
+	}
+	limit := c.StartParallelism()
+	if limit > len(actions) {
+		limit = len(actions)
+	}
+	slots := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for _, action := range actions {
+		wg.Add(1)
+		go func(action planner.Action) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			if err := c.StartService(ctx, action.InstanceID, action.Role); err != nil {
+				c.log().Warn("planner assign failed",
+					"instance_id", action.InstanceID, "role", string(action.Role), "error", err.Error())
+				return
+			}
+			c.recordPlannerAction(ctx, action)
+		}(action)
+	}
+	wg.Wait()
+}
+
+// recordPlannerAction counts and audits one applied decision. A failed action is
+// not recorded: the audit trail must not claim a change that did not happen.
+func (c *Controller) recordPlannerAction(ctx context.Context, action planner.Action) {
+	if c.metrics != nil {
+		c.metrics.IncCounter(obs.MetricPlannerChangesTotal,
+			"PD planner changes applied, including capacity requests.",
+			[]string{"kind", "role"}, "kind", string(action.Kind), "role", string(action.Role))
+	}
+	c.audit(ctx, auditForAction(action))
 }
 
 func auditForAction(action planner.Action) store.AuditEntry {

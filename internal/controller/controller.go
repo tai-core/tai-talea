@@ -244,6 +244,19 @@ func (c *Controller) CallTimeout() time.Duration { return c.cfg.Controller.CallT
 // CallTimeout: that bounds one HTTP call, this bounds a multi-minute startup.
 func (c *Controller) StartTimeout() time.Duration { return c.cfg.Controller.StartTimeout.Duration() }
 
+// defaultStartParallelism is how many services may load at once when the
+// configuration does not say. Four covers one full generation of a small pool
+// without letting a large one load every worker at the same time.
+const defaultStartParallelism = 4
+
+// StartParallelism is how many SGLang services the control plane loads at once.
+func (c *Controller) StartParallelism() int {
+	if limit := c.cfg.Controller.MaxConcurrentStarts; limit > 0 {
+		return limit
+	}
+	return defaultStartParallelism
+}
+
 func (c *Controller) callContext(parent context.Context) (context.Context, context.CancelFunc) {
 	timeout := c.CallTimeout()
 	if timeout <= 0 {

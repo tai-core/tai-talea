@@ -108,6 +108,21 @@ type ControllerConfig struct {
 	// takes minutes, so this is deliberately not call_timeout: that bounds one
 	// HTTP call, this bounds the whole startup.
 	StartTimeout Duration `yaml:"start_timeout" json:"start_timeout"`
+	// MaxConcurrentStarts bounds how many SGLang services may load at once.
+	//
+	// A start blocks until the model answers, so applying them one after another
+	// makes a cold pool cost the sum of the loads: four workers at 3 min 40 s
+	// each is 15 minutes before the deployment is whole, and the operator sees
+	// a pool that reports "up" for a quarter of it. The starts are independent -
+	// a different instance, its own endpoint, its own operation lock - so they
+	// run together.
+	//
+	// The bound exists because a large pool must not load every worker at once:
+	// the workers of one machine share its page cache and its host memory
+	// bandwidth, and loading all of them simultaneously makes each slower
+	// without making the pool ready sooner. Zero means the default of 4; set 1
+	// to restore the previous serial behaviour.
+	MaxConcurrentStarts int `yaml:"max_concurrent_starts" json:"max_concurrent_starts"`
 	// ProvisionTimeout bounds one end-to-end on-demand creation: create, wait
 	// for the container to reach RUNNING, install, hand over. It exists
 	// separately from start_timeout because a partner can queue a creation
@@ -587,6 +602,9 @@ func (c Config) Validate() error {
 	}
 	if c.Controller.StartRetryMaxRearms < 0 {
 		return errors.New("controller.start_retry_max_rearms must not be negative")
+	}
+	if c.Controller.MaxConcurrentStarts < 0 {
+		return errors.New("controller.max_concurrent_starts must not be negative")
 	}
 	if strings.TrimSpace(c.Controller.ModelID) == "" {
 		return errors.New("controller.model_id is required")

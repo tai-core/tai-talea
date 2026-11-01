@@ -33,6 +33,11 @@ controller:
   # plus the FlashInfer first compile. 20 m leaves room for a cold Triton cache.
   start_timeout: 20m
   provision_timeout: 45m
+  # Four workers load together instead of one after another. Serial, a cold pool
+  # cost the sum of the loads: measured 3 min 40 s each, 15 minutes before the
+  # deployment was whole. The limit stays at four rather than unbounded because
+  # the two workers on one node share its page cache and host memory bandwidth.
+  max_concurrent_starts: 4
   bootstrap_token: __BOOTSTRAP_TOKEN__
   # What clients ask for by name. It must equal kubernetes.model_support below
   # and --served-model-name in the extra arguments, or the Router ends up with
