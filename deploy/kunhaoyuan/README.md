@@ -27,7 +27,7 @@ client ── NodePort 31280 ──> talea-router (8000 serving, 30001 control)
   ```
 - Weights at `/data02/model-weight/GLM-5.3-Flash-NVFP4` on both nodes, and a
   writable `/data02` for the compile cache and the token log.
-- Images `talea-worker-0.9.2`, `talea-control-0.9.3`, and `glm-5.3-flash-ailog2`
+- Images `talea-worker-0.9.2`, `talea-control-0.9.8`, and `glm-5.3-flash-ailog2`
   (the last is the official SGLang image with our Router binary appended as one
   extra layer; the Router runs from it, the control plane from its own tag).
 
@@ -47,7 +47,7 @@ repository is public, and the bootstrap token also has to appear literally in th
 worker probe headers, where Kubernetes offers no secret reference. Re-rendering
 reads the same file, so a re-apply does not by itself restart anything.
 
-## Three things that look fine and are not
+## What looks fine and is not
 
 **Pod readiness is not model readiness.** The worker's readiness probe is
 `/bootstrap/health`, and that endpoint answers 200 with
@@ -89,6 +89,20 @@ rather than respected — the log is the billing record, and a client that opts 
 makes the operator pay for traffic it cannot account for. `ops/check-ailog.py`
 still counts token-less lines so the gap would reappear visibly if the flag were
 ever dropped.
+
+**A control plane that cannot apply the snapshot looks like one that agrees with
+it.** Reading the partner's snapshot is the only stage of a pull round that
+reported its own failures. Everything after it — applying an event, the
+ownership check, the commit — returned its error to a caller that logged it at
+debug and told nobody. That is not one lost round: the snapshot version stays
+where it was, so the next round re-diffs the same baseline into the same events
+and fails the same way, for as long as the cause lasts. A single instance the
+store refuses to apply therefore freezes capacity reconciliation for good, and
+the only trace is a `partner_sync_success_timestamp` that stopped advancing —
+which reads as "nothing changed", exactly like health. Those failures are now
+counted, logged and alerted through the same path as an unreachable partner,
+from one deferred hook rather than at each return, so a stage added later cannot
+be the one that forgets.
 
 ## Nightly start and stop
 
