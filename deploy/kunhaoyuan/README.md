@@ -123,8 +123,15 @@ serving, with all four workers loading together. The same measurement read
 a worker still takes 3 min 40 s (`service_starting` to `service_serving`). Both
 ends of the comparison were run within the hour, so this run had a warm page
 cache where the 15 min one was recorded cold; a cold one would add the same
-delay to all four loads rather than multiply it. What is left of the delay is
-described under known gaps.
+delay to all four loads rather than multiply it.
+
+Two later runs of the same script read 3 min 47 s (0.9.5) and 7 min 24 s (0.9.6)
+— the second is not a regression but the failure mode described under known
+gaps: the prepare step finished 20 s apart for the two pairs, and the planner
+round that saw only the first pair waited out their whole load before launching
+the other two. Watch the `idle=` count in `planner round applied` rather than the
+wall clock; a single wave is 3 min 45 s, and anything longer means the instance
+set was split across rounds.
 
 ### What `down` does before it scales
 
@@ -232,18 +239,25 @@ lines have aged out of the window.
   08:00 the cards have to come back. Raising the ceiling only moves the problem;
   the durable fix is on the worker side, where stop should refuse to return while
   `running_req > 0`.
-- **A start still blocks the reconcile loop, though no longer the other starts.**
-  The four loads now overlap — dispatched 3.9 ms apart, done 3 min 46.5 s later
-  instead of one every 3 min 40 s — but `ReconcileOnce` is still one goroutine
-  that walks the instances, and a `StartService` blocks its round for the whole
-  load. What that costs is visible in a cold start: pull snapshots that land in
-  the window are answered `PENDING, instance lifecycle operation is busy`, so no
-  other instance's `DRAINING` completion or `LOST` detection is applied until the
-  load ends, and a long load trips `lease_expiring_soon` because the lease
-  observation for that instance is not persisted while it is busy. The window is
-  now one load long rather than four, which is why the warnings arrive at the end
-  of a cold start instead of throughout it. Fixing it properly means driving
-  instances independently instead of in a round.
+- **A start no longer blocks the control plane; it still blocks the planner round
+  that launched it.** Reconcile, the pull sweep and LOST detection are free now.
+  A 0.9.6 cold start measured `operation is busy` = 0, `lease_expiring_soon` = 0,
+  and every pull round applied all four of its events while the workers were
+  loading. What remains is `applyStarts`: `Rebalance` waits for the starts it
+  dispatched, so a worker that becomes ready twenty seconds after its siblings
+  waits a whole load for the next round. A cold start shows it whenever the
+  prepare step finishes unevenly — 05:43:56 for two workers and 05:44:16 for the
+  other two, `idle=2 actions=2` in the round between them, second pair dispatched
+  at 05:47:47: 7 min 24 s wall clock, where one wave is 3 min 45 s. The fix is to
+  bound start concurrency on the controller rather than on a single round, so a
+  round can return while its starts are still in flight.
+
+  The `lease_expiring_soon` warning this section used to attribute to the load
+  had a different cause and is fixed in 0.9.6: the start persisted the whole row
+  it had read before the load, which erased the observations the pull loop
+  recorded meanwhile. The column itself was never stale — it went 05:36:23 ->
+  05:32:53 -> 05:36:53 across the serving transition. An observation that moves
+  backwards is now refused at the store.
 - `--force-stream-usage` means a client cannot get a stream without the trailing
   usage chunk. That is deliberate, but it is a behaviour a client could notice.
 - The control plane's instance store is an `emptyDir`, so rolling `talea-control`

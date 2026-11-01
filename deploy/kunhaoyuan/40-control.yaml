@@ -41,7 +41,7 @@ spec:
         - name: harbor-cred
       containers:
         - name: control
-          image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:talea-control-0.9.4
+          image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:talea-control-0.9.6
           imagePullPolicy: Always
           command: ["/opt/tai-talea/bin/tai-talea"]
           args:
