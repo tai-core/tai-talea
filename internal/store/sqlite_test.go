@@ -433,3 +433,74 @@ func TestTouchInstanceObservationWritesOnlyTheObservation(t *testing.T) {
 		t.Fatalf("unknown instance: touched=%v err=%v", touched, err)
 	}
 }
+
+// A start holds the instance for the whole model load. While it does, the pull
+// loop keeps recording that the container is still there, and those writes
+// deliberately bypass the instance lock. The start then finishes and persists a
+// whole row it read before the load, which is how a worker that answered every
+// poll ended up looking minutes unobserved the moment it started serving.
+func TestAWholeRowTransitionCannotEraseTheObservationItOutran(t *testing.T) {
+	persistence := newStore(t)
+	ctx := context.Background()
+	loadedAt := time.Now().UTC().Add(-4 * time.Minute)
+	instance := domain.Instance{
+		ID: "container-1", PartnerID: "partner-a", Endpoint: "http://10.0.0.1:8080",
+		LeaseID: "lease-1", InstanceState: domain.InstanceAllocating,
+		ServiceState: domain.ServiceNone, LeaseUpdatedAt: loadedAt, LastSeenAt: loadedAt,
+	}
+	if err := persistence.ApplyTransition(ctx, store.Transition{InstanceID: instance.ID, Next: instance}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	instance.InstanceState = domain.InstancePreparing
+	if err := persistence.ApplyTransition(ctx, store.Transition{
+		InstanceID: instance.ID, Next: instance, ExpectInstanceState: domain.InstanceAllocating,
+	}); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	// The start's own copy of the row, taken before the load.
+	stale, err := persistence.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatalf("read before the load: %v", err)
+	}
+
+	// Observations land while the load is in flight.
+	var latest time.Time
+	for i := 1; i <= 4; i++ {
+		latest = loadedAt.Add(time.Duration(i) * time.Minute)
+		if touched, err := persistence.TouchInstanceObservation(ctx, instance.ID, latest, latest.Add(time.Second)); err != nil || !touched {
+			t.Fatalf("observation %d: touched=%v err=%v", i, touched, err)
+		}
+	}
+
+	// The load finishes and the start walks the service graph, each step
+	// writing back the copy it took before the load.
+	for _, next := range []domain.ServiceState{
+		domain.ServiceStarting, domain.ServiceHealthy, domain.ServiceRegistering, domain.ServiceServing,
+	} {
+		step := stale
+		step.InstanceState = domain.InstanceIdle
+		step.ServiceState = next
+		step.Role = domain.RoleRegular
+		if err := persistence.ApplyTransition(ctx, store.Transition{InstanceID: instance.ID, Next: step}); err != nil {
+			t.Fatalf("serving step %s: %v", next, err)
+		}
+		if got, err := persistence.GetInstance(ctx, instance.ID); err != nil {
+			t.Fatalf("get after %s: %v", next, err)
+		} else if !got.LeaseUpdatedAt.Equal(latest) {
+			t.Fatalf("step %s erased the observations the load outran: lease moved back to %s, want %s",
+				next, got.LeaseUpdatedAt, latest)
+		}
+	}
+	after, err := persistence.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatalf("get after serving: %v", err)
+	}
+	if after.LastSeenAt.Before(latest) {
+		t.Fatalf("last_seen moved back to %s, want at least %s", after.LastSeenAt, latest)
+	}
+	// The state itself must still be the one the start asked for: this guard
+	// only preserves the observation columns.
+	if after.InstanceState != domain.InstanceIdle || after.ServiceState != domain.ServiceServing {
+		t.Fatalf("the transition did not land: %s/%s", after.InstanceState, after.ServiceState)
+	}
+}

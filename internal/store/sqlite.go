@@ -618,6 +618,21 @@ func (s *SQLiteStore) ApplyTransition(ctx context.Context, transition Transition
 			return domain.NewViolation(verdict.Code, verdict.Severity, "refuse %s -> %s/%s/%s: %s",
 				current, next.InstanceState, next.ServiceState, next.Role, verdict.Reason)
 		}
+		// The partner observation is written by a path that deliberately does
+		// not take the instance lock (Controller.observeOnly), so it keeps
+		// landing while a start owns the instance. A transition built from a
+		// copy read before that start carries the older value and, because this
+		// writes the whole row, erases every observation recorded meanwhile.
+		// The lease then reads as minutes stale the instant the worker starts
+		// serving, and lease_expiring_soon fires for a container the partner
+		// was reporting the entire time. An observation that moves backwards is
+		// never information, so it is not persisted.
+		if next.LeaseUpdatedAt.Before(current.LeaseUpdatedAt) {
+			next.LeaseUpdatedAt = current.LeaseUpdatedAt
+		}
+		if next.LastSeenAt.Before(current.LastSeenAt) {
+			next.LastSeenAt = current.LastSeenAt
+		}
 		if err := updateInstanceTx(ctx, tx, current, next); err != nil {
 			return err
 		}
