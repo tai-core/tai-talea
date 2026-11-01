@@ -612,7 +612,9 @@ func (c *Controller) RunPull(ctx context.Context, schedule PullSchedule) {
 			return
 		case <-ticker.C:
 			if err := c.PullOnce(ctx, schedule); err != nil {
-				// Plan already recorded the failure metric and alert.
+				// The round recorded this where it happened: the counter, the
+				// error log and the alert all came from Puller.RecordFailure.
+				// This line is only a breadcrumb for a run with debug logging on.
 				c.log().Debug("pull round incomplete", "partner_id", schedule.Adapter.PartnerID(), "error", err.Error())
 			}
 		}

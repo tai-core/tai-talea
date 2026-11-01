@@ -17,7 +17,7 @@ import (
 // pullAuthoritative reconciles a validated snapshot with current intent, not
 // only the previous snapshot. This repairs a missed Push, a reverted snapshot,
 // and an unchanged snapshot after state drift.
-func (c *Controller) pullAuthoritative(ctx context.Context, schedule PullSchedule) error {
+func (c *Controller) pullAuthoritative(ctx context.Context, schedule PullSchedule) (err error) {
 	value, _ := c.pullOperations.LoadOrStore(schedule.Adapter.PartnerID(), &sync.Mutex{})
 	lock := value.(*sync.Mutex)
 	lock.Lock()
@@ -27,8 +27,22 @@ func (c *Controller) pullAuthoritative(ctx context.Context, schedule PullSchedul
 	observed := c.now()
 	plan, err := schedule.Puller.Plan(ctx, schedule.Adapter)
 	if err != nil {
-		return err
+		return err // Plan recorded it.
 	}
+	// Everything past this point is what decides whether the authoritative view
+	// moves forward, and a failure here is not a lost round: the snapshot
+	// version stays where it was, so the next round re-diffs the same baseline
+	// into the same events and fails the same way. One instance that can never
+	// be applied therefore wedges capacity reconciliation for good. That used to
+	// be told to nobody - each path returned its error to a caller that logged
+	// it at debug - so a wedged control plane and a healthy one looked alike.
+	// Recording from one deferred hook instead of at each return means a path
+	// added later cannot be the one that forgets.
+	defer func() {
+		if err != nil {
+			schedule.Puller.RecordFailure(ctx, schedule.Adapter.PartnerID(), err)
+		}
+	}()
 	instances, err := c.store.ListInstances(ctx)
 	if err != nil {
 		return err

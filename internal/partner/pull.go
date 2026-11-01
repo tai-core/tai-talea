@@ -82,7 +82,7 @@ func (p *Puller) Plan(ctx context.Context, adapter PartnerAdapter) (PullPlan, er
 	partnerID := adapter.PartnerID()
 	snapshot, err := CollectSnapshot(ctx, adapter)
 	if err != nil {
-		p.recordFailure(ctx, partnerID, err)
+		p.RecordFailure(ctx, partnerID, err)
 		return PullPlan{}, err
 	}
 	if p.Metrics != nil {
@@ -185,7 +185,15 @@ func (p *Puller) Commit(ctx context.Context, plan PullPlan) error {
 	return nil
 }
 
-func (p *Puller) recordFailure(ctx context.Context, partnerID string, cause error) {
+// RecordFailure counts one failed round, and is loud about it: the metric, the
+// error log and the alert all come from here.
+//
+// Plan calls it for a snapshot it could not read. The caller calls it for every
+// failure that happens after Plan - an event that cannot be applied, an
+// ownership collision, a commit that does not land - because those leave the
+// authoritative view exactly where the outage does, and nothing else would say
+// so.
+func (p *Puller) RecordFailure(ctx context.Context, partnerID string, cause error) {
 	p.mu.Lock()
 	p.failures[partnerID]++
 	count := p.failures[partnerID]
