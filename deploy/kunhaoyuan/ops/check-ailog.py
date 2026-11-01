@@ -29,6 +29,7 @@ counts = {
     "with_tokens": 0,
     "stream": 0,
     "stream_without_tokens": 0,
+    "refused_stream": 0,
 }
 
 
@@ -159,7 +160,20 @@ def main(path):
             if inner.get("response_type") == "stream":
                 counts["stream"] += 1
                 if len(present) < 3:
-                    counts["stream_without_tokens"] += 1
+                    # A refusal never had a usage to report: the pool limit
+                    # answers 429 and an empty pool answers 503 before any
+                    # generation starts, and the spec says to leave the token
+                    # fields out rather than write zeros. Only a 2xx stream with
+                    # no usage is evidence that capture is broken.
+                    code = outer.get("response_code")
+                    try:
+                        code = int(code)
+                    except (TypeError, ValueError):
+                        code = None
+                    if code is not None and 200 <= code < 300:
+                        counts["stream_without_tokens"] += 1
+                    else:
+                        counts["refused_stream"] += 1
 
             # 10. unknown usage must be omitted, never zero-filled
             if len(present) == 3:
@@ -171,12 +185,12 @@ def main(path):
     print("inner ai_log parsed .... %d" % counts["inner_parsed"])
     print("non-AI lines ........... %d" % counts["non_ai"])
     print("lines with a token set . %d" % counts["with_tokens"])
-    print("stream lines ........... %d (of which without tokens: %d)"
-          % (counts["stream"], counts["stream_without_tokens"]))
+    print("stream lines ........... %d (of which 2xx without tokens: %d, refused: %d)"
+          % (counts["stream"], counts["stream_without_tokens"], counts["refused_stream"]))
     print("unique request ids ..... %d" % len(seen_request_ids))
 
     if counts["stream_without_tokens"]:
-        print("\nWARNING: %d streamed request(s) carry no usage. The Router is run"
+        print("\nWARNING: %d answered 2xx stream(s) carry no usage. The Router is run"
               % counts["stream_without_tokens"])
         print("         with --force-stream-usage, so this should not happen for")
         print("         traffic that went through it: check whether these lines")
