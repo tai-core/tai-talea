@@ -59,6 +59,11 @@ controller:
   # /health_generate probe misses, and acting on the first miss reloads every
   # GPU on the node.
   health_failure_threshold: 3
+  # Consecutive misses before an instance leaves the rotation. The probe queues
+  # behind the batch it measures, so one miss means "busy"; removing on the
+  # first one turned a burst of load into a whole-pool 503. Must not exceed
+  # health_failure_threshold.
+  readiness_failure_threshold: 2
   # Shared secret of the bootstrap interface. The container must carry the same
   # value in TAI_TALEA_BOOTSTRAP_TOKEN; 九章 CCI lets you set environment
   # variables when creating the instance. The bootstrap refuses to start

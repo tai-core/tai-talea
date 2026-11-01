@@ -179,6 +179,20 @@ func (c *Controller) HealthFailureThreshold() int {
 	return 1
 }
 
+// ReadinessFailureThreshold is how many consecutive failed probes take a
+// running instance out of rotation. It is deliberately separate from
+// HealthFailureThreshold and lower than it: leaving the rotation is the cheap,
+// reversible consequence, so it must still happen within one reconcile
+// interval, while condemning the model is neither. A non-positive
+// configuration means one, which is the behaviour that turned a burst of load
+// into a whole-pool 503.
+func (c *Controller) ReadinessFailureThreshold() int {
+	if threshold := c.cfg.Controller.ReadinessFailureThreshold; threshold > 0 {
+		return threshold
+	}
+	return 1
+}
+
 // removalContext bounds RemoveStaleMembership, the abnormal role-recovery path.
 // The Router drops a membership through its own asynchronous workflow, whose
 // budget runs to minutes; the ordinary call timeout is seconds, so using it

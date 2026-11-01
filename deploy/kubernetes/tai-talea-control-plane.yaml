@@ -63,7 +63,15 @@ spec:
       # ended a service that was serving traffic and made the next attempt
       # reload every GPU on the node, so a model is now condemned only after
       # controller.health_failure_threshold consecutive misses (default 3) and
-      # is merely taken out of rotation before that. The same version gives the
+      # is merely taken out of rotation before that. Taking it out on the *first*
+      # miss is its own failure mode, measured later: the probe is a generation
+      # and queues behind the batch it measures, so a miss means "busy", and
+      # removing on the first one removes instances in proportion to load. At
+      # 192 concurrent all four went at once and the Router answered 503 to
+      # everything for as long as the burst lasted. Removal from rotation is now
+      # gated separately, by readiness_failure_threshold (default 2), so the
+      # cheap reversible consequence still lands within one reconcile interval
+      # while a single queued probe no longer empties the pool. The same version gives the
       # Router's asynchronous membership removal its own budget
       # (router.removal_timeout, default 8m) instead of borrowing call_timeout,
       # which could only ever observe its own deadline, and makes the bootstrap

@@ -378,19 +378,23 @@ lines have aged out of the window.
 
 ## Left as known gaps
 
-- **One probe miss takes an instance out of rotation, and load causes probe
+- **One probe miss took an instance out of rotation, and load caused probe
   misses.** `settleService` probes the model with `/health_generate` behind a 2 s
   timeout; that endpoint is a generation, so it queues behind the batch, and it
-  already costs ~1.0 s idle on this pool. The first miss calls `closeReadiness`
-  and the Router stops routing to the instance; `HealthFailureThreshold` only
-  gates condemnation. Under sustained load all four can miss in the same
-  reconcile round, which is what produced both 503 bursts. The options, none of
-  them free: require N consecutive misses before closing readiness (availability
-  wins, a genuinely dead model keeps receiving traffic for N rounds); probe
-  something that does not queue, which means giving up the "is the model actually
-  generating" property that makes this probe worth having; or raise the timeout
-  above observed queueing, which only moves the load at which it breaks. The
-  measured numbers to decide with are in `## Serving baseline`.
+  already costs ~1.0 s idle on this pool. The first miss called `closeReadiness`
+  and the Router stopped routing to the instance; `HealthFailureThreshold` gates
+  only condemnation. Under sustained load all four could miss in the same
+  reconcile round, which is what produced both 503 bursts.
+
+  Removal is now gated by `controller.readiness_failure_threshold` (default 2),
+  separate from `health_failure_threshold` (3), and the config refuses a
+  readiness threshold above the condemnation one. Two rounds still removes a
+  genuinely wedged instance within one reconcile interval (~10 s), and a burst
+  no longer empties the routable set. The probe itself is unchanged: it is still
+  a real `/health_generate`, because the property worth having is "the model
+  actually generates", and the cheap alternative — the Router's own
+  `/server_info` check — is already running and already cannot see a wedged
+  model.
 - **Nothing sheds load above 4 × `max_running_requests`.** 192 concurrent is the
   pool's ceiling; past it the Router accepts everything and sglang queues
   everything, so p95 grows without bound and no caller is told to back off.

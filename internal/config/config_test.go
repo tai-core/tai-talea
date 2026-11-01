@@ -234,6 +234,13 @@ func TestValidationRejectsIncompleteConfiguration(t *testing.T) {
 		"missing model":            func(c *config.Config) { c.Controller.ModelID = "" },
 		"bad planner gear":         func(c *config.Config) { c.Planner.Gear = "3:1" },
 		"no reconcile loop":        func(c *config.Config) { c.Controller.ReconcileInterval = 0 },
+		// Leaving the rotation must happen no later than condemning the model,
+		// or the controller would keep routing to an instance it has already
+		// decided to restart.
+		"readiness after condemnation": func(c *config.Config) {
+			c.Controller.ReadinessFailureThreshold = c.Controller.HealthFailureThreshold + 1
+		},
+		"readiness threshold zero": func(c *config.Config) { c.Controller.ReadinessFailureThreshold = 0 },
 		"no sqlite path":           func(c *config.Config) { c.Storage.SQLitePath = "" },
 		"incomplete profile":       func(c *config.Config) { c.ImageProfile.Wheelhouse = "" },
 		"duplicate partner":        func(c *config.Config) { c.Partners = append(c.Partners, c.Partners[0]) },

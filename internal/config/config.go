@@ -103,6 +103,25 @@ type ControllerConfig struct {
 	// probe into a failed start, and a failed start into a full multi-GPU
 	// reload of a model that was serving.
 	HealthFailureThreshold int `yaml:"health_failure_threshold" json:"health_failure_threshold"`
+	// ReadinessFailureThreshold is how many consecutive failed probes must
+	// accumulate before a running instance is taken out of rotation. It is the
+	// routing half of HealthFailureThreshold, and the two are separate because
+	// the two mistakes are not equally expensive.
+	//
+	// Condemning a model that was serving costs a full multi-GPU reload, so
+	// condemnation waits for HealthFailureThreshold rounds. Taking an instance
+	// out of rotation costs nothing when the instance really is broken, but the
+	// probe is a /health_generate call that queues behind the batch it is
+	// measuring, so a miss is evidence that the instance is *busy* - the one
+	// state in which it should keep receiving traffic. Removing on the first
+	// miss therefore removes instances in proportion to load, and when all four
+	// miss in the same round the Router has nothing routable and answers 503 to
+	// every caller. That is the 192-concurrent outage: 1,098 refusals in two
+	// windows, both inside a cluster of probe misses.
+	//
+	// Two rounds still removes a wedged instance within one reconcile interval,
+	// and no longer turns a burst into a whole-pool outage.
+	ReadinessFailureThreshold int `yaml:"readiness_failure_threshold" json:"readiness_failure_threshold"`
 	// StartTimeout bounds how long the control plane waits for a freshly
 	// started SGLang to answer its health check. Loading a model legitimately
 	// takes minutes, so this is deliberately not call_timeout: that bounds one
@@ -480,6 +499,10 @@ func Default() Config {
 			OperationRetry:         Duration(15 * time.Second),
 			CallTimeout:            Duration(10 * time.Second),
 			HealthFailureThreshold: 3,
+			// One round is too eager: the probe is a /health_generate call
+			// that queues behind the batch, so a single miss is what a busy
+			// instance looks like, not what a broken one looks like.
+			ReadinessFailureThreshold: 2,
 			StartTimeout:           Duration(10 * time.Minute),
 			ProvisionTimeout:       Duration(45 * time.Minute),
 			LeaseWarning:           Duration(120 * time.Second),
@@ -573,6 +596,17 @@ func (c Config) Validate() error {
 	}
 	if c.Controller.HealthFailureThreshold <= 0 {
 		return errors.New("controller.health_failure_threshold must be positive")
+	}
+	if c.Controller.ReadinessFailureThreshold <= 0 {
+		return errors.New("controller.readiness_failure_threshold must be positive")
+	}
+	if c.Controller.ReadinessFailureThreshold > c.Controller.HealthFailureThreshold {
+		// The two consequences are ordered: leave the rotation first, condemn
+		// later. Allowing the reverse would keep routing to an instance the
+		// controller has already decided to restart.
+		return fmt.Errorf(
+			"controller.readiness_failure_threshold (%d) must not exceed health_failure_threshold (%d)",
+			c.Controller.ReadinessFailureThreshold, c.Controller.HealthFailureThreshold)
 	}
 	if c.Controller.StartTimeout.Duration() <= 0 {
 		return errors.New("controller.start_timeout must be positive")

@@ -391,20 +391,31 @@ func (c *Controller) settleService(ctx context.Context, instance domain.Instance
 	if healthErr != nil || !health.Healthy() {
 		// The bootstrap answers "degraded" whenever a single /health_generate
 		// call misses - during warm-up, or under a burst - and Healthy() only
-		// accepts "ok". A running model that misses one probe is therefore not
-		// yet a broken one, and condemning it here is expensive: failStart
-		// ends the service, and the next attempt reloads every GPU on the
-		// node. Take the instance out of rotation at once, but let the failure
-		// persist across several rounds before acting on it.
+		// accepts "ok". That probe is a generation, so it queues behind the
+		// batch it is measuring: a miss is what a *busy* instance looks like.
+		//
+		// Both consequences of a miss are therefore gated on a streak, and they
+		// are gated separately. Leaving the rotation is cheap and reversible, so
+		// it happens at readiness_failure_threshold; condemning the model costs
+		// a full multi-GPU reload, so it waits for health_failure_threshold.
+		// Closing the rotation on the first miss is what made a burst of load
+		// remove all four instances at once: with nothing routable the Router
+		// answers 503 to every caller, which is an outage produced entirely by
+		// traffic.
 		streak := c.noteHealthFailure(instance.ID)
-		if err := c.closeReadiness(ctx, instance); err != nil {
-			return "", err
+		if streak >= c.ReadinessFailureThreshold() {
+			if err := c.closeReadiness(ctx, instance); err != nil {
+				return "", err
+			}
 		}
 		if streak < c.HealthFailureThreshold() {
-			c.log().Warn("model health probe failed; instance taken out of rotation",
+			c.log().Warn("model health probe failed",
 				"instance_id", instance.ID, "role", string(instance.Role),
 				"status", health.Status, "error", healthErr,
-				"streak", streak, "threshold", c.HealthFailureThreshold())
+				"streak", streak,
+				"readiness_threshold", c.ReadinessFailureThreshold(),
+				"condemn_threshold", c.HealthFailureThreshold(),
+				"out_of_rotation", streak >= c.ReadinessFailureThreshold())
 			return "unhealthy", nil
 		}
 		return "", c.failStart(ctx, instance, &store.Operation{OperationID: lifecycleOperationID(instance, store.OpStart),

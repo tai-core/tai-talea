@@ -8,12 +8,19 @@ import (
 
 // The container bootstrap answers "degraded" - HTTP 200 with status
 // "degraded" - whenever a single /health_generate probe misses, which happens
-// during warm-up and under a burst of load. Healthy() only accepts "ok", so
-// treating the first miss as proof of a broken model ends a service that was
-// serving traffic, and the next attempt reloads every GPU on the node. A miss
-// must only take the instance out of rotation; the model is condemned only
-// after the failure persists past health_failure_threshold.
-func TestOneMissedProbeOnlyLeavesTheRotation(t *testing.T) {
+// during warm-up and under a burst of load. That probe is itself a generation,
+// so it queues behind the batch it is measuring: a miss is what a *busy*
+// instance looks like.
+//
+// Leaving the rotation on the first miss therefore removes instances in
+// proportion to load. Measured on kunhaoyuan at 192 concurrent: 1,098 requests
+// refused with no_available_workers in two windows, both of which sit inside a
+// cluster of "model health probe failed" rounds - all four instances out of the
+// rotation at once, so the Router had nothing routable at all. One miss must
+// leave the instance in rotation; readiness closes at
+// readiness_failure_threshold, and the model is condemned only after the
+// failure persists past health_failure_threshold.
+func TestOneMissedProbeKeepsTheInstanceInRotation(t *testing.T) {
 	h := newHarness(t)
 	h.handle(h.addedEvent("node", h.bootstrap.Endpoint(), "lease", h.clock.Now()))
 	if err := h.ctrl.StartService(t.Context(), "node", domain.RolePrefill); err != nil {
@@ -23,6 +30,9 @@ func TestOneMissedProbeOnlyLeavesTheRotation(t *testing.T) {
 		t.Fatal("not serving before the probe starts missing")
 	}
 	workerID := h.instance("node").RouterWorkerID
+	if h.ctrl.ReadinessFailureThreshold() < 2 {
+		t.Fatalf("this test needs a readiness threshold above one, got %d", h.ctrl.ReadinessFailureThreshold())
+	}
 
 	h.bootstrap.setHealthStatus("degraded")
 	report, err := h.ctrl.ReconcileOnce(t.Context())
@@ -35,8 +45,8 @@ func TestOneMissedProbeOnlyLeavesTheRotation(t *testing.T) {
 	if state := h.instance("node").ServiceState; state != domain.ServiceServing {
 		t.Fatalf("one missed probe ended the service: %s", state)
 	}
-	if h.router.readinessOf(workerID) != "unavailable" {
-		t.Fatal("an instance that misses its probe must leave the rotation")
+	if got := h.router.readinessOf(workerID); got != "ready" {
+		t.Fatalf("readiness=%s, want ready: one queued probe must not remove a busy instance from the rotation", got)
 	}
 
 	// A probe that answers again clears the streak, so the next miss counts
@@ -47,6 +57,42 @@ func TestOneMissedProbeOnlyLeavesTheRotation(t *testing.T) {
 	}
 	if _, ok := h.ctrl.healthFailures.Load("node"); ok {
 		t.Fatal("a recovered probe must clear the failure streak")
+	}
+}
+
+func TestConsecutiveMissesTakeTheInstanceOutOfRotation(t *testing.T) {
+	h := newHarness(t)
+	h.handle(h.addedEvent("node", h.bootstrap.Endpoint(), "lease", h.clock.Now()))
+	if err := h.ctrl.StartService(t.Context(), "node", domain.RolePrefill); err != nil {
+		t.Fatal(err)
+	}
+	workerID := h.instance("node").RouterWorkerID
+
+	threshold := h.ctrl.ReadinessFailureThreshold()
+	if threshold < 2 {
+		t.Fatalf("this test needs a readiness threshold above one, got %d", threshold)
+	}
+
+	h.bootstrap.setHealthStatus("degraded")
+	for round := 1; round <= threshold; round++ {
+		if _, err := h.ctrl.ReconcileOnce(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		want := "unavailable"
+		if round < threshold {
+			want = "ready"
+		}
+		if got := h.router.readinessOf(workerID); got != want {
+			t.Fatalf("round %d: readiness=%s, want %s", round, got, want)
+		}
+	}
+
+	// Removal from rotation is the cheap consequence; the model itself is only
+	// condemned at health_failure_threshold, which is deliberately higher.
+	if threshold < h.ctrl.HealthFailureThreshold() {
+		if state := h.instance("node").ServiceState; state != domain.ServiceServing {
+			t.Fatalf("service_state=%s after %d misses, want SERVING: removal is not condemnation", state, threshold)
+		}
 	}
 }
 

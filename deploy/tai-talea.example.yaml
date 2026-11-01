@@ -53,6 +53,14 @@ controller:
   # acting on the first miss ends a service that was serving traffic and
   # reloads every GPU on the node.
   health_failure_threshold: 3
+  # How many consecutive misses take a running instance out of rotation, which
+  # is the cheap and reversible half of the line above. It is separate because
+  # the probe is itself a generation: it queues behind the batch it measures, so
+  # a miss says the instance is busy, and removing on the first miss removes
+  # instances in proportion to load. When all of them go at once the Router has
+  # nothing routable and answers 503 to every caller. Must not exceed
+  # health_failure_threshold.
+  readiness_failure_threshold: 2
   # Waiting for a freshly started SGLang to answer health checks - model
   # loading takes minutes, so this is not call_timeout.
   start_timeout: 10m
