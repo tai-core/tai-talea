@@ -6,6 +6,11 @@ prefill/decode split. The sibling `deploy/kubernetes/` directory holds the
 nightshift (H100) shape; it uses hostNetwork and a hand-placed Router, which this
 namespace cannot do.
 
+For the operator-facing version of this — the daily commands, a symptom table,
+and the things that look like faults but are not — see
+`docs/kunhaoyuan-handover-2026-11-01.md` (written in Chinese, for the person who
+inherits the deployment).
+
 ```
 client ── NodePort 31280 ──> talea-router (8000 serving, 30001 control)
                                  ▲   │ PUT /state/workers/{id}
@@ -273,6 +278,13 @@ whole load before launching the other two. Watch the `idle=` count in `planner
 round applied` rather than the wall clock; a single wave is 3 min 45 s, and
 anything longer means the instance set was split across rounds.
 
+The last drill on 2026-11-01 was the first one on 0.9.10 and the one this
+deployment is handed over with: `down` at 18:50:01 finished at 18:50:25 (24 s,
+`pruned=4 kept=0 failed=0`, cards back in the scheduler), `up` at 18:51:19
+reached 4/4 `ready + live` at 18:56:5x — 5 min 50 s, all four loads in one wave.
+The same `up` run again afterwards, with the pool already serving, returns in
+29 s: it is idempotent, which is why a repeated cron firing is harmless.
+
 Starting the split on purpose — three workers, then the fourth 90 s later —
 reads 5 min 14 s to full capacity under 0.9.7, because the late worker loads
 underneath the first three instead of after them; the same sequence on the
@@ -295,20 +307,27 @@ Two details that cost real debugging:
 - `reason` on that endpoint is a closed enum (`manual` | `health_check`); a
   free-text explanation is answered with 422.
 
-The wait is driven by each worker's own `sglang:num_running_reqs` (plus
-`num_queue_reqs`), read from its Prometheus endpoint: that is the number of
-requests the scheduler is generating for, and it is zero only when nothing is
-generating. It has to be confirmed twice, two polls apart, because a request that
-finished between polls and one that has not started yet look the same in a single
-sample. `QUIESCE_TIMEOUT` (300 s) is a ceiling, not a delay — an idle pool drains
-in about 10 s.
+The wait reads the Router's own per-worker `load`, from the same `/workers`
+response the close step already used: that is the count of requests this Router
+has dispatched to the worker and not yet finished delivering, so a stream counts
+until its last byte. It is the only number here that separates a worker which is
+generating from one that is merely up. It has to be confirmed twice, two polls
+apart, because a request that finished between polls and one that has not started
+yet look the same in a single sample. `QUIESCE_TIMEOUT` (300 s) is a ceiling, not
+a delay — an idle pool drains in about 10 s, and one that is mid-generation
+drains as soon as the generation ends.
 
-The first version of this used the Router's `/get_load`, which counts only what
-is *queued* at a worker. Four concurrent generations read as zero load there, so
-the wait degenerated into a fixed 20 s pause, and any generation longer than that
-was still cut. Measured on 2026-11-01: 4096 tokens take about 16 s, which is
-exactly why the earlier four-request test appeared to pass — the requests
-happened to fit inside the pause. 8192 tokens do not.
+Two earlier versions of this wait were wrong in opposite directions, and both
+read as "working" on a quiet pool. The first read the Router's `/get_load`, which
+counts only what is *queued* at a worker: four concurrent generations read as
+zero there, so the wait degenerated into a fixed 20 s pause and a longer
+generation was still cut — 4096 tokens take about 16 s, which is why the first
+four-request test appeared to pass. The second read each worker's
+`sglang:num_running_reqs` from its own `/metrics`; that gauge does not exist in
+this sglang build (the endpoint exports prefill and decode token counters, cuda
+graph passes, `http_requests_total` and process stats), so every poll came back
+unreadable and the wait burned the full five minutes every night. A wait that
+cannot end early is not a wait, it is a fixed delay with a progress bar.
 
 `TALEA_SKIP_DRAIN=1` restores the previous scale-immediately behaviour.
 
