@@ -133,6 +133,11 @@ whole load before launching the other two. Watch the `idle=` count in `planner
 round applied` rather than the wall clock; a single wave is 3 min 45 s, and
 anything longer means the instance set was split across rounds.
 
+Starting the split on purpose — three workers, then the fourth 90 s later —
+reads 5 min 14 s to full capacity under 0.9.7, because the late worker loads
+underneath the first three instead of after them; the same sequence on the
+waiting version would need about 7 min 30 s.
+
 ### What `down` does before it scales
 
 `down` first sets each routable worker to `unavailable` in the Router
@@ -252,12 +257,27 @@ lines have aged out of the window.
   the round to the controller, so a round now returns after dispatch and leaves
   the instances it cannot serve to the next one.
 
-  The split has not been reproduced since: the 0.9.7 cold start came out as one
-  wave, `idle=4 actions=4` at 06:09:52, last worker serving at 06:13:39 — 3 min
-  47 s from dispatch, `up` 4 min 50 s end to end. So that path rests on a test
-  rather than on a measurement:
-  `TestARoundReturnsWhileItsStartIsStillLoading` parks a start in the gate and
-  fails if the round does not return, which it does against the waiting version.
+  The 0.9.7 cold start came out as one wave — `idle=4 actions=4` at 06:09:52,
+  last worker serving at 06:13:39, 3 min 47 s from dispatch, `up` 4 min 50 s end
+  to end — so the split had to be induced to check the fix. Three workers were
+  scaled up, and the fourth 90 s later. Round one saw three idle instances,
+  `idle=3 actions=3` at 06:18:42; round two ran at 06:20:12, while all three
+  starts it dispatched were still loading, and assigned the fourth
+  (`serving=3 idle=1 actions=1` — `serving` here counts instances that hold a
+  role, not instances whose service state is SERVING). The first three served at
+  06:22:22-27, the fourth at 06:23:56 — 3 min 44 s after its own dispatch. Full
+  capacity took 5 min 14 s where the waiting version would have needed about
+  7 min 30 s, because it could not have run the 06:20:12 round at all. The split
+  itself still happens: a round can only assign what is idle when it runs. What
+  it no longer does is cost a second load window; it costs only the offset
+  between the two rounds. `operation is busy`, `lease_expiring_soon`,
+  `deferred instances` and `skipped an assignment` were all 0 across the run,
+  which also means 0.9.6's store guard holds when a start lands three minutes
+  after its siblings'.
+
+  `TestARoundReturnsWhileItsStartIsStillLoading` keeps the unit-level reason:
+  it parks a start in the gate and fails if the round does not return, which it
+  does against the waiting version.
 
   The `lease_expiring_soon` warning this section used to attribute to the load
   had a different cause and is fixed in 0.9.6: the start persisted the whole row
