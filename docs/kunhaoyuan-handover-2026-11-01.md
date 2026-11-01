@@ -57,7 +57,31 @@ OpenAI 兼容端点、每天 20:00 自动上电、08:00 自动把卡还给调度
 - **talea-control**：把 Pod 变成"实例"、调 worker 的 `/bootstrap/*`、做健康探测
   与摘流。它不持卡，所以常驻。它的 store 是 `emptyDir`：**重启一次实例表就空了**，
   靠下一轮 pull 重新纳管。
-- **talea-w0..w3**：真正占卡的东西。一次冷启动约 3 分 40 秒把 40 GB 权重读进 16 张卡。
+- **talea-w0..w3**：真正占卡的东西。一次冷启动约 3 分 40 秒把 **190 GB** 权重
+  （`GLM-5.3-Flash-NVFP4`，38 个 safetensors 分片）读进 16 张卡。
+
+### 权重和镜像分别放在哪
+
+**权重不在镜像里，也不在共享存储里**——集群里没有任何 PVC/PV。
+
+| 东西 | 位置 | 说明 |
+| --- | --- | --- |
+| 权重 | 每台 GPU 节点本地盘 `hostPath: /data02/model-weight`，只读挂到容器 `/models` | 在用的是 `/models/GLM-5.3-Flash-NVFP4`，190 GB |
+| 编译缓存 | `hostPath: /data02/talea-glm53/cache` → `/root/.cache` | 跨重启复用，是 5 分钟冷启 vs 11 分钟的区别 |
+| worker 日志 | `hostPath: /data02/talea-glm53/logs` → `/logs` | |
+| token 日志 | `hostPath: /data02/talea-ai/logs` → `/logs`（router 专用） | |
+| 镜像 | registry `kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji` | 拉取凭证是 `imagePullSecrets: harbor-cred` |
+
+节点盘同型号但**各存一份**，不是共享盘（`/dev/mapper/vg4-lv_data02`，3.5 T）：
+
+| 节点 | 占用 | 其中在用的模型 |
+| --- | --- | --- |
+| aicube-7 | 2.1 T（剩 1.1 T） | 190 G |
+| aicube-8 | 1.8 T（剩 1.6 T） | 190 G |
+
+操作含义：**换节点 / 重装系统必须先把这 190 GB 放回 `/data02/model-weight/GLM-5.3-Flash-NVFP4`**，
+否则 Pod 会 `Ready`（readiness 打的是 bootstrap，不看模型）但一直加载不完；改权重两台都要改，
+不存在"改一处全都生效"。
 
 ---
 
