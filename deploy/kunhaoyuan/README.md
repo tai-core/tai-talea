@@ -155,6 +155,48 @@ Not verified: a real client across the public path. That needs a machine with
 `wg-quick` outside this network, and it is the one step no local test can stand
 in for.
 
+## Serving baseline
+
+Measured 2026-11-01 against `talea-router:8000` from a Pod in the same
+namespace: 4096-token prompts, exactly 256 generated tokens, seed 42, on the four
+TP4 workers with NEXTN speculation. Both lengths are construction rather than
+estimate — `ops/bench_serving.py` posts `input_ids` straight to `/generate` with
+`ignore_eos`, because `sglang.bench_serving --dataset-name random-ids` ignores
+`--random-range-ratio` and produced prompts averaging 2200 tokens and replies
+that stopped at EOS.
+
+| concurrency | requests | wall | output tok/s | input tok/s | TTFT mean | TTFT p50 | TTFT p95 | TPOT mean | E2E mean |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 8 | 7.7 s | 265 | 4,238 | 186 ms | 184 ms | 205 ms | 3.06 ms | 966 ms |
+| 16 | 64 | 8.1 s | 2,020 | 32,316 | 321 ms | 214 ms | 830 ms | 5.80 ms | 1,799 ms |
+| 64 | 256 | 24.1 s | 2,720 | 43,525 | 2,116 ms | 461 ms | 9,803 ms | 9.46 ms | 4,527 ms |
+| 128 | 512 | 32.1 s | 4,082 | 65,312 | 3,708 ms | 421 ms | 9,895 ms | 15.15 ms | 7,573 ms |
+
+Every request in those four rows answered 200. Read them as follows.
+
+- **4082 output tok/s at 128 concurrent is the peak measured so far**, and it is
+  in the same range as the 4156 recorded for this shape before the control plane
+  existed. A single stream decodes at 3.06 ms/token — 327 tok/s — with 186 ms to
+  first token, so the pool scales 15× in aggregate while each stream slows by 5×.
+- **The curve is not monotonic.** 64 concurrent is *slower* than 128, 2,720
+  against 4,082. At 64 the pool holds 16 requests per worker, too few to fill a
+  decode batch; the shape wants to be pushed to 32 per worker before its
+  throughput is measured.
+- **TTFT is bimodal.** At 128 concurrent the median is 421 ms while p95 is
+  9.9 s: one request in twenty waits about ten seconds. The plateau sits at the
+  same place at 64 concurrent (9.8 s), which is what a fixed timeout looks like
+  rather than a queue that grows with load — but nothing has confirmed which
+  timeout, and this is the first thing worth attacking.
+- **192 concurrent is not usable.** 768 requests at concurrency 192 returned
+  `ok=192, failed=576`, every failure a 503 whose body is
+  `{"error":{"code":"no_available_workers","message":"No available workers (all
+  circuits open or unhealthy)"}}`. That is the Router's circuit breaker: enough
+  requests time out under the overload to open the circuit on healthy workers,
+  after which it refuses everything until a 30 s health check closes it again. A
+  probe at the same concurrency right after reported 368 of 400 answered and 32
+  refused, so the recovery is gradual and the ceiling is a cliff rather than a
+  slope.
+
 ## Nightly start and stop
 
 ```bash
@@ -304,7 +346,19 @@ lines have aged out of the window.
 
 ## Left as known gaps
 
-- A generation that outlives `QUIESCE_TIMEOUT` (300 s, roughly 75k tokens) is
+- **The Router's circuit breaker turns an overload into an outage.** At 192
+  concurrent requests the pool answered 192 of 768; the rest were refused with
+  `code: no_available_workers`, which is the Router reporting that it has opened
+  the circuit on every worker. Workers were healthy throughout. Whatever the
+  trigger is — requests slow enough to count as failures, or the probe against
+  `/server_info` timing out while the queue is long — the first consequence is
+  that capacity disappears instead of degrading, and the recovery is not
+  instantaneous. The next steps are to find what is counted as a failure and to
+  decide whether an open circuit should back off per worker rather than refuse
+  the whole pool. Until then the deployment is safe below 128 concurrent and a
+  cliff above it; the token-bucket-shaped 9.9 s p95 TTFT is probably the same
+  cause seen from the other side.
+- **A generation that outlives `QUIESCE_TIMEOUT`** (300 s, roughly 75k tokens) is
   still cut by the Pod deletion, and the scale-down proceeds with a warning: at
   08:00 the cards have to come back. Raising the ceiling only moves the problem;
   the durable fix is on the worker side, where stop should refuse to return while
