@@ -274,6 +274,7 @@ kubectl -n kunhaoyuan logs deploy/talea-router  -f     # 请求级日志（每�
 | WireGuard 服务端私钥 | `/etc/wireguard/server.key` | `peers/<label>/client.conf` 含各客户端私钥 |
 | 镜像仓库 | `kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji` | n2 的 `/etc/hosts` 指 `10.163.118.121` |
 | 权重 | 两节点 `/data02/model-weight/GLM-5.3-Flash-NVFP4` | 节点本地盘 |
+| 客户端接入说明 + `local-1.conf`（含私钥） | 交接方机器 `C:\Users\Tkis1\Documents\talea-api\` | 面向调用方的文档与首个真实 peer 的私钥，**刻意不入库** |
 
 **代码侧的四个入口：**
 
