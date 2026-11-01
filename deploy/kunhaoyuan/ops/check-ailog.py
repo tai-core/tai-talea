@@ -19,6 +19,8 @@ TOKEN_KEYS = ("input_token", "output_token", "total_token")
 
 failures = []
 warnings = []
+# Set per line so a failure can say which request it came from.
+current_stamp = ""
 counts = {
     "lines": 0,
     "parsed": 0,
@@ -31,11 +33,23 @@ counts = {
 
 
 def fail(index, message):
-    failures.append("line %d: %s" % (index, message))
+    failures.append("%s: %s" % (location(index), message))
 
 
 def warn(index, message):
-    warnings.append("line %d: %s" % (index, message))
+    warnings.append("%s: %s" % (location(index), message))
+
+
+def location(index):
+    """Line number plus the request's own timestamp.
+
+    The log is one append-only file, so a window exported right after a gateway
+    upgrade still holds lines the previous binary wrote. Without the timestamp a
+    failure from last week looks exactly like a regression from a minute ago.
+    """
+    if current_stamp:
+        return "line %d (%s)" % (index, current_stamp)
+    return "line %d" % index
 
 
 def is_number(value):
@@ -48,6 +62,8 @@ def main(path):
     seen_request_ids = {}
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for index, raw in enumerate(handle, 1):
+            global current_stamp
+            current_stamp = ""
             line = raw.rstrip("\n")
             if not line.strip():
                 continue
@@ -63,6 +79,7 @@ def main(path):
                 fail(index, "outer JSON is not an object")
                 continue
             counts["parsed"] += 1
+            current_stamp = str(outer.get("start_time") or "")
 
             # 2/3. the three fields the collector treats as mandatory
             for key in REQUIRED_OUTER:
