@@ -247,12 +247,15 @@ do_up() {
 # not the ones already in flight.
 #
 # This runs as a Pod because the Router's control port is a ClusterIP, and the
-# jump host can reach neither that nor any Pod address. It reads each worker's
-# `sglang:num_running_reqs`, so it depends on `--enable-metrics` in the worker
-# arguments - without metrics there is no way to tell a generating worker from an
-# idle one, and the wait falls back to the timeout. Best effort on purpose: at
-# 08:00 the cards have to come back either way, so a failed drain is logged and
-# the scale-down proceeds.
+# jump host can reach neither that nor any Pod address. The wait reads the
+# Router's own per-worker `load` - the count of requests it has dispatched and
+# not yet finished delivering - so it needs nothing from the workers and no
+# flags on them. That count is the only number here that distinguishes a
+# generating worker from an idle one; the gauge this used to read
+# (`sglang:num_running_reqs`) is not exported by this sglang build, which made
+# every drain burn its full window. Best effort on purpose: at 08:00 the cards
+# have to come back either way, so a failed drain is logged and the scale-down
+# proceeds.
 do_drain() { # $1 = close (default) | open
   local image pod=talea-drain rc mode=${1:-close}
   image=$(kubectl -n "$NS" get deploy talea-router -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)

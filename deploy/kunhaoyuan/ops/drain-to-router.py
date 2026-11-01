@@ -14,16 +14,34 @@ choosing the worker for new requests, and an open stream keeps its connection.
 That is why the wait for in-flight to reach zero comes after the close, not
 before.
 
-The wait reads `sglang:num_running_reqs` from the worker's own Prometheus
-endpoint, which is the number of requests the scheduler is generating for right
-now. The Router's `/get_load` cannot answer this question: it counts tokens
-queued at the worker, and a request that is already generating counts zero. An
-earlier version of this script waited on it and therefore only ever waited a
-fixed 20 s - any generation longer than that was cut off by the Pod deletion.
+The wait reads the Router's `load` field for each worker, from the same
+`/workers` response the close step already used. That number is the count of
+requests this Router has dispatched to the worker and not yet finished
+delivering: the worker struct increments it before the request is sent and the
+guard decrements it when the response body is dropped, so a stream counts until
+its last byte. It is the only number in this system that answers "is this worker
+still generating for someone".
 
-Runs inside the cluster (the Router's control port and the workers' Pod
-addresses are not reachable from the jump host). Prints a final marker so the
-caller can decide without parsing prose.
+It used to read the worker's `sglang:num_running_reqs` from its own /metrics
+instead. That gauge does not exist in this sglang build (the endpoint exports
+prefill/decode token counters, cuda graph passes, http_requests_total and
+process stats), so every poll came back unreadable, no zero reading ever
+confirmed, and the wait always burned the full QUIESCE_TIMEOUT. A wait that
+cannot end early is not a wait, it is a fixed delay with a progress bar.
+
+What the count does not include, and why that is acceptable:
+
+  * requests that reached the worker through some other Router - there is one;
+  * requests whose client disconnected, because the Router drops the guard with
+    the stream while the worker may keep generating until it notices.
+
+Both omissions make the number too low, never too high, so a zero reading is at
+worst optimistic by a request that is already being torn down. The alternative
+errors were in the other direction and cost a fixed five minutes every night.
+
+Runs inside the cluster (the Router's control port is not reachable from the
+jump host). Prints a final marker so the caller can decide without parsing
+prose.
 
 MODE=close (default) closes routing and waits for in-flight to finish.
 MODE=open puts the workers back, which is the only way to undo a close: the
@@ -32,7 +50,7 @@ so a hand-drained pool would stay unroutable until the Pods were recreated.
 
 exit 0  closed and quiesced, or reopened
 exit 2  at least one worker refused the change - the pool is half changed
-exit 3  requests still running when the quiesce window expired
+exit 3  requests still in flight when the quiesce window expired
 exit 1  the Router never answered
 """
 
@@ -49,17 +67,15 @@ BASE = os.environ.get("ROUTER_URL", "http://talea-router:30001").rstrip("/")
 # minutes, and the schedule values freeing the cards over saving a request.
 QUIESCE_TIMEOUT = int(os.environ.get("QUIESCE_TIMEOUT", "300"))
 # Closing routing only changes how the *next* request is placed. A request the
-# Router dispatched microseconds earlier is already on its way, so the first
-# poll can happen before the worker has counted it. One short settle closes that
-# gap, and the poll below additionally requires a second confirmation.
+# Router is in the middle of placing has been accepted but has not yet produced
+# a load increment, so the first poll can happen before it is counted. One short
+# settle closes that gap, and the poll below additionally requires a second
+# confirmation.
 SETTLE_SECONDS = int(os.environ.get("SETTLE_SECONDS", "3"))
 POLL_SECONDS = 3
 # Two consecutive zero readings, not one: a request that finished between two
 # polls and one that has not started yet look identical in a single sample.
 CONFIRM_POLLS = 2
-# The worker's own view of what it is generating. Both gauges are summed: a
-# queued request is work the Pod would lose just as surely as a running one.
-PENDING_METRICS = ("sglang:num_running_reqs", "sglang:num_queue_reqs")
 # close: stop routing (before a scale-down). open: put the workers back, which is
 # the only way to undo a drain without restarting the Pods - the control plane
 # reads readiness but never sets it back itself.
@@ -79,45 +95,18 @@ def call(method, path, payload=None, timeout=10):
     return json.loads(body) if body.strip() else {}
 
 
-def fetch_text(url, timeout=10):
-    request = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", "replace")
-
-
-def pending_requests(worker_url):
-    """How much work a worker says it is doing, or None if it will not say.
-
-    Summed over every series: with tensor parallelism each rank may publish the
-    same gauge, and over-counting a non-zero reading only makes the wait
-    stricter. Zero is zero however many ranks report it.
-    """
+def read_loads():
+    """In-flight request count per worker id, or None if the Router will not say."""
     try:
-        text = fetch_text(worker_url.rstrip("/") + "/metrics")
-    except Exception as exc:  # noqa: BLE001 - a probe reports, it does not raise
+        payload = call("GET", "/workers")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
         return None, str(exc)
-
-    total = 0.0
-    found = False
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        head, _, value = line.rpartition(" ")
-        name = head.split("{", 1)[0].strip()
-        if name not in PENDING_METRICS:
-            continue
-        try:
-            total += float(value)
-        except ValueError:
-            continue
-        # Only a running-request gauge proves the worker understands the
-        # question. num_queue_reqs alone would let a worker that does not export
-        # the running gauge look idle.
-        if name == "sglang:num_running_reqs":
-            found = True
-    if not found:
-        return None, "no sglang:num_running_reqs"
-    return total, None
+    loads = {}
+    for worker in payload.get("workers") or []:
+        worker_id = worker.get("id")
+        if worker_id is not None:
+            loads[worker_id] = worker.get("load")
+    return loads, None
 
 
 def main():
@@ -183,48 +172,56 @@ def main():
         return 0
 
     deadline = time.time() + QUIESCE_TIMEOUT
-    print("settling for %ds before asking the workers what they are running"
+    print("settling for %ds before asking the Router what is still in flight"
           % SETTLE_SECONDS)
     time.sleep(SETTLE_SECONDS)
 
-    total = 0.0
-    unknown = 0
+    total = 0
+    unreadable = 0
     zero_streak = 0
     while time.time() < deadline:
-        readings = []
-        for worker in targets:
-            count, error = pending_requests(worker.get("url") or "")
-            readings.append((worker.get("id"), count, error))
+        loads, error = read_loads()
+        if loads is None:
+            # A Router that stopped answering tells us nothing about its workers,
+            # and "nothing is running" is exactly the wrong thing to assume.
+            total, unreadable = 0, len(targets)
+            print("  the Router would not report loads: %s" % error)
+        else:
+            total, unreadable = 0, 0
+            for worker in targets:
+                worker_id = worker.get("id")
+                if worker_id not in loads:
+                    # Deregistered while we watched: it cannot be receiving
+                    # anything, and there is no counter left to wait on.
+                    print("  %-40s no longer registered" % worker_id)
+                    continue
+                load = loads[worker_id]
+                if not isinstance(load, int) or isinstance(load, bool):
+                    unreadable += 1
+                    print("  %-40s no usable load field: %r" % (worker_id, load))
+                    continue
+                total += load
+                if load:
+                    print("  %-40s in flight: %d" % (worker_id, load))
 
-        total = 0.0
-        unknown = 0
-        for worker_id, count, error in readings:
-            if count is None:
-                unknown += 1
-                print("  %-40s unreadable: %s" % (worker_id, error))
-            else:
-                total += count
-                if count:
-                    print("  %-40s running/queued: %d" % (worker_id, count))
-
-        if total == 0 and unknown == 0:
+        if total == 0 and unreadable == 0:
             zero_streak += 1
             if zero_streak >= CONFIRM_POLLS:
-                print("QUIESCE_OK: nothing generating on %d worker(s)" % len(targets))
+                print("QUIESCE_OK: nothing in flight on %d worker(s)" % len(targets))
                 return 0
-            print("in-flight: 0 - confirming (%d/%d)" % (zero_streak, CONFIRM_POLLS))
+            print("in flight: 0 - confirming (%d/%d)" % (zero_streak, CONFIRM_POLLS))
         else:
             zero_streak = 0
-            print("in-flight: %d, unreadable: %d" % (total, unknown))
+            print("in flight: %d, unreadable: %d" % (total, unreadable))
         time.sleep(POLL_SECONDS)
 
-    if total == 0:
+    if total == 0 and unreadable == 0:
         # Nothing measurable was running at the end of the window; the requests
         # that were in flight when routing closed have had their time.
-        print("QUIESCE_OK: no measurable work after %ds (metrics unreadable on %d worker(s))"
-              % (QUIESCE_TIMEOUT, unknown))
+        print("QUIESCE_OK: nothing in flight after %ds" % QUIESCE_TIMEOUT)
         return 0
-    print("QUIESCE_TIMEOUT: %d request(s) still generating after %ds" % (total, QUIESCE_TIMEOUT))
+    print("QUIESCE_TIMEOUT: %d request(s) still in flight after %ds, %d worker(s) unreadable"
+          % (total, QUIESCE_TIMEOUT, unreadable))
     return 3
 
 
