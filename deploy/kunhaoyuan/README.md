@@ -27,7 +27,7 @@ client ── NodePort 31280 ──> talea-router (8000 serving, 30001 control)
   ```
 - Weights at `/data02/model-weight/GLM-5.3-Flash-NVFP4` on both nodes, and a
   writable `/data02` for the compile cache and the token log.
-- Images `talea-worker-0.9.2`, `talea-control-0.9.8`, and `glm-5.3-flash-ailog2`
+- Images `talea-worker-0.9.2`, `talea-control-0.9.9`, and `glm-5.3-flash-ailog2`
   (the last is the official SGLang image with our Router binary appended as one
   extra layer; the Router runs from it, the control plane from its own tag).
 
@@ -395,6 +395,15 @@ lines have aged out of the window.
   actually generates", and the cheap alternative — the Router's own
   `/server_info` check — is already running and already cannot see a wedged
   model.
+
+  Deployed as `talea-control-0.9.9` (`sha256:bfe0de700c6f…`) and measured: 3,600
+  requests at concurrency 192, 4096-in/256-out, sustained 165 s — the exact shape
+  that produced 576 refusals in four seconds this morning — came back 3,600 × 200
+  with a steady ~210 completions per 10 s and no gap. Honest limit of that
+  measurement: not one probe miss occurred during either verification run, so
+  what it proves is that the pool now holds 192 for minutes at a time; the guard
+  against a miss is the changed gate, and a miss is still not reproducible on
+  demand.
 - **Nothing sheds load above 4 × `max_running_requests`.** 192 concurrent is the
   pool's ceiling; past it the Router accepts everything and sglang queues
   everything, so p95 grows without bound and no caller is told to back off.

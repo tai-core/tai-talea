@@ -29,6 +29,11 @@ controller:
   operation_retry: 15s
   call_timeout: 10s
   health_failure_threshold: 3
+  # Consecutive misses before the instance leaves the rotation. Measured here:
+  # the probe is a /health_generate that queues behind the batch, and closing
+  # the rotation on the first miss removed all four instances at once under a
+  # 192-concurrent burst, which the Router then answered with 503 to everything.
+  readiness_failure_threshold: 2
   # A cold worker takes 11-12 minutes on this hardware: 102 s of weight loading
   # plus the FlashInfer first compile. 20 m leaves room for a cold Triton cache.
   start_timeout: 20m
