@@ -223,18 +223,75 @@ func (c *Client) createInstance(ctx context.Context, productCode string, cciPara
 	return key, nil
 }
 
-// subscriptionResult is one poll of the subscription result.
+// subscriptionResource is one allocated resource inside a subscription result.
+// The instance id lives here, not at the top level: the platform renamed
+// instanceId to resourceInstanceId when it moved the endpoint.
+type subscriptionResource struct {
+	Status             string `json:"status"`
+	SubscriptionNo     string `json:"subscriptionNo"`
+	ResourceInstanceID string `json:"resourceInstanceId"`
+	// ErrorCode is null on success and a business code on rejection (40010 is
+	// the quota refusal). A plain int decodes null as 0, which is why the
+	// success case needs no pointer.
+	ErrorCode    int    `json:"errorCode"`
+	ErrorMessage string `json:"errorMessage"`
+}
+
+// subscriptionResult is one poll of a subscription.
+//
+// The platform decommissioned GET /api/osm/v1/subscription/CCI/result/{key}
+// (it answers status 212147, "该接口已停用") in favour of
+// GET /api/osm/v1/subscription/sku/cci/result/{key}, and changed the payload
+// with it. The old body was {result, message, instanceId}; the new one nests
+// everything under data.resources[]. Verified live on 2026-10-27 against a CPU
+// subscription, one second after the create call:
+//
+//	{"status":200,"message":"OK","data":{
+//	  "status":"SUCCESS","startAt":"2026-10-27 14:48:10",
+//	  "resources":[{"status":"SUCCESS","subscriptionNo":"ORD...",
+//	    "resourceInstanceId":"647e8613-...","resourceId":"647e8613-...",
+//	    "errorCode":null,"errorMessage":null}]}}
+//
+// Read what SUCCESS means here: the container had not started yet when that
+// body was captured. It says the subscription was fulfilled and an id was
+// minted, not that the container is RUNNING - that stays AwaitSSHAccess's
+// question, and it already holds its budget while the platform is queueing.
 type subscriptionResult struct {
-	Result     string `json:"result"`
-	Message    string `json:"message"`
-	InstanceID string `json:"instanceId"`
+	Status    string                 `json:"status"`
+	Resources []subscriptionResource `json:"resources"`
+}
+
+// instanceID returns the first container id the subscription minted, if any.
+func (r subscriptionResult) instanceID() string {
+	for _, resource := range r.Resources {
+		if resource.ResourceInstanceID != "" {
+			return resource.ResourceInstanceID
+		}
+	}
+	return ""
+}
+
+// rejection returns the platform's own refusal text, or "" when the
+// subscription has not been refused. Reporting the raw message matters: a
+// quota refusal carries "您的剩余配额为：0，已达上限：3" and the code 40010, which
+// tells an operator what to do; "creation failed" tells them nothing.
+func (r subscriptionResult) rejection() string {
+	for _, resource := range r.Resources {
+		if resource.ErrorCode != 0 || resource.ErrorMessage != "" {
+			return fmt.Sprintf("status %d: %s", resource.ErrorCode, resource.ErrorMessage)
+		}
+	}
+	if r.Status == "FAILED" || r.Status == "ERROR" {
+		return "the subscription did not produce a container"
+	}
+	return ""
 }
 
 func (c *Client) subscriptionResultOnce(ctx context.Context, key string) (subscriptionResult, error) {
 	var out subscriptionResult
 	// The key contains colons; keep it verbatim in the path or the signature
 	// will mismatch (verified against the live platform).
-	err := c.call(ctx, "GET", "/api/osm/v1/subscription/CCI/result/"+key, "", nil, &out)
+	err := c.call(ctx, "GET", "/api/osm/v1/subscription/sku/cci/result/"+key, "", nil, &out)
 	return out, err
 }
 

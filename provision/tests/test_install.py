@@ -125,5 +125,85 @@ class HostKeyPinningTests(unittest.TestCase):
                     .missing_host_key(client, '[120.220.102.21]:30085', FakeKey('ssh-ed25519', b'actual'))
 
 
+class RuntimeChannelTests(unittest.TestCase):
+    """The shared-volume channel is what makes CCI installable at all: the base
+    image's sglang cannot load the model, and the wheelhouse that would replace
+    it is not built. These tests pin the gate that must hold anyway."""
+
+    profile = dict(os='ubuntu-22.04', cuda='12.9', python='3.12', sglang='0.5.22',
+                   virtualenv='/opt/tai-talea/venv', wheelhouse='/opt/tai-talea/wheelhouse')
+
+    def setUp(self):
+        # One module instance for the whole test: load() execs the file anew, so
+        # a second load would hand back a different InstallError class and every
+        # assertRaises below would miss it.
+        self.installer = load('ssh_install')
+
+    def plan(self, **runtime):
+        profile = self.profile
+        return self.installer.runtime_plan({'runtime': dict(runtime), 'profile': profile}, profile)
+
+    def test_a_manifest_without_tarballs_is_refused(self):
+        with self.assertRaisesRegex(self.installer.InstallError, '没有任何压缩包'):
+            self.plan(source='/root/gongji/tai-talea-runtime', tarballs=[])
+
+    def test_a_relative_volume_path_is_refused(self):
+        with self.assertRaisesRegex(self.installer.InstallError, '绝对路径'):
+            self.plan(source='tai-talea-runtime',
+                      tarballs=[dict(name='bits.tar', target='/')])
+
+    def test_only_plain_tarball_names_are_accepted(self):
+        # A name that escapes the volume directory would let a manifest read any
+        # file the container can see, which is exactly what the wheelhouse gate
+        # also forbids on its side.
+        for name in ['../../../etc/shadow.tar', 'venv.tar.gz', 'venv.whl', 'sub/venv.tar']:
+            with self.assertRaisesRegex(self.installer.InstallError, '非法文件名', msg=name):
+                self.plan(source='/root/gongji/tai-talea-runtime',
+                          tarballs=[dict(name=name, target='/opt/tai-talea')])
+
+    def test_a_relative_unpack_target_is_refused(self):
+        with self.assertRaisesRegex(self.installer.InstallError, '解包目录必须是绝对路径'):
+            self.plan(source='/root/gongji/tai-talea-runtime',
+                      tarballs=[dict(name='venv.tar', target='opt/tai-talea')])
+
+    def test_a_relative_purge_pattern_is_refused(self):
+        with self.assertRaisesRegex(self.installer.InstallError, '清理路径必须是绝对路径'):
+            self.plan(source='/root/gongji/tai-talea-runtime',
+                      tarballs=[dict(name='bits.tar', target='/')],
+                      purge=['etc/tai-talea/*.yaml'])
+
+    def test_a_valid_runtime_manifest_passes_the_artifact_gate(self):
+        # Reaching the SSH phase is the assertion: it means no wheelhouse key or
+        # checksum was demanded for a channel that uploads no wheels at all.
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / 'manifest.json'
+            manifest.write_text(json.dumps(dict(
+                profile=self.profile, probe_ip='172.19.0.1', model_target='/root/gongji',
+                runtime=dict(source='/root/gongji/tai-talea-runtime',
+                             tarballs=[dict(name='venv.tar', target='/opt/tai-talea')]))))
+
+            class ReachedSSH(Exception):
+                pass
+
+            with patch.object(self.installer.paramiko, 'SSHClient', side_effect=ReachedSSH):
+                with self.assertRaises(ReachedSSH):
+                    self.installer.install(dict(request={}, manifest=str(manifest),
+                                                bootstrap_token='t' * 32, state_dir=directory))
+
+    def test_the_wheelhouse_channel_still_demands_its_checksum(self):
+        # The refactor must not have opened a hole in the original channel: a
+        # manifest without `runtime` still goes through the wheelhouse gate.
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / 'manifest.json'
+            manifest.write_text(json.dumps(dict(
+                profile=self.profile, probe_ip='172.19.0.1', model_target='/root/gongji',
+                wheelhouse_source=directory, wheel_manifest_sha256='wrong')))
+            with patch.object(self.installer.paramiko, 'SSHClient') as client:
+                with self.assertRaisesRegex(self.installer.InstallError, '清单校验失败'):
+                    self.installer.install(dict(request={}, manifest=str(manifest),
+                                                bootstrap_token='t' * 32, state_dir=directory))
+                client.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

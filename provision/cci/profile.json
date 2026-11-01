@@ -1,0 +1,10 @@
+{
+  "os": "ubuntu-22.04",
+  "cuda": "12.9",
+  "python": "3.12",
+  "sglang": "0.5.22",
+  "wheelhouse": "/opt/tai-talea/wheelhouse",
+  "virtualenv": "/opt/tai-talea/venv",
+  "bootstrap_version": "tai-talea-bootstrap/2",
+  "model_id": "zai-org/GLM-5.3-Flash"
+}

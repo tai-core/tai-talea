@@ -113,15 +113,21 @@ alerts:
   cooldown: 5m
   ratio_tolerance: 0.15
 
-# Measured on the H100 CCI container, not copied from the generic example.
-# The very same values live in deploy/container/profile.json and
-# provision/wheelhouse/spec.json; a mismatch is rejected on the node, not at
-# submission, so verify.py checks all three together before a rollout.
+# Measured on the H100 CCI container (glm53-pd2/pd3, 2026-10-26), not copied
+# from the generic example. This platform is NOT the private-image baseline used
+# by deploy/tai-talea.example.yaml: CCI runs ubuntu-22.04 with a CUDA 12.9
+# toolkit, and the image's own sglang (0.5.3rc0) has no glm5_next.py - the
+# runtime is the managed virtualenv carrying sglang 0.5.22. All four values are
+# the ones the node self-check actually ran against; see provision/cci/README.md.
+#
+# The wheelhouse path stays as-is even though CCI installs from a NAS tarball
+# rather than a wheelhouse: the field is required by the profile contract and
+# the directory is created (empty) by the installer.
 image_profile:
-  os: ubuntu-24.04
-  cuda: "13.x"
+  os: ubuntu-22.04
+  cuda: "12.9"
   python: "3.12"
-  sglang: "0.5.20"
+  sglang: "0.5.22"
   wheelhouse: /opt/tai-talea/wheelhouse
   virtualenv: /opt/tai-talea/venv
 

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -147,12 +148,36 @@ func (f *fakePlatform) handler(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": 200, "message": "OK", "data": "CCI:SUBSCRIBE:x:1",
 		})
-	case strings.HasPrefix(r.URL.Path, "/api/osm/v1/subscription/CCI/result/"):
-		key := strings.TrimPrefix(r.URL.Path, "/api/osm/v1/subscription/CCI/result/")
+	case strings.HasPrefix(r.URL.Path, "/api/osm/v1/subscription/sku/cci/result/"):
+		// Mirrors the live payload shape captured on 2026-10-27: the id and the
+		// error live inside data.resources[], and errorCode is null (not 0) on
+		// success. The old /subscription/CCI/result path is deliberately not
+		// served here: it is decommissioned and a client that still calls it
+		// must fail this test rather than quietly pass.
+		key := strings.TrimPrefix(r.URL.Path, "/api/osm/v1/subscription/sku/cci/result/")
 		state := f.results[key]
+		resource := map[string]any{
+			"status":       state["result"],
+			"errorCode":    nil,
+			"errorMessage": nil,
+		}
+		if state["instanceId"] != "" {
+			resource["resourceInstanceId"] = state["instanceId"]
+			resource["resourceId"] = state["instanceId"]
+		}
+		if state["message"] != "" {
+			resource["errorMessage"] = state["message"]
+		}
+		if state["errorCode"] != "" {
+			code, err := strconv.Atoi(state["errorCode"])
+			if err != nil {
+				f.t.Fatalf("errorCode %q is not a number", state["errorCode"])
+			}
+			resource["errorCode"] = code
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": 200, "message": "OK",
-			"data": map[string]any{"result": state["result"], "instanceId": state["instanceId"], "message": state["message"]},
+			"data": map[string]any{"status": state["result"], "resources": []any{resource}},
 		})
 	default:
 		w.WriteHeader(404)
@@ -280,6 +305,62 @@ func TestCreateAndWait(t *testing.T) {
 	}
 }
 
+// The platform resolves "image" against the public catalogue unless
+// imageType says otherwise, so a tenant image without the field is looked up
+// somewhere it cannot be and the create fails with nothing pointing at the
+// real cause. An empty type must stay absent, because every deployment that
+// never used a private registry sent no field at all and still works.
+func TestCreateForwardsImageTypeOnlyWhenSet(t *testing.T) {
+	newFake := func() *fakePlatform {
+		return &fakePlatform{
+			t: t, secret: "sk-test",
+			results: map[string]map[string]string{
+				"CCI:SUBSCRIBE:i:1": {"result": "SUCCESS", "instanceId": "inst-new"},
+			},
+		}
+	}
+
+	fake := newFake()
+	adapter := newTestAdapter(t, fake)
+	adapter.cfg.ProductCode = "PRD-CCI-5-208"
+	adapter.cfg.Image = "registry.hd-02.alayanew.com:8443/tai-talea/sglang-glm53:0.5.22-cu130"
+	adapter.cfg.ImageType = "private"
+	if _, err := adapter.CreateInstance(context.Background(), "glm53-priv"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	params, _ := fake.lastCreate["cciParams"].(map[string]any)
+	if params["imageType"] != "private" {
+		t.Fatalf("imageType not forwarded: %+v", params)
+	}
+
+	unset := newFake()
+	withoutType := newTestAdapter(t, unset)
+	withoutType.cfg.ProductCode = "PRD-CCI-5-208"
+	withoutType.cfg.Image = "registry.test/ubuntu:24.04"
+	if _, err := withoutType.CreateInstance(context.Background(), "glm53-pub"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	params, _ = unset.lastCreate["cciParams"].(map[string]any)
+	if _, present := params["imageType"]; present {
+		t.Fatalf("unset imageType must not be sent: %+v", params)
+	}
+}
+
+// A value outside the documented set would be accepted by create and then
+// ignored or misread by the platform, so it is rejected while the config is
+// still being loaded.
+func TestNewRejectsUnknownImageType(t *testing.T) {
+	_, err := New("alayanew", Config{AccessKey: "ak", SecretKey: "sk", ImageType: "Private"})
+	if err == nil {
+		t.Fatal("expected an error for an undocumented image_type")
+	}
+	for _, valid := range []string{"", "general", "application", "private"} {
+		if _, err := New("alayanew", Config{AccessKey: "ak", SecretKey: "sk", ImageType: valid}); err != nil {
+			t.Errorf("image_type %q rejected: %v", valid, err)
+		}
+	}
+}
+
 // The platform queues a create when the product's pool has no free node and
 // drains the queue by priority, so an operator has to be able to ask for a
 // better position than the platform's default.
@@ -334,6 +415,55 @@ func TestWaitCreationReportsFailure(t *testing.T) {
 	_, err := adapter.WaitCreation(context.Background(), "k")
 	if err == nil || !strings.Contains(err.Error(), "insufficient quota") {
 		t.Fatalf("expected failure reason, got %v", err)
+	}
+}
+
+// A quota refusal is the failure mode that actually stopped a provisioning in
+// production (2026-10-26, 40010). The platform's own text is the only thing
+// that tells an operator what to change, so it must survive to the caller
+// instead of being flattened into "creation failed".
+func TestWaitCreationSurfacesThePlatformRefusal(t *testing.T) {
+	fake := &fakePlatform{
+		t: t, secret: "sk-test",
+		results: map[string]map[string]string{
+			"q": {"result": "FAILED", "errorCode": "40010",
+				"message": "您的剩余配额为：0，已达上限：3，请等待资源可用或联系管理员调整资源分配。"},
+		},
+	}
+	adapter := newTestAdapter(t, fake)
+	_, err := adapter.WaitCreation(context.Background(), "q")
+	if err == nil {
+		t.Fatal("a quota refusal must not be reported as success")
+	}
+	for _, want := range []string{"40010", "已达上限"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal text lost %q: %v", want, err)
+		}
+	}
+}
+
+// The subscription reports SUCCESS about a second after the create call, while
+// the container is still being built (measured 2026-10-27). Treating that as
+// "not ready yet" would burn the whole creation budget before the first poll of
+// AwaitSSHAccess ever runs; the id is what WaitCreation owes its caller.
+func TestWaitCreationReturnsTheIDEvenWhileTheContainerIsStillStarting(t *testing.T) {
+	fake := &fakePlatform{
+		t: t, secret: "sk-test",
+		results: map[string]map[string]string{
+			"s": {"result": "SUCCESS", "instanceId": "647e8613-759c-450d-8685-b75e48e6d9a1"},
+		},
+	}
+	adapter := newTestAdapter(t, fake)
+	started := time.Now()
+	id, err := adapter.WaitCreation(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if id != "647e8613-759c-450d-8685-b75e48e6d9a1" {
+		t.Fatalf("wrong id: %q", id)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("returned the minted id only after %s; it must not wait for RUNNING", elapsed)
 	}
 }
 

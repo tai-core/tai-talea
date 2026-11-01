@@ -25,8 +25,23 @@ type Config struct {
 	// the configured model. Usually a single entry: the controller's model_id.
 	ModelSupport []string
 	// Creation defaults (Task: provision instances through the console API).
-	ProductCode      string            `json:"product_code"`
-	Image            string            `json:"image"`
+	ProductCode string `json:"product_code"`
+	Image       string `json:"image"`
+	// ImageType tells the platform how to resolve Image: "general" (a public
+	// base image), "application" (a prebuilt application image) or "private"
+	// (an image from a registry project the tenant owns). The field is
+	// optional and empty leaves the platform's own default in place, which is
+	// what every deployment that never touched a private registry relied on.
+	//
+	// Provenance matters here: the CCI create endpoint publishes no parameter
+	// table, so this spelling is taken from the sibling training task API
+	// (/v1/subscription/training/create), which documents imageType with
+	// exactly these three values next to the same image field, and from the
+	// console, where instance creation offers the same three image sources.
+	// It is forwarded verbatim and the platform decides; if it turns out to be
+	// ignored, the symptom is a private reference that fails to resolve, not a
+	// rejected request, because unknown keys in cciParams are not errors.
+	ImageType        string            `json:"image_type"`
 	NASStorageID     string            `json:"nas_storage_id"`
 	NASFileDirectory string            `json:"nas_file_directory"`
 	NASMountPath     string            `json:"nas_mount_path"`
@@ -101,6 +116,13 @@ func New(partnerID string, cfg Config) (*Adapter, error) {
 	}
 	if cfg.ServicePort == 0 {
 		cfg.ServicePort = 9002
+	}
+	// The platform documents exactly three values. A typo here would not fail
+	// at create time with anything recognisable, so it fails at load time.
+	switch cfg.ImageType {
+	case "", "general", "application", "private":
+	default:
+		return nil, fmt.Errorf("alayanew image_type %q: want general, application or private", cfg.ImageType)
 	}
 	return &Adapter{
 		partnerID: partnerID,
@@ -285,6 +307,9 @@ func (a *Adapter) CreateInstance(ctx context.Context, name string) (string, erro
 	if len(a.cfg.Env) > 0 {
 		cciParams["env"] = a.cfg.Env
 	}
+	if a.cfg.ImageType != "" {
+		cciParams["imageType"] = a.cfg.ImageType
+	}
 	if a.cfg.ComputeResource != "" {
 		cciParams["computeResourceType"] = a.cfg.ComputeResource
 	}
@@ -325,14 +350,19 @@ func (a *Adapter) WaitCreation(ctx context.Context, key string) (string, error) 
 		if err != nil {
 			return "", err
 		}
-		switch result.Result {
-		case "SUCCESS":
-			if result.InstanceID == "" {
-				return "", errors.New("alayanew creation succeeded without instanceId")
-			}
-			return result.InstanceID, nil
-		case "FAILED":
-			return "", fmt.Errorf("alayanew creation failed: %s", result.Message)
+		// A refusal is terminal and the platform has already said why. Waiting
+		// the full budget on a quota rejection only delays the operator seeing
+		// "您的剩余配额为：0，已达上限：3".
+		if reason := result.rejection(); reason != "" {
+			return "", fmt.Errorf("alayanew creation failed: %s", reason)
+		}
+		// The id is the deliverable, not the status: a CPU subscription reports
+		// SUCCESS within a second while its container is still being built.
+		// Handing the id over here and letting AwaitSSHAccess wait for RUNNING
+		// keeps one question per step, and it is the step that knows how to hold
+		// its budget while the platform queues.
+		if instanceID := result.instanceID(); instanceID != "" {
+			return instanceID, nil
 		}
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("alayanew creation %s not resolved within %s", key, a.cfg.WaitTimeout)

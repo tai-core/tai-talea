@@ -1,0 +1,52 @@
+{
+  "comment": [
+    "九章 CCI（中国移动智算）节点的铺装清单，走 provision/ssh_install.py 的",
+    "共享卷通道（manifest 里有 runtime 就走这条，没有才走 wheelhouse）。",
+    "",
+    "为什么不需要 wheelhouse 上传：容器创建时已按 partners[].alayanew 的",
+    "nas_storage_id 挂载了 NAS，运行时压缩包就在那个卷上。控制节点只上传",
+    "几百字节（profile.json + bootstrap-token），20+ GB 的 venv 一个字节都不搬。",
+    "",
+    "使用前需要替换的只有 probe_ip：它是控制节点内网地址（本部署 172.19.166.190），",
+    "PROBE 用它做 ip route get 来定位容器自己的内网网卡。",
+    "",
+    "purge 不是可选项：tai-talea-bits.tar 是在控制节点上烤的，里面带着那份",
+    "/etc/tai-talea/tai-talea.yaml — 含平台 access_key/secret_key。worker 从不读它",
+    "（bootstrap 只吃 --profile），留着等于把控制面凭据复制到每台推理机上。"
+  ],
+  "profile": {
+    "os": "ubuntu-22.04",
+    "cuda": "12.9",
+    "python": "3.12",
+    "sglang": "0.5.22",
+    "wheelhouse": "/opt/tai-talea/wheelhouse",
+    "virtualenv": "/opt/tai-talea/venv"
+  },
+  "probe_ip": "172.19.166.190",
+  "runtime": {
+    "source": "/root/gongji/tai-talea-runtime",
+    "checksums": "SHA256SUMS",
+    "checksums_required": true,
+    "tarballs": [
+      {
+        "name": "venv-0.5.22-cu130.tar",
+        "target": "/opt/tai-talea"
+      },
+      {
+        "name": "tai-talea-bits.tar",
+        "target": "/"
+      },
+      {
+        "name": "jit-caches.tar",
+        "target": "/root"
+      }
+    ],
+    "purge": [
+      "/etc/tai-talea/tai-talea*.yaml"
+    ],
+    "bootstrap_source": "/opt/tai-talea/bootstrap-src",
+    "bootstrap_python": "python3",
+    "token_file": "/etc/tai-talea/bootstrap-token",
+    "profile_file": "/etc/tai-talea/profile.json"
+  }
+}

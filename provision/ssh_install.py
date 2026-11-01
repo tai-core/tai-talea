@@ -154,6 +154,105 @@ print(json.dumps(dict(uid=os.geteuid(),hostname=socket.gethostname(),python=f'{s
 '''
 
 
+# Restore the runtime from the platform's own shared volume. Runs as program
+# text over the SSH channel; every decision comes from the manifest payload.
+# It never installs anything: the tarballs already contain the virtualenv that
+# was validated on this platform, so the only work is unpacking and proving the
+# bytes are the ones that were baked.
+UNPACK = r'''
+import glob,json,os,subprocess,sys
+p=json.load(sys.stdin)
+out={'steps':[]}
+def sh(argv,timeout):
+    r=subprocess.run(argv,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=timeout)
+    return r.returncode,(r.stdout or '')[-400:]
+src=p['source']
+if p.get('checksums'):
+    path=os.path.join(src,p['checksums'])
+    if os.path.isfile(path):
+        rc,text=sh(['bash','-c','cd '+src+' && sha256sum -c '+p['checksums']+' --quiet'],3600)
+        out['steps'].append({'step':'checksum','rc':rc})
+        if rc:
+            out['error']='共享卷上的运行时包校验失败：'+text.strip()[:200]
+            print(json.dumps(out));sys.exit(0)
+    elif p.get('checksums_required',True):
+        out['error']='共享卷缺少校验清单 %s，拒绝解包未经核对的运行时'%p['checksums']
+        print(json.dumps(out));sys.exit(0)
+for item in p['tarballs']:
+    path=os.path.join(src,item['name'])
+    if not os.path.isfile(path):
+        out['error']='共享卷缺少运行时包 %s（容器的 NAS 是否已挂载？）'%item['name']
+        print(json.dumps(out));sys.exit(0)
+    os.makedirs(item['target'],exist_ok=True)
+    rc,text=sh(['tar','-C',item['target'],'-xf',path],7200)
+    out['steps'].append({'step':'unpack '+item['name'],'rc':rc})
+    if rc:
+        out['error']='解包 %s 失败：%s'%(item['name'],text.strip()[:200])
+        print(json.dumps(out));sys.exit(0)
+# The bits tarball was baked on a control node and carries that node's own
+# configuration, platform keys included. A worker never reads it - the
+# bootstrap takes --profile - so leaving it behind would spread the control
+# plane's credentials to every machine the pipeline touches.
+for pattern in p.get('purge') or []:
+    for path in glob.glob(pattern):
+        try:
+            os.unlink(path)
+            out['steps'].append({'step':'purge '+path,'rc':0})
+        except OSError:
+            pass
+print(json.dumps(out))
+'''
+
+# Start the node manager the way it is proven to run on this platform: the
+# system interpreter with the package tree as the import anchor. The tarball's
+# venv is for sglang, not for the bootstrap - using it would drag torch and
+# sglang into a process whose whole job is to spawn them.
+START = r'''
+import json,os,signal,subprocess,sys,time,urllib.request
+p=json.load(sys.stdin)
+root='/opt/tai-talea'
+for folder in ('logs','run'):
+    os.makedirs(os.path.join(root,folder),exist_ok=True)
+def phase():
+    try:
+        req=urllib.request.Request('http://127.0.0.1:9001/bootstrap/status',headers={'X-Bootstrap-Token':p['token']})
+        with urllib.request.urlopen(req,timeout=3) as r:
+            return json.load(r).get('phase','')
+    except Exception:
+        return None
+current=phase()
+if current in ('RUNNING','STARTING','INSTALLING','STOPPING'):
+    print(json.dumps({'error':'容器已有运行中的服务（%s），已停止安装'%current}));sys.exit(0)
+pid_path=os.path.join(root,'run/bootstrap.pid')
+if os.path.isfile(pid_path):
+    try:
+        pid=int(open(pid_path).read().strip())
+        args=open('/proc/%d/cmdline'%pid,'rb').read().split(b'\0')
+        if b'tai_talea_bootstrap' in args and b'serve' in args:
+            os.kill(pid,signal.SIGTERM)
+            for _ in range(100):
+                if not os.path.exists('/proc/%d'%pid):break
+                time.sleep(.1)
+    except Exception:
+        pass
+log=open(os.path.join(root,'logs/bootstrap.log'),'ab')
+env=dict(os.environ)
+env['PYTHONPATH']=p['bootstrap_source']
+proc=subprocess.Popen([p['python'],'-m','tai_talea_bootstrap','serve',
+    '--profile',p['profile'],'--host','0.0.0.0','--port','9001',
+    '--token-file',p['token_file'],'--log-dir',os.path.join(root,'logs')],
+    cwd=p['bootstrap_source'],stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=env,start_new_session=True)
+open(pid_path,'w').write(str(proc.pid))
+for _ in range(120):
+    if proc.poll() is not None:
+        print(json.dumps({'error':'节点管理服务启动失败，请查看容器 /opt/tai-talea/logs/bootstrap.log'}));sys.exit(0)
+    if phase() is not None:
+        print(json.dumps({'pid':proc.pid}));sys.exit(0)
+    time.sleep(1)
+print(json.dumps({'error':'节点管理服务启动超时'}))
+'''
+
+
 def mkdirs(sftp, path):
     parent = str(Path(path).parent).replace('\\', '/')
     if parent != path and parent != '.':
@@ -243,13 +342,8 @@ def inventory(source, destination):
             for p in sorted(source.rglob('*')) if p.is_file() and '__pycache__' not in p.parts and not p.name.endswith('.pyc')]
 
 
-def install(payload):
-    request = payload['request']
-    manifest = json.loads(Path(payload['manifest']).read_text())
-    profile = manifest['profile']
-    for name in ['virtualenv', 'wheelhouse']:
-        if profile[name] != '/opt/tai-talea/' + ('venv' if name == 'virtualenv' else 'wheelhouse'):
-            raise InstallError('当前安装器仅支持 /opt/tai-talea 下的运行环境')
+def wheelhouse_files(manifest, profile):
+    """Validate the operator-built wheelhouse; return (local, remote, sha256)."""
     expected = manifest['wheel_manifest_sha256']
     wheel_root = Path(manifest['wheelhouse_source'])
     if digest(wheel_root / 'manifest.json') != expected:
@@ -269,6 +363,59 @@ def install(payload):
     if digest(requirements) != manifest['requirements_sha256']:
         raise InstallError('控制节点依赖锁文件校验失败')
     files.append((requirements, profile['wheelhouse'] + '/requirements.txt', digest(requirements)))
+    return files
+
+
+def runtime_plan(manifest, profile):
+    """Validate the shared-volume runtime tarballs and return the description.
+
+    This is the second artifact channel, and the only one that works on a
+    platform whose base image does not match the controlled baseline. On CCI the
+    image ships sglang 0.5.3rc0, which has no glm5_next.py, so the runtime is a
+    virtualenv built once and kept on the platform's own shared volume. The
+    control node uploads nothing but a few small files: the volume is already
+    mounted inside the container, and pushing 20+ GB over SFTP to reach a mount
+    the container can read directly would be the expensive way to do nothing.
+
+    Integrity is still gated. The volume carries a SHA256SUMS file written when
+    the tarballs were baked; `checksums` names it. If it is absent the install
+    fails rather than trusting whatever is on disk, unless the operator says so
+    explicitly with checksums_required: false.
+    """
+    runtime = manifest['runtime']
+    source = runtime.get('source', '')
+    if not source.startswith('/'):
+        raise InstallError('共享卷运行时目录必须是绝对路径')
+    tarballs = runtime.get('tarballs') or []
+    if not tarballs:
+        raise InstallError('运行时清单没有任何压缩包')
+    for item in tarballs:
+        name = item.get('name', '')
+        if name != Path(name).name or not name.endswith('.tar'):
+            raise InstallError('运行时清单包含非法文件名')
+        if not str(item.get('target', '')).startswith('/'):
+            raise InstallError('运行时包的解包目录必须是绝对路径')
+    if runtime.get('checksums') and runtime['checksums'] != Path(runtime['checksums']).name:
+        raise InstallError('校验清单文件名非法')
+    for pattern in runtime.get('purge') or []:
+        if not str(pattern).startswith('/'):
+            raise InstallError('清理路径必须是绝对路径')
+    return runtime
+
+
+def install(payload):
+    request = payload['request']
+    manifest = json.loads(Path(payload['manifest']).read_text())
+    profile = manifest['profile']
+    for name in ['virtualenv', 'wheelhouse']:
+        if profile[name] != '/opt/tai-talea/' + ('venv' if name == 'virtualenv' else 'wheelhouse'):
+            raise InstallError('当前安装器仅支持 /opt/tai-talea 下的运行环境')
+    # Two channels, chosen by the manifest. `runtime` restores a proven tarball
+    # from a shared volume; its absence keeps the original wheelhouse build.
+    volume = manifest.get('runtime')
+    files = [] if volume else wheelhouse_files(manifest, profile)
+    if volume:
+        volume = runtime_plan(manifest, profile)
     emit(stage='连接 SSH，核对容器环境')
     state_dir = Path(payload['state_dir'])
     hosts = state_dir / 'known_hosts'
@@ -312,41 +459,75 @@ def install(payload):
         host_url = '['+host+']' if ':' in host else host
         endpoint = 'http://' + host_url + ':9001'
         service_endpoint = 'http://' + host_url + ':9002'
-        emit(stage='校验并分发运行时制品')
-        with client.open_sftp() as sftp:
-            upload_files(client, sftp, files)
-            if manifest.get('model_source'):
-                # Platforms that mount a shared model volume skip this: the
-                # weights are already at model_target and re-pushing 300+ GB
-                # over SFTP would be pure waste.
-                emit(stage='同步模型与节点管理程序')
-                upload_files(client, sftp, inventory(manifest['model_source'], manifest['model_target']))
-            else:
-                emit(stage='使用平台共享模型卷，跳过模型分发')
-            source = '/opt/tai-talea/onboarding/bootstrap'
-            clear_remote_dir(client, source)
-            upload_files(client, sftp, inventory(manifest['bootstrap_source'], source))
-            seed = '/opt/tai-talea/onboarding/install_node.py'
-            put_bytes(sftp, seed, Path(__file__).with_name('install_node.py').read_bytes())
-            put_bytes(sftp, '/opt/tai-talea/onboarding/sglang_compat.py', Path(__file__).with_name('sglang_compat.py').read_bytes())
-            runtime = dict(profile=profile, environment=manifest.get('environment',{}), token=payload['bootstrap_token'],
-                           interface=observed['interface'], model_path=manifest['model_target'],
-                           transfer_backend=manifest.get('transfer_backend', 'nixl'))
-            config_path = '/opt/tai-talea/onboarding/install.json'
-            put_bytes(sftp, config_path, json.dumps(runtime).encode())
-        emit(stage='安装依赖并启动节点管理服务')
-        _, out, err = client.exec_command('python3 /opt/tai-talea/onboarding/install_node.py', timeout=5400)
-        # The seed emits only structured milestones; detailed output stays in a
-        # node-local file and never contains SSH credentials.
-        for raw in out:
-            try:
-                message = json.loads(raw)
-            except ValueError:
-                continue
-            if 'stage' in message: emit(stage=message['stage'])
-            if 'error' in message: raise InstallError(message['error'])
-        if out.channel.recv_exit_status():
-            raise InstallError('容器安装失败，详细记录在容器 /opt/tai-talea/logs/onboarding.log')
+        if volume:
+            # Nothing but a few hundred bytes crosses SFTP here: the tarballs
+            # are on the platform volume the container already has mounted.
+            emit(stage='校验并解包共享卷上的运行时')
+            unpacked = remote(client, UNPACK, {
+                'source': volume['source'],
+                'checksums': volume.get('checksums', 'SHA256SUMS'),
+                'checksums_required': volume.get('checksums_required', True),
+                'tarballs': volume['tarballs'],
+                'purge': volume.get('purge') or [],
+            }, timeout=10800)
+            if unpacked.get('error'):
+                raise InstallError(unpacked['error'])
+            token_file = volume.get('token_file', '/etc/tai-talea/bootstrap-token')
+            profile_file = volume.get('profile_file', '/etc/tai-talea/profile.json')
+            with client.open_sftp() as sftp:
+                # The tarball carries the token and profile that were current
+                # when it was baked. Both must be replaced: this control plane
+                # signs its calls with controller.bootstrap_token, and a node
+                # still holding the previous one answers 401 to every start.
+                mkdirs(sftp, '/etc/tai-talea')
+                put_bytes(sftp, profile_file, json.dumps(profile).encode())
+                put_bytes(sftp, token_file, payload['bootstrap_token'].encode())
+            emit(stage='启动节点管理服务')
+            started = remote(client, START, {
+                'python': volume.get('bootstrap_python', 'python3'),
+                'bootstrap_source': volume.get('bootstrap_source', '/opt/tai-talea/bootstrap-src'),
+                'profile': profile_file,
+                'token_file': token_file,
+                'token': payload['bootstrap_token'],
+            }, timeout=900)
+            if started.get('error'):
+                raise InstallError(started['error'])
+        else:
+            emit(stage='校验并分发运行时制品')
+            with client.open_sftp() as sftp:
+                upload_files(client, sftp, files)
+                if manifest.get('model_source'):
+                    # Platforms that mount a shared model volume skip this: the
+                    # weights are already at model_target and re-pushing 300+ GB
+                    # over SFTP would be pure waste.
+                    emit(stage='同步模型与节点管理程序')
+                    upload_files(client, sftp, inventory(manifest['model_source'], manifest['model_target']))
+                else:
+                    emit(stage='使用平台共享模型卷，跳过模型分发')
+                source = '/opt/tai-talea/onboarding/bootstrap'
+                clear_remote_dir(client, source)
+                upload_files(client, sftp, inventory(manifest['bootstrap_source'], source))
+                seed = '/opt/tai-talea/onboarding/install_node.py'
+                put_bytes(sftp, seed, Path(__file__).with_name('install_node.py').read_bytes())
+                put_bytes(sftp, '/opt/tai-talea/onboarding/sglang_compat.py', Path(__file__).with_name('sglang_compat.py').read_bytes())
+                runtime = dict(profile=profile, environment=manifest.get('environment',{}), token=payload['bootstrap_token'],
+                               interface=observed['interface'], model_path=manifest['model_target'],
+                               transfer_backend=manifest.get('transfer_backend', 'nixl'))
+                config_path = '/opt/tai-talea/onboarding/install.json'
+                put_bytes(sftp, config_path, json.dumps(runtime).encode())
+            emit(stage='安装依赖并启动节点管理服务')
+            _, out, err = client.exec_command('python3 /opt/tai-talea/onboarding/install_node.py', timeout=5400)
+            # The seed emits only structured milestones; detailed output stays in a
+            # node-local file and never contains SSH credentials.
+            for raw in out:
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue
+                if 'stage' in message: emit(stage=message['stage'])
+                if 'error' in message: raise InstallError(message['error'])
+            if out.channel.recv_exit_status():
+                raise InstallError('容器安装失败，详细记录在容器 /opt/tai-talea/logs/onboarding.log')
         emit(stage='检查控制节点到容器的连通性')
         import urllib.request
         req = urllib.request.Request(endpoint + '/bootstrap/health', headers={'X-Bootstrap-Token':payload['bootstrap_token']})
