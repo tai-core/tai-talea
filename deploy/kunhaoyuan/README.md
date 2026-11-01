@@ -182,20 +182,52 @@ Every request in those four rows answered 200. Read them as follows.
   against 4,082. At 64 the pool holds 16 requests per worker, too few to fill a
   decode batch; the shape wants to be pushed to 32 per worker before its
   throughput is measured.
-- **TTFT is bimodal.** At 128 concurrent the median is 421 ms while p95 is
-  9.9 s: one request in twenty waits about ten seconds. The plateau sits at the
-  same place at 64 concurrent (9.8 s), which is what a fixed timeout looks like
-  rather than a queue that grows with load — but nothing has confirmed which
-  timeout, and this is the first thing worth attacking.
-- **192 concurrent is not usable.** 768 requests at concurrency 192 returned
-  `ok=192, failed=576`, every failure a 503 whose body is
-  `{"error":{"code":"no_available_workers","message":"No available workers (all
-  circuits open or unhealthy)"}}`. That is the Router's circuit breaker: enough
-  requests time out under the overload to open the circuit on healthy workers,
-  after which it refuses everything until a 30 s health check closes it again. A
-  probe at the same concurrency right after reported 368 of 400 answered and 32
-  refused, so the recovery is gradual and the ceiling is a cliff rather than a
-  slope.
+- **TTFT is bimodal, and the second mode is queue wait, not a timeout.** At 128
+  concurrent the median is 421 ms and p95 is 9.9 s. The Router is not the cause:
+  its own `/health` answered in at most 80 ms across 538 probes taken during a
+  saturated run, and `/get_loads` in at most 50 ms. The evidence is in the
+  Router's access log, which records per-request token counts and durations — a
+  `/generate` that took 9,842 ms logged `cached_tokens: 4032` of 4,096, so it had
+  essentially no prefill work to do and spent the time waiting. Sorting a run by
+  the second each request started gives a monotone decay, 5.02 s median at t=0
+  down to 1.24 s at t=20, which is what a draining queue looks like. The plateau
+  is one *service wave*: a worker runs at most `max_running_requests` (48 here,
+  read from `/server_info`, so 4 × 48 = 192 is the pool's ceiling), and a request
+  that arrives behind a full wave waits roughly one wave — about 10 s at
+  4096-in/256-out — regardless of how deep the queue behind it is. That is why
+  p95 sat at 9.8 s for both 64 and 128 concurrent: the magnitude is fixed by the
+  wave, only the probability of being caught by one grows with load.
+- **Nothing sheds load above 192, which is the real defect.** At 192 concurrent
+  the pool is exactly at 4 × 48 and every request either waits a wave or two or
+  times out client-side; the Router keeps accepting and sglang keeps queueing, so
+  latency degrades without bound and no 429 or 503 ever tells the caller to back
+  off. `--max-concurrent-requests` is -1 and no `--max-queued-requests` is set on
+  the workers.
+- **The 503s are not the circuit breaker, whatever the message says.**
+  `no_available_workers` is one string covering every way `select_worker` can
+  find nothing routable, and the text "all circuits open or unhealthy" is
+  `router.rs:303`'s default, not a diagnosis. Over this Router's whole lifetime
+  (70,435 log lines, six hours, 1,098 such 503s) the string `circuit` appears
+  **zero** times — no breaker ever transitioned — and the log never says
+  `unhealthy` or `tripped` either, so the Router's own health tracking never
+  fired. The 503s cluster in exactly two windows, 07:04–07:07 (490)
+  and 07:14:17–20 (576), and each client request burned 3 attempts at ~424 ms
+  each. Both windows sit inside a cluster of `model health probe failed;
+  instance taken out of rotation` from the **control plane**: 25 of them between
+  07:02 and 07:07 and 13 between 07:12 and 07:15, `streak:1` in 39 cases. The
+  mechanism is `settleService`: the probe is a real `/health_generate` call
+  behind a 2 s timeout, so it queues behind the batch it is measuring; the first
+  miss calls `closeReadiness`, which sets the Router's `routing_ready` false for
+  that instance, and when all four miss in the same round there is nothing left
+  to route to. `HealthFailureThreshold` (3) gates only condemnation, not removal
+  from rotation. Recovery is the next successful probe, which is why a re-probe
+  minutes later answered 368 of 400. At 07:06 the streak did reach 3 for w2, so
+  the controller condemned a healthy model and would have reloaded every GPU on
+  that node from a purely load-induced probe miss.
+
+Read the last two together: 192 concurrent is not a cliff in the Router's
+routing, and it is not a circuit breaker. It is the point where the pool is full
+*and* sustained load starts knocking instances out of rotation.
 
 ## Nightly start and stop
 
@@ -346,18 +378,33 @@ lines have aged out of the window.
 
 ## Left as known gaps
 
-- **The Router's circuit breaker turns an overload into an outage.** At 192
-  concurrent requests the pool answered 192 of 768; the rest were refused with
-  `code: no_available_workers`, which is the Router reporting that it has opened
-  the circuit on every worker. Workers were healthy throughout. Whatever the
-  trigger is — requests slow enough to count as failures, or the probe against
-  `/server_info` timing out while the queue is long — the first consequence is
-  that capacity disappears instead of degrading, and the recovery is not
-  instantaneous. The next steps are to find what is counted as a failure and to
-  decide whether an open circuit should back off per worker rather than refuse
-  the whole pool. Until then the deployment is safe below 128 concurrent and a
-  cliff above it; the token-bucket-shaped 9.9 s p95 TTFT is probably the same
-  cause seen from the other side.
+- **One probe miss takes an instance out of rotation, and load causes probe
+  misses.** `settleService` probes the model with `/health_generate` behind a 2 s
+  timeout; that endpoint is a generation, so it queues behind the batch, and it
+  already costs ~1.0 s idle on this pool. The first miss calls `closeReadiness`
+  and the Router stops routing to the instance; `HealthFailureThreshold` only
+  gates condemnation. Under sustained load all four can miss in the same
+  reconcile round, which is what produced both 503 bursts. The options, none of
+  them free: require N consecutive misses before closing readiness (availability
+  wins, a genuinely dead model keeps receiving traffic for N rounds); probe
+  something that does not queue, which means giving up the "is the model actually
+  generating" property that makes this probe worth having; or raise the timeout
+  above observed queueing, which only moves the load at which it breaks. The
+  measured numbers to decide with are in `## Serving baseline`.
+- **Nothing sheds load above 4 × `max_running_requests`.** 192 concurrent is the
+  pool's ceiling; past it the Router accepts everything and sglang queues
+  everything, so p95 grows without bound and no caller is told to back off.
+  Shedding has to live in the Router (`--max-concurrent-requests`, or a queue
+  with an explicit 503 and `Retry-After`), because the workers have no
+  `--max-queued-requests` and refusing there would still be invisible.
+- **`ops/taleactl.sh` waits on a metric this build does not export.** Drain waits
+  for `sglang:num_running_reqs` to reach 0 twice in a row; that gauge is not in
+  this sglang's `/metrics` (which carries only `prefill_effective_tokens_total`,
+  `realtime_tokens_total`, `cuda_graph_passes_total`, `http_requests_total` and
+  process metrics). The wait therefore always runs to its timeout, which is why a
+  drained-but-empty pool still took ~10 s. Measured `down` elapsed with real
+  traffic in flight was 70 s, so the ceiling hides the bug rather than avoiding
+  it.
 - **A generation that outlives `QUIESCE_TIMEOUT`** (300 s, roughly 75k tokens) is
   still cut by the Pod deletion, and the scale-down proceeds with a warning: at
   08:00 the cards have to come back. Raising the ceiling only moves the problem;
