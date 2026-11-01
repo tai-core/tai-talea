@@ -66,7 +66,9 @@ all. The Router has no flag to force it; a production gateway has to inject it.
 
 ```bash
 ops/taleactl.sh up        # scale the four workers to 1, wait for a real completion
-ops/taleactl.sh down      # scale them to 0, wait until the cards are free
+ops/taleactl.sh down      # close routing, let in-flight finish, then scale to 0
+ops/taleactl.sh drain     # close routing only (the pool stays up, unused)
+ops/taleactl.sh undrain   # put the workers back after a manual drain
 ops/taleactl.sh status    # replicas, pods, cards requested, endpoint
 ops/taleactl.sh hold 2    # suppress up/down for two hours (testing windows)
 ops/taleactl.sh release
@@ -83,7 +85,30 @@ The router and the control plane are deliberately left running: neither holds a
 card, and a router restart throws away the worker ids it handed out. `kubectl
 scale` is not granted to this account, so the script patches `spec.replicas`.
 
-Measured on 2026-11-01: up 263–304 s (warm page cache), down 32 s.
+Measured on 2026-11-01: up 263–304 s (warm page cache), down 23–32 s.
+
+### What `down` does before it scales
+
+`down` first sets each routable worker to `unavailable` in the Router
+(`PUT /state/workers/{id}`) and waits, so the requests that were already running
+finish instead of being cut off by a deleted Pod. Requests that arrive during
+that window get an honest 503 — the pool is going away — rather than a
+connection to a process that is stopping.
+
+Two details that cost real debugging:
+
+- The control plane's own `POST .../drain` is *not* this. It waits for load and
+  then stops SGLang, but it only closes Router readiness when the instance has no
+  recorded worker id, so a serving worker keeps receiving traffic right up to the
+  moment it dies.
+- `reason` on that endpoint is a closed enum (`manual` | `health_check`); a
+  free-text explanation is answered with 422.
+
+The wait is a settle window (20 s) plus a load probe, because `/get_load` counts
+what is queued at the worker, not what is generating: four concurrent requests
+were observed reading as zero load. A generation longer than the window can
+still be cut when the Pod is deleted. `TALEA_SKIP_DRAIN=1` restores the old
+scale-immediately behaviour.
 
 ## Token log
 
@@ -101,8 +126,12 @@ no translation layer is needed before the log reaches Vector.
 
 ## Left as known gaps
 
-- A scale-down cuts in-flight requests (503 for ~30 s) because the Router has no
-  drain call; draining through the control plane before scaling is the next step.
+- A generation longer than the 20 s settle window can still be cut by the Pod
+  deletion; the fix belongs on the worker side (stop waiting for
+  `running_req == 0`), not in the scale-down script.
 - `input_token_details.cached_tokens` never appears: the worker reports
   `prompt_tokens_details: null`. Enabling `--enable-cache-report` on the workers
   would populate it and let the cache-hit statistic leave zero.
+- The Router's worker registry keeps an entry per registration, not per address,
+  so a scaled-down pool leaves entries behind. They show as unhealthy and are
+  skipped by the drain script, but the list grows across restarts.

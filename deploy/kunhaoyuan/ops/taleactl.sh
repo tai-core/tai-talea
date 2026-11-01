@@ -13,10 +13,17 @@
 # bootstrap process is up - it returns {"status":"ok","phase":"starting"} while
 # the model is still loading. A "4/4 Ready" cluster can therefore serve nothing.
 #
-# usage: taleactl.sh up|down|status|hold [hours]|release|cycle
+# `down` first closes the Router's routing to the workers and waits for in-flight
+# requests to finish, so a scale-down does not truncate them. The requests that
+# arrive during that window still get 503 - the pool is going away - but they get
+# an honest 503 instead of a connection to a process that is already stopping.
+# TALEA_SKIP_DRAIN=1 scales without that step.
+#
+# usage: taleactl.sh up|down|drain|undrain|status|hold [hours]|release
 
 set -uo pipefail
 export KUBECONFIG=${KUBECONFIG:-/root/.kube/config}
+HERE=$(cd "$(dirname "$0")" && pwd)
 NS=${NS:-kunhaoyuan}
 WORKERS=${WORKERS:-"talea-w0 talea-w1 talea-w2 talea-w3"}
 NODE_PORT=${NODE_PORT:-31280}
@@ -28,6 +35,7 @@ LOCK_FILE=${LOCK_FILE:-/root/.taleactl.lock}
 POD_READY_TIMEOUT=${POD_READY_TIMEOUT:-2400}   # 40 min: a cold load is 11-12 min
 POD_GONE_TIMEOUT=${POD_GONE_TIMEOUT:-900}      # 15 min
 SERVE_TIMEOUT=${SERVE_TIMEOUT:-2400}
+QUIESCE_TIMEOUT=${QUIESCE_TIMEOUT:-90}         # how long in-flight may take to finish
 
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 die() { log "FAILED: $*"; exit 1; }
@@ -146,8 +154,82 @@ do_up() {
   do_status
 }
 
+# Close routing before the Pods disappear, so that what fails during a
+# scale-down is only the requests that arrive after there is no capacity left,
+# not the ones already in flight.
+#
+# This runs as a Pod because the Router's control port is a ClusterIP, and the
+# jump host can reach neither that nor any Pod address. Best effort on purpose:
+# at 08:00 the cards have to come back either way, so a failed drain is logged
+# and the scale-down proceeds.
+do_drain() { # $1 = close (default) | open
+  local image pod=talea-drain rc mode=${1:-close}
+  image=$(kubectl -n "$NS" get deploy talea-router -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+  [ -n "$image" ] || { log "drain skipped: cannot read the router image"; return 0; }
+
+  kubectl -n "$NS" create configmap talea-drain-script \
+    --from-file=drain.py="$HERE/drain-to-router.py" --dry-run=client -o yaml |
+    kubectl apply -f - >/dev/null || { log "drain skipped: could not stage the script"; return 0; }
+
+  kubectl -n "$NS" delete pod "$pod" --ignore-not-found --wait=true >/dev/null 2>&1
+  kubectl -n "$NS" apply -f - >/dev/null <<YAML || { log "drain skipped: could not schedule the Pod"; return 0; }
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+  namespace: $NS
+spec:
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: harbor-cred
+  containers:
+    - name: drain
+      image: $image
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          py=\$(command -v python3 || command -v /opt/sglang/bin/python3 || echo /opt/sglang/bin/python)
+          exec "\$py" /drain/drain.py
+      env:
+        - {name: ROUTER_URL, value: "http://talea-router:30001"}
+        - {name: QUIESCE_TIMEOUT, value: "$QUIESCE_TIMEOUT"}
+        - {name: MODE, value: "$mode"}
+      volumeMounts:
+        - {name: script, mountPath: /drain, readOnly: true}
+  volumes:
+    - name: script
+      configMap:
+        name: talea-drain-script
+YAML
+
+  local deadline=$(( $(date +%s) + QUIESCE_TIMEOUT + 120 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    case "$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null)" in
+      Succeeded) rc=0; break ;;
+      Failed)    rc=1; break ;;
+    esac
+    sleep 3
+  done
+  kubectl -n "$NS" logs "$pod" 2>&1 | sed 's/^/  /'
+  kubectl -n "$NS" delete pod "$pod" --wait=false >/dev/null 2>&1
+  return "${rc:-1}"
+}
+
 do_down() {
   hold_active && { log "down suppressed by hold"; return 0; }
+
+  if [ "${TALEA_SKIP_DRAIN:-0}" = "1" ]; then
+    log "down: drain skipped on request"
+  else
+    log "down: closing routing to the workers"
+    if do_drain close; then
+      log "down: routing closed and no request is in flight"
+    else
+      log "WARNING: drain did not complete cleanly; scaling anyway to release the cards"
+    fi
+  fi
+
   log "down: scaling ${WORKERS} to 0"
   set_replicas 0 $WORKERS || die "could not patch the worker deployments"
 
@@ -225,6 +307,8 @@ do_release() {
 case "${1:-}" in
   up)      do_up ;;
   down)    do_down ;;
+  drain)   do_drain close ;;
+  undrain) do_drain open ;;
   status)  do_status ;;
   hold)    do_hold "${2:-2}" ;;
   release) do_release ;;
