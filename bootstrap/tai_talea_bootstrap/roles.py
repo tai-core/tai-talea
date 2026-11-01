@@ -2,13 +2,28 @@
 
 The bootstrap receives a role from the control plane and turns it into an
 argument vector. Nothing else is accepted: no shell, no free form command line.
+
+Two deployment shapes are supported and they differ by one flag:
+
+``prefill`` / ``decode``
+    A disaggregated pair. The process is started with
+    ``--disaggregation-mode`` and expects a KV peer on the other side.
+
+``regular``
+    A self-contained worker. It is started **without**
+    ``--disaggregation-mode``: passing it would make SGLang wait for a prefill
+    peer that this deployment does not run, and the worker would answer 503
+    forever while looking healthy on ``/health``.
 """
 
 from __future__ import annotations
 
 import shlex
 
-ROLES = ("prefill", "decode")
+ROLES = ("prefill", "decode", "regular")
+
+# Roles that take part in a disaggregated pair. Only these get the mode flag.
+DISAGGREGATED_ROLES = ("prefill", "decode")
 
 # Characters that must never appear in an argument handed to SGLang. The command
 # is executed as a vector, but rejecting them early gives a clean 400 instead of
@@ -77,11 +92,21 @@ ALLOWED_EXTRA_FLAGS = (
     # runner this model uses, and leaving it on changes the numerical path.
     "--disable-shared-experts-fusion",
     # Speculative decoding. Only usable in the aggregated layout: the upstream
-    # cookbook states it does not start under PD disaggregation at this cut.
+    # cookbook states it does not start under PD disaggregation at this cut,
+    # which is one of the reasons the aggregated shape exists at all.
     "--speculative-algorithm",
     "--speculative-num-steps",
     "--speculative-eagle-topk",
     "--speculative-num-draft-tokens",
+    # Adaptive draft length. Aggregated-only, next to the flags above, and the
+    # value that took GLM-5.3-Flash from a fixed 5/6 draft to a load-following
+    # one on B300.
+    "--speculative-adaptive",
+    # The checkpoint's quantization scheme. NVFP4 weights advertise themselves
+    # in config.json, but SGLang only selects the modelopt path when the flag
+    # is present; without it the loader falls back to a scheme the checkpoint
+    # does not carry and dies during weight loading.
+    "--quantization",
 )
 
 
@@ -131,7 +156,9 @@ def build_sglang_command(role, model_id, *, model_path="", host="0.0.0.0", port=
     """Build the SGLang argument vector for one role.
 
     Prefill and Decode workers are started with ``--disaggregation-mode`` so the
-    Router can keep them in separate pools (§8).
+    Router can keep them in separate pools (§8). A regular worker is not: it is
+    a whole server on its own, and the flag would make it wait for a KV peer
+    that does not exist in an aggregated deployment.
     """
     if role not in ROLES:
         raise ConfigurationError("role must be one of %s" % (ROLES,))
@@ -159,9 +186,9 @@ def build_sglang_command(role, model_id, *, model_path="", host="0.0.0.0", port=
         host,
         "--port",
         str(port),
-        "--disaggregation-mode",
-        role,
     ]
+    if role in DISAGGREGATED_ROLES:
+        command += ["--disaggregation-mode", role]
     command += validate_extra_args(extra_args)
     # Note: there is deliberately no --log-file here. SGLang 0.5.x does not
     # accept one, and passing it made the child die inside argparse - before it

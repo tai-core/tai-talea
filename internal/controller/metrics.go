@@ -29,8 +29,10 @@ var allServiceStates = []domain.ServiceState{
 	domain.ServiceFailed,
 }
 
-// allRoles is the closed set of PD roles, including "unassigned".
-var allRoles = []domain.Role{domain.RoleNone, domain.RolePrefill, domain.RoleDecode}
+// allRoles is the closed set of roles the control plane can assign, including
+// "unassigned". Every value here must have a matching service gauge series, or
+// a regular worker would be counted in the total and missing from its bucket.
+var allRoles = []domain.Role{domain.RoleNone, domain.RolePrefill, domain.RoleDecode, domain.RoleRegular}
 
 // PublishGauges recomputes the capacity and service gauges from the database.
 func (c *Controller) PublishGauges(ctx context.Context) error {

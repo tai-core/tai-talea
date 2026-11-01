@@ -130,6 +130,23 @@ class RoleTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             build_sglang_command("router", "model-a")
 
+    def test_regular_worker_omits_the_disaggregation_mode(self):
+        # A regular worker is a whole server: the flag would make it wait for a
+        # prefill peer the aggregated deployment does not run.
+        regular = build_sglang_command("regular", "model-a", port=30000)
+        self.assertNotIn("--disaggregation-mode", regular)
+        self.assertEqual(regular[0], "python3")
+        self.assertIn("--port", regular)
+
+    def test_aggregated_only_flags_are_allowed(self):
+        # Entries carry the flag and its value together, exactly as they appear
+        # in controller.extra_sglang_args ("--flag value" or "--flag=value").
+        command = build_sglang_command(
+            "regular", "model-a",
+            extra_args=["--quantization modelopt_fp4", "--speculative-adaptive"])
+        self.assertIn("modelopt_fp4", command)
+        self.assertIn("--speculative-adaptive", command)
+
     def test_model_id_is_required(self):
         with self.assertRaises(ConfigurationError):
             build_sglang_command("prefill", "   ")

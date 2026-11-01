@@ -78,6 +78,7 @@ func buildAdapter(global config.Config, partnerConfig config.PartnerConfig, reso
 			ServicePort:       alaya.ServicePort,
 			ProductCode:       alaya.ProductCode,
 			Image:             alaya.Image,
+			ImageType:         alaya.ImageType,
 			ComputeResource:   alaya.ComputeResource,
 			Priority:          alaya.Priority,
 			NASStorageID:      alaya.NASStorageID,

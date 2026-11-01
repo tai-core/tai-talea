@@ -136,9 +136,11 @@ type ControllerConfig struct {
 	//	extra_sglang_args_by_role:
 	//	  decode:                 - --mem-fraction-static=0.55
 	//
-	// Keys are the PD roles ("prefill", "decode"). A one-sided flag - decode's
-	// --cuda-graph-max-bs-decode, prefill's --chunked-prefill-size - simply
-	// appears in that role's list and nowhere else.
+	// Keys are the roles the planner can assign: "prefill", "decode" and
+	// "regular". A one-sided flag - decode's --cuda-graph-max-bs-decode,
+	// prefill's --chunked-prefill-size - simply appears in that role's list and
+	// nowhere else, and an aggregated deployment puts its whole override under
+	// "regular".
 	ExtraSGLangArgsByRole map[string][]string `yaml:"extra_sglang_args_by_role" json:"extra_sglang_args_by_role"`
 	LeaseWarning          Duration            `yaml:"lease_warning" json:"lease_warning"`
 	LostRateThreshold     float64             `yaml:"lost_rate_threshold" json:"lost_rate_threshold"`
@@ -391,8 +393,12 @@ type PartnerAlayaNeWConfig struct {
 	BootstrapPort int `yaml:"bootstrap_port" json:"bootstrap_port"`
 	ServicePort   int `yaml:"service_port" json:"service_port"`
 	// Creation defaults; empty product_code disables on-demand creation.
-	ProductCode      string `yaml:"product_code" json:"product_code"`
-	Image            string `yaml:"image" json:"image"`
+	ProductCode string `yaml:"product_code" json:"product_code"`
+	Image       string `yaml:"image" json:"image"`
+	// ImageType resolves Image on the platform side: general, application or
+	// private. Empty keeps the platform default, which is only correct for
+	// images in the public catalogue.
+	ImageType        string `yaml:"image_type" json:"image_type"`
 	ComputeResource  string `yaml:"compute_resource" json:"compute_resource"`
 	NASStorageID     string `yaml:"nas_storage_id" json:"nas_storage_id"`
 	NASFileDirectory string `yaml:"nas_file_directory" json:"nas_file_directory"`
@@ -586,8 +592,9 @@ func (c Config) Validate() error {
 		return errors.New("controller.model_id is required")
 	}
 	for role, arguments := range c.Controller.ExtraSGLangArgsByRole {
-		if role != string(domain.RolePrefill) && role != string(domain.RoleDecode) {
-			return fmt.Errorf("controller.extra_sglang_args_by_role: %q is not a prefill/decode role", role)
+		if !domain.Role(role).Valid() {
+			return fmt.Errorf("controller.extra_sglang_args_by_role: %q is not one of %q, %q, %q",
+				role, domain.RolePrefill, domain.RoleDecode, domain.RoleRegular)
 		}
 		for _, argument := range arguments {
 			if strings.TrimSpace(argument) == "" {

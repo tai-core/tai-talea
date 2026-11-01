@@ -37,6 +37,7 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 	var (
 		prefillServing int
 		decodeServing  int
+		regularServing int
 	)
 	for _, instance := range instances {
 		if instance.PendingRelease || instance.PendingUpdate != nil {
@@ -55,10 +56,13 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 				RoleSince: roleSince,
 				Assigned:  true,
 			})
-			if instance.Role == domain.RolePrefill {
+			switch instance.Role {
+			case domain.RolePrefill:
 				prefillServing++
-			} else {
+			case domain.RoleDecode:
 				decodeServing++
+			case domain.RoleRegular:
+				regularServing++
 			}
 		case instance.InstanceState == domain.InstanceIdle && !instance.Role.Valid() && assignable(instance):
 			input.Idle = append(input.Idle, planner.Candidate{ID: instance.ID})
@@ -83,24 +87,36 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 
 	// Router in-flight counts are not scheduler queue lengths. Only fresh,
 	// complete scheduler samples are passed as measured planner inputs.
+	//
+	// "Complete" means different things in the two deployment shapes: a PD pool
+	// is complete when both sides reported, an aggregated pool when its single
+	// role did. Dereferencing the PD pointers on the strength of the aggregated
+	// answer would panic, so each shape fills only its own fields.
 	load := c.Telemetry("")
 	input.Load.MeasuredAt = load.At
-	input.Load.Valid = load.Complete
 	input.Load.Advice = load.Advice
-	if load.Complete {
+	switch {
+	case load.Complete && load.Prefill.Pressure != nil && load.Decode.Pressure != nil:
+		input.Load.Valid = true
 		input.Load.QueueLength = *load.Prefill.Queue + *load.Decode.Queue
 		input.Load.PrefillPressure = load.Prefill.Pressure
 		input.Load.DecodePressure = load.Decode.Pressure
 		input.Load.PDLoadImbalance = *load.PressureGap
 		input.Load.InputTokenRate = load.Prefill.TokenRate
 		input.Load.OutputTokenRate = load.Decode.TokenRate
+	case load.Complete && load.Regular.Pressure != nil:
+		// Reported for the console. The aggregated planner deliberately makes
+		// no capacity decision from it: replica count came from a benchmark.
+		input.Load.Valid = true
+		input.Load.QueueLength = *load.Regular.Queue
+		input.Load.OutputTokenRate = load.Regular.TokenRate
 	}
 
 	decision, err := c.planner.Plan(input)
 	if err != nil {
 		return planner.Decision{}, err
 	}
-	c.publishPlanMetrics(prefillServing, decodeServing, decision)
+	c.publishPlanMetrics(prefillServing, decodeServing, regularServing, decision)
 	c.recordGearChange(ctx, decision)
 
 	for _, action := range decision.Actions {
@@ -343,26 +359,37 @@ func (c *Controller) startRetryPending(instance domain.Instance) bool {
 		instance.StartRearms < c.cfg.Controller.StartRetryMaxRearms
 }
 
-func (c *Controller) publishPlanMetrics(prefill, decode int, decision planner.Decision) {
+func (c *Controller) publishPlanMetrics(prefill, decode, regular int, decision planner.Decision) {
 	if c.metrics == nil {
 		return
 	}
-	total := prefill + decode
-	current := 0.0
-	if total > 0 {
-		current = float64(prefill) / float64(total)
+	total := prefill + decode + regular
+	// A P/D ratio only exists in the disaggregated shape. Publishing 0/0 in
+	// aggregated mode would read as "the pool lost its prefill workers", which
+	// is the exact alert a disaggregated deployment must still be able to fire.
+	if decision.Mode != planner.ModeAggregated {
+		current := 0.0
+		if prefill+decode > 0 {
+			current = float64(prefill) / float64(prefill+decode)
+		}
+		c.metrics.SetGauge(obs.MetricPDRatioCurrent,
+			"Observed Prefill share of serving instances.", nil, current)
+		c.metrics.SetGauge(obs.MetricPDRatioTarget,
+			"Planner target Prefill share of serving instances.", nil, decision.TargetRatio)
 	}
-	c.metrics.SetGauge(obs.MetricPDRatioCurrent,
-		"Observed Prefill share of serving instances.", nil, current)
-	c.metrics.SetGauge(obs.MetricPDRatioTarget,
-		"Planner target Prefill share of serving instances.", nil, decision.TargetRatio)
 	c.metrics.SetGauge("capacity_serving_instances",
-		"Instances currently holding a PD role.", nil, float64(total))
+		"Instances currently holding a role.", nil, float64(total))
+	c.metrics.SetGauge("capacity_regular_instances",
+		"Instances serving as self-contained regular workers.", nil, float64(regular))
 }
 
 // checkRatioDrift alerts when the observed ratio stays away from the target for
 // several consecutive rounds (§14: 实际 P/D 比例长期偏离目标).
 func (c *Controller) checkRatioDrift(ctx context.Context, decision planner.Decision) {
+	if decision.Mode == planner.ModeAggregated {
+		// No ratio exists, so there is nothing to drift away from.
+		return
+	}
 	tolerance := c.cfg.Alerts.RatioTolerance
 	if tolerance <= 0 {
 		return

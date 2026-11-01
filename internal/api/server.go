@@ -376,6 +376,7 @@ func (s *Server) handleGetPlanner(writer http.ResponseWriter, request *http.Requ
 	instance := s.opts.Controller.Planner()
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"mode":               instance.Mode(),
+		"modes":              planner.ModeNames(),
 		"last_observed_load": instance.LastObservedLoad(),
 		"gear":               instance.Config().Gear,
 		"effective_gear":     instance.EffectiveGear(),
@@ -419,6 +420,7 @@ func (s *Server) handleSetPlannerGear(writer http.ResponseWriter, request *http.
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"mode":           instance.Mode(),
+		"modes":          planner.ModeNames(),
 		"gear":           instance.Config().Gear,
 		"gears":          planner.GearNames(),
 		"effective_gear": instance.EffectiveGear(),

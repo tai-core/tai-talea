@@ -1,12 +1,28 @@
-// Package planner implements the PD planner: a Prefill/Decode ratio with
-// manual gears, change caps, minimum hold time, cooldown and a preference for
-// idle instances.
+// Package planner implements the capacity planner. It has two independent
+// shapes and a deployment picks one of them:
+//
+//   - disaggregated: a Prefill/Decode ratio with manual gears, change caps,
+//     minimum hold time, cooldown and a preference for idle instances. An
+//     optional automatic mode walks the gear ladder from measured pressure.
+//   - aggregated: every available instance runs the same self-contained
+//     worker. There is no ratio to keep, so the whole gear machinery - ladder,
+//     ratio targets, role conversion - is out of the picture and the planner
+//     only has to make the pool's shape match the number of containers the
+//     partner provided.
 //
 // Development document §11 is explicit that milestone 1 must not claim adaptive
 // Prefill/Decode sizing, so the fixed gear remains the default and the only
 // behaviour unless auto mode is switched on. Milestone 3 adds that mode: it
 // consumes the measured LoadSnapshot and walks the gear ladder towards the role
 // with the higher scheduler pressure, one rung per cooldown window.
+//
+// Aggregated mode was added for deployments whose throughput is best with a
+// single process per GPU (GLM-5.3-Flash on B300: four TP4 replicas beat the
+// disaggregated layouts, and speculative decoding does not start under PD at
+// this cut). It is a separate branch rather than a ratio of 1:0 because a
+// regular worker is not a prefill worker with the decode half missing: it has
+// no KV peer, the bootstrap must not pass --disaggregation-mode, and the
+// Router files it under a third worker type.
 package planner
 
 import (
@@ -37,6 +53,10 @@ const (
 	// scheduler pressure. It needs a complete P/D load sample to act at all,
 	// and it moves at most one rung per cooldown window.
 	ModeAuto = "auto"
+	// ModeAggregated drops the ratio entirely: every available instance runs
+	// the same self-contained worker and the pool is exactly as wide as the
+	// partner made it. Gear, load and capacity actions do not apply.
+	ModeAggregated = "aggregated"
 )
 
 // DefaultDeadBand is the pressure gap below which auto mode keeps the current
@@ -50,6 +70,11 @@ const DefaultDeadBand = 0.2
 // capacity back. It is deliberately far below DefaultDeadBand: asking for
 // capacity again costs a queue position, not just money.
 const DefaultReleaseBelow = 0.1
+
+// ModeNames returns the supported planner modes in a stable order. A console
+// that offers a mode switch should read this rather than hard-code the list,
+// because a new shape is a value here and nothing else.
+func ModeNames() []string { return []string{ModeFixed, ModeAuto, ModeAggregated} }
 
 // GearNames returns the supported gears in a stable order.
 func GearNames() []string {
@@ -94,10 +119,10 @@ func stepGear(current string, step int) (string, bool) {
 
 // Config is the planner tuning surface.
 type Config struct {
-	// Mode is ModeFixed (default) or ModeAuto.
+	// Mode is ModeFixed (default), ModeAuto or ModeAggregated.
 	Mode string `json:"mode" yaml:"mode"`
 	// Gear is the manual ratio gear, for example "1:1". Auto mode starts the
-	// ladder from it.
+	// ladder from it. Aggregated mode ignores it and accepts it being empty.
 	Gear string `json:"gear" yaml:"gear"`
 	// MaxChangePerRound caps how many instances may change role per round.
 	MaxChangePerRound int `json:"max_change_per_round" yaml:"max_change_per_round"`
@@ -108,7 +133,9 @@ type Config struct {
 	Cooldown time.Duration `json:"cooldown" yaml:"cooldown"`
 	// MaxServing optionally caps how many instances serve traffic at once.
 	// Zero means "use every available instance", which is the milestone 1
-	// behaviour: we never ask the partner for capacity we do not have.
+	// behaviour: we never ask the partner for capacity we do not have. In
+	// aggregated mode it is the only sizing knob there is: the pool serves
+	// min(available, max_serving) regular workers.
 	MaxServing int `json:"max_serving" yaml:"max_serving"`
 	// AutoDeadBand is the minimum |prefill_pressure - decode_pressure| that makes
 	// auto mode move a step. Zero selects DefaultDeadBand.
@@ -130,11 +157,18 @@ type Config struct {
 // normalisedMode reports the active mode, treating the unset value as fixed so
 // configurations written before auto mode existed keep their behaviour.
 func (c Config) normalisedMode() string {
-	if c.Mode == ModeAuto {
+	switch c.Mode {
+	case ModeAuto:
 		return ModeAuto
+	case ModeAggregated:
+		return ModeAggregated
+	default:
+		return ModeFixed
 	}
-	return ModeFixed
 }
+
+// aggregated reports whether the ratio machinery is out of the picture.
+func (c Config) aggregated() bool { return c.normalisedMode() == ModeAggregated }
 
 // deadBand returns the active dead band, falling back to DefaultDeadBand so
 // auto mode can be switched on without tuning anything.
@@ -156,11 +190,19 @@ func (c Config) releaseBelow() float64 {
 
 // Validate rejects impossible planner configurations.
 func (c Config) Validate() error {
-	if c.Mode != "" && c.Mode != ModeFixed && c.Mode != ModeAuto {
-		return fmt.Errorf("planner mode must be %q or %q, got %q", ModeFixed, ModeAuto, c.Mode)
+	switch c.Mode {
+	case "", ModeFixed, ModeAuto, ModeAggregated:
+	default:
+		return fmt.Errorf("planner mode must be %q, %q or %q, got %q",
+			ModeFixed, ModeAuto, ModeAggregated, c.Mode)
 	}
-	if _, ok := Gears[c.Gear]; !ok {
-		return fmt.Errorf("planner gear must be one of %v, got %q", GearNames(), c.Gear)
+	if !c.aggregated() {
+		// A gear is meaningless without a ratio to keep, so requiring one in
+		// aggregated mode would force operators to write a value the planner
+		// never reads - and then quietly disagree with it.
+		if _, ok := Gears[c.Gear]; !ok {
+			return fmt.Errorf("planner gear must be one of %v, got %q", GearNames(), c.Gear)
+		}
 	}
 	if c.MaxChangePerRound <= 0 {
 		return errors.New("planner max change per round must be positive")
@@ -307,6 +349,11 @@ type Decision struct {
 	CurrentRatio  float64 `json:"current_ratio"`
 	TargetPrefill int     `json:"target_prefill"`
 	TargetDecode  int     `json:"target_decode"`
+	// TargetRegular is the aggregated mode target and is zero in every PD
+	// mode. It is a separate field rather than "all of the above" because a
+	// console that renders a P/D ratio must be able to tell the two shapes
+	// apart; a regular pool has no ratio to draw.
+	TargetRegular int     `json:"target_regular,omitempty"`
 	ServingCount  int     `json:"serving_count"`
 	IdleCount     int     `json:"idle_count"`
 	// RecoveringCount and StrandedCount describe capacity the control plane owns
@@ -380,14 +427,15 @@ func (p *Planner) SetGear(gear string) error {
 	return nil
 }
 
-// SetMode switches between the fixed and the automatic planner. An empty mode
-// selects the fixed default.
+// SetMode switches between the fixed, automatic and aggregated planners. An
+// empty mode selects the fixed default.
 func (p *Planner) SetMode(mode string) error {
 	if mode == "" {
 		mode = ModeFixed
 	}
-	if mode != ModeFixed && mode != ModeAuto {
-		return fmt.Errorf("planner mode must be %q or %q, got %q", ModeFixed, ModeAuto, mode)
+	if mode != ModeFixed && mode != ModeAuto && mode != ModeAggregated {
+		return fmt.Errorf("planner mode must be %q, %q or %q, got %q",
+			ModeFixed, ModeAuto, ModeAggregated, mode)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -634,10 +682,19 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 		now = time.Now().UTC()
 	}
 	mode := p.config.normalisedMode()
-	gear := p.gear()
-	ratio, ok := Gears[gear]
-	if !ok {
-		return Decision{}, fmt.Errorf("planner gear %q is not supported", gear)
+	// Aggregated mode has no ratio, so a gear is neither required nor read. The
+	// lookup is skipped rather than defaulted: indexing Gears with an empty
+	// string would fail and take down a deployment that is configured exactly
+	// as the documentation says to configure it.
+	gear := ""
+	ratio := 0.0
+	if mode != ModeAggregated {
+		gear = p.gear()
+		found := false
+		ratio, found = Gears[gear]
+		if !found {
+			return Decision{}, fmt.Errorf("planner gear %q is not supported", gear)
+		}
 	}
 
 	decision := Decision{
@@ -663,19 +720,31 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 			decision.StrandedCount))
 	}
 
-	prefillNow := 0
+	prefillNow, decodeNow := 0, 0
 	for _, candidate := range input.Serving {
-		if candidate.Role == domain.RolePrefill {
+		switch candidate.Role {
+		case domain.RolePrefill:
 			prefillNow++
+		case domain.RoleDecode:
+			decodeNow++
 		}
 	}
-	if len(input.Serving) > 0 {
-		decision.CurrentRatio = float64(prefillNow) / float64(len(input.Serving))
+	// The ratio describes the disaggregated workers only. A regular worker
+	// left over from the other shape is neither side, and counting it as a
+	// decode worker would move the target and trigger a reassignment to fix a
+	// ratio that was never wrong.
+	if pd := prefillNow + decodeNow; pd > 0 {
+		decision.CurrentRatio = float64(prefillNow) / float64(pd)
 	}
 
 	if p.config.Cooldown > 0 && !p.lastChangeAt.IsZero() && now.Sub(p.lastChangeAt) < p.config.Cooldown {
 		decision.Notes = append(decision.Notes, fmt.Sprintf(
 			"cooldown active for another %s", (p.config.Cooldown-now.Sub(p.lastChangeAt)).Round(time.Second)))
+		return decision, nil
+	}
+
+	if mode == ModeAggregated {
+		p.planAggregated(input, &decision, now)
 		return decision, nil
 	}
 
@@ -703,7 +772,13 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 	// that is not serving as if it were is how a degraded pool gets planned as
 	// a whole one: the deficit would be filled by converting a healthy worker
 	// instead of by waiting for the one that is already coming back.
-	total := len(input.Serving) + len(input.Idle)
+	//
+	// Regular workers are absent for the same reason plus one of their own:
+	// they are drained this round (a PD pool cannot use a worker that was
+	// started without --disaggregation-mode), so counting them would make the
+	// round plan against capacity it is about to take away.
+	servingPD := prefillNow + decodeNow
+	total := servingPD + len(input.Idle)
 	if p.config.MaxServing > 0 && total > p.config.MaxServing {
 		decision.Notes = append(decision.Notes, fmt.Sprintf(
 			"max_serving=%d caps %d available instances", p.config.MaxServing, total))
@@ -719,6 +794,24 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 
 	// Drain surplus capacity before it can take a role.
 	actions := []Action{}
+	// A regular worker cannot serve in a PD pool: it was started without
+	// --disaggregation-mode and has no KV peer. Draining it is the mirror of
+	// what aggregated mode does to a leftover prefill or decode worker, and it
+	// is what makes switching the other way round safe as well.
+	for _, candidate := range movable(input.Serving, now, p.config.MinHold) {
+		if len(actions) >= p.config.MaxChangePerRound {
+			break
+		}
+		if candidate.Role != domain.RoleRegular {
+			continue
+		}
+		actions = append(actions, Action{
+			Kind:       ActionDrain,
+			InstanceID: candidate.ID,
+			FromRole:   candidate.Role,
+			Reason:     "a disaggregated pool cannot use a regular worker: it has no KV peer to exchange with",
+		})
+	}
 	// Capacity verbs come before the role phases on purpose: whichever instance a
 	// release names is reserved here, and every phase below skips anything this
 	// round has already touched.
@@ -730,8 +823,8 @@ func (p *Planner) Plan(input Input) (Decision, error) {
 		}
 	}
 	prefillPlanned := prefillNow
-	decodePlanned := len(input.Serving) - prefillNow
-	drainBudget := len(input.Serving) - total
+	decodePlanned := decodeNow
+	drainBudget := servingPD - total
 	if drainBudget > 0 {
 		eligible := movable(input.Serving, now, p.config.MinHold)
 		for drainBudget > 0 && len(actions) < p.config.MaxChangePerRound {
@@ -880,6 +973,104 @@ done:
 	return decision, nil
 }
 
+// planAggregated is the second planning shape: the pool holds one kind of
+// worker, so there is no ratio to keep.
+//
+// Deliberately absent: the gear ladder, the pressure sample and the capacity
+// verbs. "Aggregated" means the deployment already decided how wide the pool
+// should be - four TP4 replicas is a number that came from a benchmark, not
+// from a pressure ratio - and the planner's whole job is to make sure every
+// instance it was given runs a regular worker.
+//
+// Two details still need care:
+//
+//   - a worker left over from a PD deployment carries prefill or decode, and a
+//     regular pool cannot use it: it was started with --disaggregation-mode and
+//     waits for a KV peer this pool does not have. It is drained, and a later
+//     round assigns it back as regular. That is also what makes switching a
+//     running deployment from PD to aggregated safe instead of a manual rebuild.
+//   - max_serving is the only sizing knob. Zero means "every instance the
+//     partner provided", which is the normal case on a fixed-capacity cluster.
+func (p *Planner) planAggregated(input Input, decision *Decision, now time.Time) {
+	total := len(input.Serving) + len(input.Idle)
+	target := total
+	if p.config.MaxServing > 0 && total > p.config.MaxServing {
+		decision.Notes = append(decision.Notes, fmt.Sprintf(
+			"max_serving=%d caps %d available instances", p.config.MaxServing, total))
+		target = p.config.MaxServing
+	}
+	decision.TargetRegular = target
+
+	actions := make([]Action, 0, target)
+	surplus := total - target
+
+	// Phase 1: take out what cannot serve in this shape. Surplus capacity goes
+	// first, then anything still carrying a PD role.
+	for _, candidate := range movable(input.Serving, now, p.config.MinHold) {
+		if len(actions) >= p.config.MaxChangePerRound {
+			decision.Notes = append(decision.Notes, "max_change_per_round reached")
+			break
+		}
+		switch {
+		case surplus > 0:
+			actions = append(actions, Action{
+				Kind:       ActionDrain,
+				InstanceID: candidate.ID,
+				FromRole:   candidate.Role,
+				Reason:     fmt.Sprintf("surplus capacity beyond max_serving=%d", p.config.MaxServing),
+			})
+			surplus--
+		case candidate.Role != domain.RoleRegular:
+			actions = append(actions, Action{
+				Kind:       ActionDrain,
+				InstanceID: candidate.ID,
+				FromRole:   candidate.Role,
+				Reason: fmt.Sprintf(
+					"aggregated mode cannot use a %s worker: it was started with --disaggregation-mode and has no KV peer here",
+					candidate.Role),
+			})
+		}
+	}
+
+	regular := 0
+	for _, candidate := range input.Serving {
+		if candidate.Role == domain.RoleRegular && !alreadyPlanned(actions, candidate.ID) {
+			regular++
+		}
+	}
+
+	// Phase 2: fill the pool from idle instances. Sorted so a round is
+	// reproducible; there is no other preference to express, because every
+	// regular worker is interchangeable.
+	idle := make([]Candidate, len(input.Idle))
+	copy(idle, input.Idle)
+	sort.Slice(idle, func(i, j int) bool { return idle[i].ID < idle[j].ID })
+	for _, candidate := range idle {
+		if regular >= target {
+			break
+		}
+		if len(actions) >= p.config.MaxChangePerRound {
+			decision.Notes = append(decision.Notes, "max_change_per_round reached")
+			break
+		}
+		if alreadyPlanned(actions, candidate.ID) {
+			continue
+		}
+		actions = append(actions, Action{
+			Kind:       ActionAssign,
+			InstanceID: candidate.ID,
+			Role:       domain.RoleRegular,
+			Reason:     "aggregated mode runs an identical worker on every available instance",
+		})
+		regular++
+	}
+
+	decision.Actions = actions
+	if len(actions) > 0 {
+		p.lastChangeAt = now
+	}
+}
+
 // nextConversion returns the worker this round should move out of fromRole, if
 // any is allowed to move. It is the role-parameterised form of "oldest movable
 // candidate that this round has not already touched".
@@ -939,6 +1130,11 @@ func movable(candidates []Candidate, now time.Time, minHold time.Duration) []Can
 
 // DecisionSummary is a compact human readable rendering used in logs.
 func (d Decision) DecisionSummary() string {
+	if d.Mode == ModeAggregated {
+		return fmt.Sprintf("mode=aggregated target=regular:%d serving=%d idle=%d recovering=%d stranded=%d actions=%d",
+			d.TargetRegular, d.ServingCount, d.IdleCount,
+			d.RecoveringCount, d.StrandedCount, len(d.Actions))
+	}
 	return fmt.Sprintf("gear=%s target=%d/%d serving=%d idle=%d recovering=%d stranded=%d actions=%d",
 		d.Gear, d.TargetPrefill, d.TargetDecode, d.ServingCount, d.IdleCount,
 		d.RecoveringCount, d.StrandedCount, len(d.Actions))

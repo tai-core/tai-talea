@@ -169,9 +169,14 @@ Router（Rust，独立仓库）与控制面之间有四条硬契约，全部来�
 4. **worker id 是进程内随机 UUID**，`url_to_id` 映射在 Router 内存里：Router 重启
    后 id 全换；同 URL 重注册复用 id（drain 状态会粘住）。控制面不能假设 id 稳定。
 
-## 8. Planner（P/D 比例规划）
+## 8. Planner（两种互斥的部署形态）
 
-`internal/planner/planner.go`，职责：在 fixed 模式下维持 `gear`（如 `"1:1"`）档位。
+`internal/planner/planner.go`。一个部署只走其中一条路，两条路不共享决策逻辑，
+只在输入（`Input`）和输出（`Action`）上共用类型。
+
+### 8.1 分离式（`mode: fixed | auto`）
+
+职责：维持 `gear`（如 `"1:1"`）档位。
 
 - **计数口径**：`total = Serving + Idle`；`TargetPrefill = floor(total × ratio)`；
   仅当 `total >= 2` 才把目标夹到 `[1, total-1]`。计划数按 Serving 侧算。
@@ -182,8 +187,28 @@ Router（Rust，独立仓库）与控制面之间有四条硬契约，全部来�
 - **已知边界**：会把 1-of-2 的降级放大成全停（实测 4m14s 收敛）；实时自适应
   P/D 未实现（`capacity_actions: false` 时只读不算）。
 
-机器级 SGLang 参数三层合并（后写覆盖前写）：
-`extra_sglang_args` → `by_role` → `nodes[]`，最终进 `InstanceSpec.SGLangArgsOverride`。
+### 8.2 聚合式（`mode: aggregated`）
+
+所有实例跑同一种自包含 worker，角色是 `regular`。**没有比例可维持**，因此
+档位、梯子、压力采样、容量动词全部不参与：一轮决策只做两件事。
+
+1. 把 `Serving` 侧不能用于本形态的实例摘流（先摘超出 `max_serving` 的富余，
+   再摘仍带 `prefill`/`decode` 的残留 worker —— 后者是为 PD 启动的，
+   在本形态里等一个不存在的 KV peer）。
+2. 把 `Idle` 实例逐个赋成 `regular`，直到 `min(可用数, max_serving)`。
+
+- **没有 PROVISION/RELEASE**：池子有多宽由 partner 决定，planner 不发明容量，
+  也不因为负载低就归还 —— 那属于运维决策，不是比例决策。
+- **切换安全**：从 PD 切到聚合只需改 `mode` 并重启控制面。被摘流的 PD worker
+  下一轮会以 `regular` 重新拉起，不需要人工重建。
+- **为什么不是 `1:0`**：regular worker 不是"少了 decode 的 prefill"——它没有 KV
+  peer，bootstrap 不能传 `--disaggregation-mode`，Router 把它记在第三种
+  worker_type 下（`WorkerType::Regular`）。用比例表达会同时骗过这三层。
+
+### 8.3 三层 SGLang 参数合并
+
+`extra_sglang_args` → `extra_sglang_args_by_role` → `nodes[]`（后写覆盖前写），
+最终进 `InstanceSpec.SGLangArgsOverride`。聚合部署把整份覆盖放进 `regular` 键。
 
 ## 9. 自愈体系：A（重试预算）+ B（liveness 合约）
 

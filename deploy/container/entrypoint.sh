@@ -66,7 +66,12 @@ PY
 start_role() {
   local role="${TALEA_ROLE:-}"
   [[ -n "${role}" ]] || return 0
-  [[ "${role}" == "prefill" || "${role}" == "decode" ]] || die "TALEA_ROLE must be prefill, decode, or empty"
+  # "regular" is the aggregated shape: a whole server on its own, started
+  # without --disaggregation-mode (see bootstrap/tai_talea_bootstrap/roles.py).
+  case "${role}" in
+    prefill|decode|regular) ;;
+    *) die "TALEA_ROLE must be prefill, decode, regular, or empty" ;;
+  esac
   local model_id="${TALEA_MODEL_ID:-glm5.2}"
   local model_path="${TALEA_MODEL_PATH:-${model_id}}"
   local service_port="${TAI_TALEA_SERVICE_PORT:-9002}"
@@ -82,12 +87,16 @@ role, model_id, model_path, port = sys.argv[1], sys.argv[2], sys.argv[3], int(sy
 base = "http://127.0.0.1:%d" % int(os.environ.get("TAI_TALEA_BOOTSTRAP_PORT", "9001"))
 headers = {"X-Bootstrap-Token": os.environ["TAI_TALEA_BOOTSTRAP_TOKEN"], "Content-Type": "application/json"}
 extra_args = []
-backend = os.environ.get("TALEA_TRANSFER_BACKEND", "").strip()
-pd_port = os.environ.get("TALEA_PD_BOOTSTRAP_PORT", "").strip()
-if backend:
-    extra_args.append("--disaggregation-transfer-backend=" + backend)
-if pd_port:
-    extra_args.append("--disaggregation-bootstrap-port=" + pd_port)
+# The transfer backend and the bootstrap port belong to a disaggregated pair.
+# A regular worker has no KV peer, so passing them would make SGLang wait for
+# a connection that this deployment never opens.
+if role in ("prefill", "decode"):
+    backend = os.environ.get("TALEA_TRANSFER_BACKEND", "").strip()
+    pd_port = os.environ.get("TALEA_PD_BOOTSTRAP_PORT", "").strip()
+    if backend:
+        extra_args.append("--disaggregation-transfer-backend=" + backend)
+    if pd_port:
+        extra_args.append("--disaggregation-bootstrap-port=" + pd_port)
 payload = json.dumps({"role": role, "model_id": model_id, "model_path": model_path,
                      "port": port, "extra_args": extra_args}).encode()
 

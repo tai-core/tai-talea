@@ -184,11 +184,11 @@ func (c *Client) Name() string { return c.config.Name }
 // BaseURL returns the Router origin.
 func (c *Client) BaseURL() string { return strings.TrimSuffix(c.config.URL, "/") }
 
-// RegisterWorker dynamically registers a Prefill or Decode worker. The Router
+// RegisterWorker dynamically registers a worker with the Router. The Router
 // starts with an empty pool, so this is the only way a worker becomes routable.
 func (c *Client) RegisterWorker(ctx context.Context, request RegisterRequest) (Registration, error) {
 	if !request.WorkerType.Valid() {
-		return Registration{}, errors.New("worker type must be prefill or decode")
+		return Registration{}, errors.New("worker type must be prefill, decode or regular")
 	}
 	workerURL, err := url.Parse(request.WorkerURL)
 	if err != nil || (workerURL.Scheme != "http" && workerURL.Scheme != "https") || workerURL.Host == "" ||

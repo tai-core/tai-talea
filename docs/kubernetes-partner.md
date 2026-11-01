@@ -108,6 +108,18 @@ ProvisionNode                                 → EnrollPrepared        （自�
 5. 摘流仍只走 readiness —— RouterAdapter 接口里没有 DELETE /workers，这一点没变。
 ```
 
+### 4.1 聚合式（`mode: aggregated`）时同一套流程只有两处不同
+
+```
+3'. POST /bootstrap/start {role: regular, …}
+    └─ bootstrap 不注入 --disaggregation-mode；参数来自 by_role.regular
+4'. POST /workers {url: …, worker_type: regular}
+    └─ bootstrap_port 不发送（只有 prefill 才有），Router 记在 regular 池
+```
+
+Pod、标签、hostPath、探针、摘流路径完全一致。所以同一个 partner 适配器两种形态都能跑，
+差别只在 planner 模式和 `by_role` 里的参数。
+
 Pod 创建时**不写死角色**（`TALEA_ROLE` 留空）。角色是控制面在运行时给的，写死会让 planner 失去再平衡能力。
 
 ## 5. 部署

@@ -66,6 +66,12 @@ type Point struct {
 }
 type Snapshot struct {
 	Point
+	// Regular aggregates the self-contained workers of an aggregated
+	// deployment. Such a pool has no prefill/decode pair, so judging it by the
+	// P/D completeness rule would report every healthy aggregated deployment as
+	// "no load input", forever. The two shapes are exclusive, so exactly one of
+	// Regular and Prefill/Decode carries data.
+	Regular     Role     `json:"regular"`
 	Nodes       []Node   `json:"nodes"`
 	History     []Point  `json:"history"`
 	Complete    bool     `json:"complete"`
@@ -320,7 +326,10 @@ func aggregate(nodes []Node, role domain.Role, at time.Time) Role {
 		transfer += *n.Transfer
 		capacity += *n.MaxRunning
 		rate := n.InputRate
-		if role == domain.RoleDecode {
+		if role != domain.RolePrefill {
+			// Decode and regular workers are measured by what they emit: a
+			// regular worker does its own prefill, so its useful rate is the
+			// output rate, exactly like a decode worker.
 			rate = n.OutputRate
 		}
 		if rate != nil {
@@ -358,6 +367,9 @@ func (c *Collector) Snapshot(owner string) Snapshot {
 		out.History = append(out.History, p)
 		out.Point = p
 		out.Nodes = nodes
+		if idx == len(c.frames)-1 {
+			out.Regular = aggregate(nodes, domain.RoleRegular, at)
+		}
 	}
 	for idx := range out.Nodes {
 		n := &out.Nodes[idx]
@@ -371,6 +383,23 @@ func (c *Collector) Snapshot(owner string) Snapshot {
 		}
 	}
 	p, d := out.Prefill, out.Decode
+	// An aggregated pool is judged on its own bucket. Requiring both PD sides
+	// would report every healthy aggregated deployment as "no load input",
+	// which is the one signal an operator must never learn to ignore.
+	if r := out.Regular; r.Nodes > 0 && p.Nodes == 0 && d.Nodes == 0 {
+		out.Complete = r.Pressure != nil
+		if out.Complete {
+			switch {
+			case *r.Queue > 0:
+				out.Advice = "聚合 worker 存在排队；持续出现时考虑增加副本或提高 max_running_requests"
+			case *r.Pressure == 0:
+				out.Advice = "当前空闲；需要持续请求才能判断容量"
+			default:
+				out.Advice = "聚合 worker 无明显排队；压力表示并发占用，不代表 GPU 利用率"
+			}
+		}
+		return out
+	}
 	out.Complete = p.Pressure != nil && d.Pressure != nil
 	if out.Complete {
 		gap := *p.Pressure - *d.Pressure

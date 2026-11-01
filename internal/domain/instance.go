@@ -52,17 +52,36 @@ const (
 	ServiceFailed ServiceState = "FAILED"
 )
 
-// Role is the prefill/decode assignment produced by the PD planner.
+// Role is the assignment the planner hands to one instance.
+//
+// Two deployment shapes share this vocabulary. In the disaggregated shape a
+// pool is split into prefill and decode workers and the planner owns the ratio
+// between them. In the aggregated shape every instance runs the same
+// self-contained SGLang process and the role is RoleRegular: there is no ratio
+// to keep, because there is nothing to split - a regular worker does its own
+// prefill and its own decode, and the pool is sized by the number of containers
+// rather than by a gear.
+//
+// The two shapes are mutually exclusive within one control plane. Mixing them
+// would describe a pool where some workers expect a KV peer and others refuse
+// one, which is exactly the kind of half-state that makes a degraded pool look
+// whole.
 type Role string
 
 const (
 	RoleNone    Role = ""
 	RolePrefill Role = "prefill"
 	RoleDecode  Role = "decode"
+	// RoleRegular is a self-contained worker: it runs without
+	// --disaggregation-mode and answers requests on its own.
+	RoleRegular Role = "regular"
 )
 
-// Valid reports whether the role is one the Router accepts.
-func (r Role) Valid() bool { return r == RolePrefill || r == RoleDecode }
+// Valid reports whether the role is one the Router accepts. The Router's
+// worker_type vocabulary is exactly these three values.
+func (r Role) Valid() bool {
+	return r == RolePrefill || r == RoleDecode || r == RoleRegular
+}
 
 // InstanceSpec describes the container shape advertised by the partner.
 type InstanceSpec struct {

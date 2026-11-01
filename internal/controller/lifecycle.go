@@ -172,7 +172,7 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 	lock.Lock()
 	defer lock.Unlock()
 	if !role.Valid() {
-		return fmt.Errorf("instance %s cannot start without a valid PD role", instanceID)
+		return fmt.Errorf("instance %s cannot start without a valid role", instanceID)
 	}
 	instance, err := c.store.GetInstance(ctx, instanceID)
 	if err != nil {
@@ -354,6 +354,16 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 	return nil
 }
 
+// prefillBootstrapPort returns the bootstrap port to publish for a role. Only a
+// prefill worker has one; for every other role the field must stay zero so the
+// Router registration carries no disaggregation hint at all.
+func prefillBootstrapPort(role domain.Role, port int) int {
+	if role != domain.RolePrefill {
+		return 0
+	}
+	return port
+}
+
 // waitHealthy polls the bootstrap health endpoint until SGLang answers or the
 // call timeout expires.
 func (c *Controller) waitHealthy(ctx context.Context, instance domain.Instance) error {
@@ -442,10 +452,14 @@ func (c *Controller) register(ctx context.Context, instance domain.Instance, rol
 	// to every request; on a partner platform the two are different ports.
 	serviceURL := instance.ServiceURL()
 	registration, err := c.router.RegisterWorker(callCtx, routeradapter.RegisterRequest{
-		WorkerURL:     serviceURL,
-		WorkerType:    role,
-		ModelID:       c.cfg.Controller.ModelID,
-		BootstrapPort: c.cfg.Router.PrefillBootstrapPort,
+		WorkerURL:  serviceURL,
+		WorkerType: role,
+		ModelID:    c.cfg.Controller.ModelID,
+		// The bootstrap port only means something to a prefill worker: it is
+		// where its decode peer pulls KV from. Sending it for a regular or
+		// decode worker would make the Router inject a disaggregation hint
+		// into an ordinary request.
+		BootstrapPort: prefillBootstrapPort(role, c.cfg.Router.PrefillBootstrapPort),
 	})
 	cancel()
 	if err == nil {

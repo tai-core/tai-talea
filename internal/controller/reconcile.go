@@ -386,7 +386,7 @@ func (c *Controller) settleService(ctx context.Context, instance domain.Instance
 			Severity:   obs.SeverityCritical,
 			InstanceID: instance.ID,
 			PartnerID:  instance.PartnerID,
-			Message:    "service state present without an assigned PD role; draining",
+			Message:    "service state present without an assigned role; draining",
 			Details:    map[string]string{"service_state": string(instance.ServiceState)},
 		})
 		if err := c.beginDrain(ctx, instance.ID, "service without role", 0, false); err != nil {

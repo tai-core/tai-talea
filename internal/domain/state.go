@@ -197,7 +197,7 @@ func CheckCombination(instance InstanceState, service ServiceState, role Role) V
 
 	if runnableServiceStates[service] && !role.Valid() {
 		return Verdict{Code: CodeMissingRole, Severity: SeverityReject,
-			Reason: fmt.Sprintf("service state %s requires an assigned PD role", service)}
+			Reason: fmt.Sprintf("service state %s requires an assigned role", service)}
 	}
 
 	legal := func() Verdict { return Verdict{Legal: true, Severity: "", Code: "", Reason: ""} }
