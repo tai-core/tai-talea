@@ -62,7 +62,7 @@
 
 ## 3. 五个真实发现
 
-### 3.0 调用方能左右 `request_id`，重放就会撞 id（未改，建议改配置）
+### 3.0 调用方能左右 `request_id`，重放就会撞 id（已修，待出镜像）
 
 Router 的 request-id 中间件默认读入站 `x-request-id` 头（`server.rs:1369` 的
 `unwrap_or_else` 缺省是 `["x-request-id"]`），读到就直接用，只在没有 `nightgw-` 前缀时补一个。
@@ -82,13 +82,20 @@ request_id=nightgw-dup-probe-001  start=2026-11-01T11:17:40.945Z  code=200  toke
 触发条件很普通：调用方带 `x-request-id`（做链路追踪的客户端都会带），并且**复用**了同一个值
 （重试、一个会话一个 id、代理转发同一 id）。今天 15,118 行没有重复，只是因为目前的调用方没带这个头。
 
-三个选项：
+**已按「改代码」修掉**（`sglang-router` `feat/token-access-log`）：
 
-| 做法 | 改动 | 代价 |
-| --- | --- | --- |
-| **启动参数改成 `--request-id-headers x-talea-request-id`**（推荐） | 一行 args，不用重出镜像 | 响应头回显的 id 变成 Router 生成的（OpenAI 也是自己生成，调用方本来就不该依赖回显） |
-| 只对访问日志强制生成新 id | 改代码 | 日志 id 与响应头不再一致，排查时要多跳一次 |
-| 什么都不做，写进对接文档："调用方不得复用 x-request-id" | 无 | 依赖别人守规矩，而丢的是我们的账 |
+- `--request-id-headers` 的缺省值由四个头改成**空列表** ⇒ Router 总是自己生成 id，
+  响应头 `x-request-id` 回传的也是生成值。
+- 调用方带来的值不丢，改写进**外层** `caller_request_id`（采集端不映射这个字段，所以它不参与
+  ES 文档 ID，重放也不会覆盖任何人的用量）。先后顺序：`x-request-id` → `x-correlation-id`
+  → `x-trace-id` → `request-id`，取第一个。
+- 仍然想「调用方的 id 就是主键」的部署可以显式传 `--request-id-headers`，那时唯一性由它自己保证。
+- 单测：`middleware::tests::a_reused_caller_id_does_not_become_the_request_id`（同值连发两次必须得到
+  两个不同 id）、`observability::ai_access_log::tests::a_callers_own_id_is_recorded_beside_the_generated_one`；
+  集成：`api_endpoints_test::request_id_tests::test_request_id_generation` 里同值重放断言 id 不同。
+
+> 出镜像后复核：带同一个 `x-request-id` 发两次，日志里两条 `request_id` 必须不同，且两条都出现
+> `caller_request_id`。核对命令见 §8。
 
 ### 3.1 `reasoning_tokens` 被丢掉（已修，待出镜像）
 

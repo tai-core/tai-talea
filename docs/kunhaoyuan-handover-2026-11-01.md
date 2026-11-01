@@ -191,6 +191,10 @@ OpenAI SDK 直接把 `base_url` 指到 `http://10.66.0.1/v1` 即可。
 3. **429 是正常的背压，不是故障。** 池级上限 192，拒绝会带
    `{"error":{"code":"concurrency_limit"}}` 与 `Retry-After: 1`，客户端按 1 秒退避重试即可。
    429 的 p95 只有 177 ms，不会拖住你。
+4. **`x-request-id` 不会原样回显。** 响应头里的 `x-request-id` 永远是 Router 自己生成的值；
+   你带来的那个只被记进访问日志的 `caller_request_id`。原因是日志按 `request_id` 落到 ES 文档 ID
+   上，而写入是 upsert——同一个 id 来两次，前一次的用量会被静默盖掉。所以**链路追踪请用
+   `caller_request_id` 对账，不要拿响应头去比对自己发出去的值**。
 
 `/health` 免鉴权可直接探活（回 200）。`/metrics`、`/server_info` 对外 **403**（只有 nginx
 放行 `/v1/*` 和 `/health`）。鉴权只在 nginx 上做——NodePort 本身不校验，但从集群外到不了它。
