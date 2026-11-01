@@ -19,16 +19,19 @@
 # an honest 503 instead of a connection to a process that is already stopping.
 # TALEA_SKIP_DRAIN=1 scales without that step.
 #
-# usage: taleactl.sh up|down|drain|undrain|status|hold [hours]|release
+# usage: taleactl.sh up|down|drain|undrain|prune|status|hold [hours]|release
 
 set -uo pipefail
 export KUBECONFIG=${KUBECONFIG:-/root/.kube/config}
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 NS=${NS:-kunhaoyuan}
 WORKERS=${WORKERS:-"talea-w0 talea-w1 talea-w2 talea-w3"}
 NODE_PORT=${NODE_PORT:-31280}
 API=${API:-http://192.168.239.2:$NODE_PORT}
 MODEL=${MODEL:-glm-5.3-flash}
+# The worker service port. The Router registers a worker under its Pod IP and
+# this port, which is how `status` derives the URLs that should be serving.
+WORKER_PORT=${WORKER_PORT:-9002}
 HOLD_FILE=${HOLD_FILE:-/root/talea-hold-until}
 LOCK_FILE=${LOCK_FILE:-/root/.taleactl.lock}
 
@@ -145,6 +148,77 @@ wait_inference() {
   return 1
 }
 
+# The Router registers a worker under its Pod IP and the worker service port, so
+# the URLs that should be serving can be derived from the Pods that exist now.
+worker_service_urls() {
+  local name ip list=""
+  while read -r name ip; do
+    [ -n "$ip" ] || continue
+    list="${list:+$list,}http://$ip:$WORKER_PORT"
+  done <<< "$(kubectl -n "$NS" get pods -o wide --no-headers 2>/dev/null |
+    awk -v w="$WORKERS" '
+      BEGIN { n = split(w, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+      { for (p in want) if (index($1, p "-") == 1) print $1, $6 }
+    ')"
+  printf '%s' "$list"
+}
+
+# The Router's control port is a ClusterIP, and the jump host can reach neither
+# that nor any Pod address, so anything that reads the registry runs as a Pod.
+wait_registry() { # rest = args for worker-registry.py
+  local image pod=talea-registry rc expected
+  expected=$(worker_service_urls)
+  image=$(kubectl -n "$NS" get deploy talea-router -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+  [ -n "$image" ] || { log "registry probe skipped: cannot read the router image"; return 2; }
+
+  kubectl -n "$NS" create configmap talea-registry-script \
+    --from-file=registry.py="$HERE/worker-registry.py" --dry-run=client -o yaml |
+    kubectl apply -f - >/dev/null || { log "registry probe skipped: could not stage the script"; return 2; }
+
+  kubectl -n "$NS" delete pod "$pod" --ignore-not-found --wait=true >/dev/null 2>&1
+  kubectl -n "$NS" apply -f - >/dev/null <<YAML || { log "registry probe skipped: could not schedule the Pod"; return 2; }
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $pod
+  namespace: $NS
+spec:
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: harbor-cred
+  containers:
+    - name: registry
+      image: $image
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          py=\$(command -v python3 || command -v /opt/sglang/bin/python3 || echo /opt/sglang/bin/python)
+          exec "\$py" -u /probe/registry.py $*
+      env:
+        - {name: ROUTER_URL, value: "http://talea-router:30001"}
+        - {name: EXPECTED, value: "$expected"}
+      volumeMounts:
+        - {name: script, mountPath: /probe, readOnly: true}
+  volumes:
+    - name: script
+      configMap:
+        name: talea-registry-script
+YAML
+
+  local deadline=$(( $(date +%s) + SERVE_TIMEOUT + 180 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    case "$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null)" in
+      Succeeded) rc=0; break ;;
+      Failed)    rc=1; break ;;
+    esac
+    sleep 3
+  done
+  kubectl -n "$NS" logs "$pod" 2>&1 | sed 's/^/  /'
+  kubectl -n "$NS" delete pod "$pod" --wait=false >/dev/null 2>&1
+  return "${rc:-1}"
+}
+
 do_up() {
   hold_active && { log "up suppressed by hold"; return 0; }
   log "up: scaling ${WORKERS} to 1"
@@ -153,7 +227,18 @@ do_up() {
   wait_pods_ready || die "workers did not become Ready in ${POD_READY_TIMEOUT}s"
   wait_inference || die "the endpoint never answered a request in ${SERVE_TIMEOUT}s"
 
-  log "up: complete, $(ready_count)/$(echo "$WORKERS" | wc -w) pods ready"
+  # A Pod is Ready as soon as its bootstrap answers /bootstrap/health, and that
+  # endpoint answers while the model is still loading, so "4/4 Ready" and even
+  # one 200 from the endpoint can hide workers that never started. Only the
+  # Router's registry says how many workers are really serving, and a start that
+  # reports success at 1/4 is worse than one that fails: it runs all day on a
+  # quarter of the cards while everything looks green.
+  local want; want=$(echo "$WORKERS" | wc -w)
+  log "up: waiting for all $want workers to be live in the router registry"
+  wait_registry --wait --timeout "$SERVE_TIMEOUT" ||
+    die "not every worker registered with the router; the deployment is serving below capacity"
+
+  log "up: complete, $(ready_count)/$want pods ready, and every one of them is serving"
   do_status
 }
 
@@ -249,6 +334,15 @@ do_down() {
     log "WARNING: worker pods are still present after ${POD_GONE_TIMEOUT}s"
     worker_pods | sed 's/^/  /'
   fi
+
+  # Every generation leaves its registrations behind: the registry is keyed by
+  # URL and a worker that disappears never unregisters. They are never routed
+  # to, but the health checker keeps probing dead addresses and the table stops
+  # being readable. Pruning here, after the Pods are gone, cannot touch a live
+  # worker by construction - and a failure is only cosmetic, so it must not fail
+  # the scale-down.
+  log "down: pruning registrations that no longer answer"
+  wait_registry --prune || log "WARNING: some stale registrations were left in the router"
   do_status
 }
 
@@ -286,9 +380,11 @@ for pod in data.get("items", []):
 print("  %d" % total)
 ' "$WORKERS"
 
-  echo "--- serving instances (control plane log, advisory)"
-  kubectl -n "$NS" logs deploy/talea-control --since=45m 2>/dev/null |
-    grep -c "service serving" | sed 's/^/  reached serving in the last 45m: /'
+  echo "--- workers the router will route to"
+  # Counting "service serving" lines in the control log was the earlier answer
+  # here, and it is the reason a 1/4 deployment looked healthy: the log only
+  # ever grows, so it reports what once happened, not what is true now.
+  wait_registry || echo "  (not every worker is serving)"
 
   echo "--- endpoint"
   if probe_inference; then
@@ -315,6 +411,7 @@ case "${1:-}" in
   down)    do_down ;;
   drain)   do_drain close ;;
   undrain) do_drain open ;;
+  prune)   wait_registry --prune ;;
   status)  do_status ;;
   hold)    do_hold "${2:-2}" ;;
   release) do_release ;;

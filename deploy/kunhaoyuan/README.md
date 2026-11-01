@@ -27,7 +27,7 @@ client ── NodePort 31280 ──> talea-router (8000 serving, 30001 control)
   ```
 - Weights at `/data02/model-weight/GLM-5.3-Flash-NVFP4` on both nodes, and a
   writable `/data02` for the compile cache and the token log.
-- Images `talea-worker-0.9.2`, `talea-control-0.9.2`, and `glm-5.3-flash-ailog2`
+- Images `talea-worker-0.9.2`, `talea-control-0.9.3`, and `glm-5.3-flash-ailog2`
   (the last is the official SGLang image with our Router binary appended as one
   extra layer; the Router runs from it, the control plane from its own tag).
 
@@ -47,7 +47,7 @@ repository is public, and the bootstrap token also has to appear literally in th
 worker probe headers, where Kubernetes offers no secret reference. Re-rendering
 reads the same file, so a re-apply does not by itself restart anything.
 
-## Two things that look fine and are not
+## Three things that look fine and are not
 
 **Pod readiness is not model readiness.** The worker's readiness probe is
 `/bootstrap/health`, and that endpoint answers 200 with
@@ -55,6 +55,22 @@ reads the same file, so a re-apply does not by itself restart anything.
 `4/4 Running` pool can serve nothing for another few minutes. Only a completion
 over `/v1/chat/completions` proves the deployment is usable — that is what
 `taleactl.sh up` and `verify.sh` wait for.
+
+**One completion is not four workers.** The Router round-robins, so a single 200
+says nothing about the other three, and `up` used to call itself done on exactly
+that evidence. On 2026-11-01 that hid a pool running at 1/4 with everything
+green; the surviving worker answered every probe while three were still loading
+or had never been started at all. `ops/worker-registry.py` asks the narrower
+question instead: for each Pod that exists right now, is its service URL both
+registered as healthy *and* answering `/health`? `up` now fails unless every one
+of them is.
+
+Two of the Router's own answers cannot be used for this. `is_healthy` is a cached
+health-check flag, so after a scale-down it keeps reporting `true` for workers
+that are already gone — `down` finished with four Pods deleted and the registry
+still claiming four ready. And the registry is keyed by URL, so an entry survives
+the worker it described; counting healthy rows can be right about a generation
+that no longer exists.
 
 **A streamed request carries no tokens unless someone asks.**
 `--enable-ai-access-log` writes the token fields from the upstream `usage`, and
@@ -77,11 +93,12 @@ ever dropped.
 ## Nightly start and stop
 
 ```bash
-ops/taleactl.sh up        # scale the four workers to 1, wait for a real completion
-ops/taleactl.sh down      # close routing, let in-flight finish, then scale to 0
+ops/taleactl.sh up        # scale the four workers to 1, wait until all of them serve
+ops/taleactl.sh down      # close routing, let in-flight finish, scale to 0, prune
 ops/taleactl.sh drain     # close routing only (the pool stays up, unused)
 ops/taleactl.sh undrain   # put the workers back after a manual drain
-ops/taleactl.sh status    # replicas, pods, cards requested, endpoint
+ops/taleactl.sh prune     # drop registrations that no longer answer
+ops/taleactl.sh status    # replicas, pods, cards requested, who is serving
 ops/taleactl.sh hold 2    # suppress up/down for two hours (testing windows)
 ops/taleactl.sh release
 ```
@@ -93,11 +110,16 @@ Crontab on the jump host:
 0 8  * * * /bin/bash /root/taleactl.sh down >> /var/log/taleactl.log 2>&1
 ```
 
+`/root/taleactl.sh` is a symlink into `ops/`, because the script locates its
+helper scripts relative to itself and cron has to keep working.
+
 The router and the control plane are deliberately left running: neither holds a
 card, and a router restart throws away the worker ids it handed out. `kubectl
 scale` is not granted to this account, so the script patches `spec.replicas`.
 
-Measured on 2026-11-01: up 263–304 s (warm page cache), down 23–32 s.
+Measured on 2026-11-01 with a cold page cache: `down` 26 s, `up` 15 min 19 s to
+4/4 serving. The 15 minutes are not overhead — see the cold-start note under
+known gaps.
 
 ### What `down` does before it scales
 
@@ -132,6 +154,34 @@ exactly why the earlier four-request test appeared to pass — the requests
 happened to fit inside the pause. 8192 tokens do not.
 
 `TALEA_SKIP_DRAIN=1` restores the previous scale-immediately behaviour.
+
+### A revoked container is already gone
+
+`down` scales the deployment, so the Pods disappear before the control plane has
+finished draining them. The platform reports that as a revocation with a grace
+period, which puts the instance in `DRAINING` with `pending_release` set — and
+that state used to be a trap.
+
+`reconcileInstance` dispatches a pending release straight to `reconcileReclaim`,
+before the reachability probe that would mark an instance `LOST`. So the one
+shortcut in `finishDrain` that skips `/bootstrap/stop` for a container that
+cannot answer never fired for exactly the instances that needed it. Every round
+then spent the full caller timeout on a dead address, and retried on the next
+interval, forever: one immortal row per Pod generation, each one delaying the
+work that was still real. On 2026-11-01 five generations of Pod names were
+sitting in `DRAINING`, and a start took eight extra minutes because the
+reconciler was queueing behind their timeouts.
+
+The fix asks the partner before spending the stop budget. Absence from its lease
+view is authoritative — it is the same answer `ReleaseInstance` already treats as
+a completed release — so the drain collapses instead of retrying. An unreadable
+lease view is *not* evidence of absence, so that case still stops the service as
+before: skipping a stop that was needed leaves a process holding cards nobody is
+accounting for.
+
+Measured on the same day, four revoked workers: `service draining` at 03:23:30,
+`service drain skipped the stop call` at 03:23:40, `instance released` at
+03:23:40. Zero `context deadline exceeded`, zero `drain_timeout` alerts.
 
 ## Token log
 
@@ -177,8 +227,15 @@ lines have aged out of the window.
   08:00 the cards have to come back. Raising the ceiling only moves the problem;
   the durable fix is on the worker side, where stop should refuse to return while
   `running_req > 0`.
+- **Cold start is serial, and it is the whole 15 minutes.** `ReconcileOnce` walks
+  the instances in one goroutine, and `StartService` blocks for the entire model
+  load, so the four workers load one after another: 03:28:53, 03:32:35, 03:36:17,
+  03:39:54 — 3 min 40 s each. The two Pods on a node have cards to spare, so they
+  could overlap; until they do, `20:00` means "serving at 20:15".
 - `--force-stream-usage` means a client cannot get a stream without the trailing
   usage chunk. That is deliberate, but it is a behaviour a client could notice.
-- The Router's worker registry keeps an entry per registration, not per address,
-  so a scaled-down pool leaves entries behind. They show as unhealthy and are
-  skipped by the drain script, but the list grows across restarts.
+- The control plane's instance store is an `emptyDir`, so rolling `talea-control`
+  empties it and the next pull has to re-adopt every Pod. That costs a re-adoption
+  round, not a reload — `/bootstrap/start` against a worker that is already
+  serving answers "already running" and the control plane adopts it, which is what
+  the 03:21 re-adoption did in four seconds.
