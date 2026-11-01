@@ -27,7 +27,7 @@ client ── NodePort 31280 ──> talea-router (8000 serving, 30001 control)
   ```
 - Weights at `/data02/model-weight/GLM-5.3-Flash-NVFP4` on both nodes, and a
   writable `/data02` for the compile cache and the token log.
-- Images `talea-worker-0.9.2`, `talea-control-0.9.9`, and `glm-5.3-flash-ailog2`
+- Images `talea-worker-0.9.2`, `talea-control-0.9.10`, and `glm-5.3-flash-ailog3`
   (the last is the official SGLang image with our Router binary appended as one
   extra layer; the Router runs from it, the control plane from its own tag).
 
@@ -197,12 +197,13 @@ Every request in those four rows answered 200. Read them as follows.
   4096-in/256-out — regardless of how deep the queue behind it is. That is why
   p95 sat at 9.8 s for both 64 and 128 concurrent: the magnitude is fixed by the
   wave, only the probability of being caught by one grows with load.
-- **Nothing sheds load above 192, which is the real defect.** At 192 concurrent
-  the pool is exactly at 4 × 48 and every request either waits a wave or two or
-  times out client-side; the Router keeps accepting and sglang keeps queueing, so
-  latency degrades without bound and no 429 or 503 ever tells the caller to back
-  off. `--max-concurrent-requests` is -1 and no `--max-queued-requests` is set on
-  the workers.
+- **Load is shed above 192 now, but only pool-wide.** The Router refuses past
+  `--max-concurrent-requests 192` with `429` + `Retry-After: 1` instead of
+  accepting work it cannot start; see the gap list below for the measurements
+  and for the per-worker skew this does not address. What made the old behaviour
+  invisible is that `--max-concurrent-requests` was -1 and no
+  `--max-queued-requests` is set on the workers, so every caller was accepted and
+  every wait happened inside the engine.
 - **The 503s are not the circuit breaker, whatever the message says.**
   `no_available_workers` is one string covering every way `select_worker` can
   find nothing routable, and the text "all circuits open or unhealthy" is
@@ -404,20 +405,71 @@ lines have aged out of the window.
   what it proves is that the pool now holds 192 for minutes at a time; the guard
   against a miss is the changed gate, and a miss is still not reproducible on
   demand.
-- **Nothing sheds load above 4 × `max_running_requests`.** 192 concurrent is the
-  pool's ceiling; past it the Router accepts everything and sglang queues
-  everything, so p95 grows without bound and no caller is told to back off.
-  Shedding has to live in the Router (`--max-concurrent-requests`, or a queue
-  with an explicit 503 and `Retry-After`), because the workers have no
-  `--max-queued-requests` and refusing there would still be invisible.
-- **`ops/taleactl.sh` waits on a metric this build does not export.** Drain waits
-  for `sglang:num_running_reqs` to reach 0 twice in a row; that gauge is not in
-  this sglang's `/metrics` (which carries only `prefill_effective_tokens_total`,
-  `realtime_tokens_total`, `cuda_graph_passes_total`, `http_requests_total` and
-  process metrics). The wait therefore always runs to its timeout, which is why a
-  drained-but-empty pool still took ~10 s. Measured `down` elapsed with real
-  traffic in flight was 70 s, so the ceiling hides the bug rather than avoiding
-  it.
+
+  That measurement only covered the evenly loaded case. The shape that actually
+  condemns models is a *skewed* one: the Router's limit is pool-wide, so
+  `cache_aware` can still put three batches on one worker, and every probe
+  against that worker then queues past its 2 s budget. At 192 concurrency with
+  eight shared prefixes, all four instances left the rotation in one round and
+  two were condemned — a full multi-GPU reload each — while both were serving
+  correctly. Callers saw the reload, not the load: 192 × 503 and first tokens at
+  20-50 s.
+
+  `talea-control-0.9.10` therefore counts a miss only when the instance had
+  nothing in flight; `instanceHasWorkInFlight` reads the Router's per-worker
+  `load`, the same number the drain waits on. A miss while busy is logged at
+  INFO and changes nothing. Re-running the skewing shape on 0.9.10: 384
+  requests, 0 refused, the gate fired twice on the hammered worker, 0 counted
+  misses, 0 condemnations, 0 restarts. The evenly loaded shape never misses the
+  probe at all, so this is a fix for the skewed case specifically — which is the
+  case that produced the outages.
+- **The pool sheds load above 4 × `max_running_requests`, but only pool-wide.**
+  192 concurrent is the ceiling; past it the Router refuses with `429` and
+  `Retry-After: 1` instead of accepting work it cannot start, via
+  `--max-concurrent-requests 192 --rate-limit-tokens-per-second 0
+  --queue-size 0`. The middle flag matters: 0 makes the token bucket a
+  semaphore, so a permit returns only when a request ends, where the default
+  refills the whole bucket every second — a request-rate limit wearing a
+  concurrency limit's name. `--queue-size 0` refuses immediately instead of
+  hiding the wait in a queue nobody can observe. The 429 carries the same
+  `{"error":{"code","message"}}` envelope as every other refusal, because a bare
+  status code tells a caller it was refused but not when to come back.
+
+  Measured at 4096-in/256-out with distinct prompts: 288 requests at concurrency
+  192 came back 288 × 200, TTFT p50 1.5 s; 384 requests at concurrency 256 came
+  back 192 × 200 and 192 × 429, the refusals in 177 ms (p95) with
+  `Retry-After: 1`, and the admitted requests were not slowed by them (TTFT p50
+  1.9 s). A 768-request run at 192 sustained 35 s: 768 × 200, TTFT p50 1.2 s,
+  5.6k output tok/s.
+
+  Still open, and the reason the paragraph above exists: the limit is pool-wide,
+  not per worker. With eight shared prefixes and 384 requests, `cache_aware`
+  puts about three batches on one worker while the other three are half idle —
+  TTFT p50 10 s, p95 28 s, 1.8k tok/s against 5.6k for the same concurrency with
+  distinct prompts. A per-worker cap is what would fix that, and nothing in this
+  Router expresses one yet.
+- **`ops/taleactl.sh` waits on a signal that exists.** Drain used to wait for
+  `sglang:num_running_reqs`, which this sglang build does not export, so every
+  poll came back unreadable and the wait always ran to its 300 s ceiling — a
+  fixed delay with a progress bar. It now reads the Router's per-worker `load`
+  from the same `/workers` response the close step already fetched: requests
+  dispatched and not yet finished delivering, tied to the response body, so a
+  stream counts until its last byte. `ops/tests/test_drain_to_router.py` pins
+  the four outcomes that matter, and a reverse control (signal forced
+  unreadable) makes the idle case burn the window, which is what the old code
+  did all night.
+
+  Measured on 0.9.10: an idle pool drains in 10 s end to end — 3 s settle, two
+  zero polls, Pod scheduling — where it used to burn the full window. With a
+  12,000-token generation in flight, the wait polled `in flight: 1` five times,
+  the request completed normally at 20.9 s with HTTP 200 (closing readiness does
+  not cut an open stream), and `QUIESCE_OK` printed on the first zero reading
+  after that, 25 s total.
+
+  It cannot see requests that reached a worker through another Router, or
+  requests whose client disconnected — the guard drops with the stream while the
+  worker may keep generating. Both omissions make the count low, never high, so
+  a zero reading is at worst optimistic by a request already being torn down.
 - **A generation that outlives `QUIESCE_TIMEOUT`** (300 s, roughly 75k tokens) is
   still cut by the Pod deletion, and the scale-down proceeds with a warning: at
   08:00 the cards have to come back. Raising the ceiling only moves the problem;

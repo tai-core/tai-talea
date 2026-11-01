@@ -63,12 +63,23 @@ spec:
           # together would mean rebuilding the control plane to ship a router
           # fix. Only the extra layer is pulled; the base layers are already
           # local from the workers.
-          image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:glm-5.3-flash-ailog2
+          image: kunhaoyuan-62c8ab7d.ecis.jinan-1.cmecloud.cn/khy/gongji:glm-5.3-flash-ailog3
           imagePullPolicy: Always
           # --enable-ai-access-log writes to stdout and nowhere else: the only
           # other log knob, --log-dir, redirects the tracing subscriber and has
           # no effect on token lines. So the stream is mirrored here instead of
           # asking the router for a file sink it does not have.
+          #
+          # The three rate-limiting flags are one decision: 192 is the batch the
+          # pool can actually hold (4 workers x max_running_requests 48), 0 makes
+          # the bucket a pure semaphore instead of a per-second refill, and
+          # queue-size 0 refuses instead of hiding the wait. Without them a
+          # request beyond capacity was still accepted and sat inside the
+          # engine's queue, which is how a 4k/256 request at 192 concurrency came
+          # back in ten seconds with nothing to tell the client to slow down.
+          # The limit is static: if workers are missing the pool is smaller than
+          # 192 and some of what is admitted will still queue, so this bounds the
+          # overshoot rather than eliminating it.
           #
           # exec on both lines matters. Process substitution puts tee in a
           # sibling process, and exec'ing the router makes it PID 1 with that
@@ -96,7 +107,10 @@ spec:
                 --health-check-interval-secs 30 \
                 --log-level info \
                 --enable-ai-access-log \
-                --force-stream-usage
+                --force-stream-usage \
+                --max-concurrent-requests 192 \
+                --rate-limit-tokens-per-second 0 \
+                --queue-size 0
           ports:
             - name: http
               containerPort: 8000
