@@ -125,13 +125,13 @@ ends of the comparison were run within the hour, so this run had a warm page
 cache where the 15 min one was recorded cold; a cold one would add the same
 delay to all four loads rather than multiply it.
 
-Two later runs of the same script read 3 min 47 s (0.9.5) and 7 min 24 s (0.9.6)
-— the second is not a regression but the failure mode described under known
-gaps: the prepare step finished 20 s apart for the two pairs, and the planner
-round that saw only the first pair waited out their whole load before launching
-the other two. Watch the `idle=` count in `planner round applied` rather than the
-wall clock; a single wave is 3 min 45 s, and anything longer means the instance
-set was split across rounds.
+Two later runs of the same script read 3 min 47 s (0.9.5), 7 min 24 s (0.9.6)
+and 3 min 47 s (0.9.7). The 7-minute one is not a regression but the failure
+mode described under known gaps: the prepare step finished 20 s apart for the
+two pairs, and the planner round that saw only the first pair waited out their
+whole load before launching the other two. Watch the `idle=` count in `planner
+round applied` rather than the wall clock; a single wave is 3 min 45 s, and
+anything longer means the instance set was split across rounds.
 
 ### What `down` does before it scales
 
@@ -239,18 +239,25 @@ lines have aged out of the window.
   08:00 the cards have to come back. Raising the ceiling only moves the problem;
   the durable fix is on the worker side, where stop should refuse to return while
   `running_req > 0`.
-- **A start no longer blocks the control plane; it still blocks the planner round
-  that launched it.** Reconcile, the pull sweep and LOST detection are free now.
-  A 0.9.6 cold start measured `operation is busy` = 0, `lease_expiring_soon` = 0,
-  and every pull round applied all four of its events while the workers were
-  loading. What remains is `applyStarts`: `Rebalance` waits for the starts it
-  dispatched, so a worker that becomes ready twenty seconds after its siblings
-  waits a whole load for the next round. A cold start shows it whenever the
-  prepare step finishes unevenly — 05:43:56 for two workers and 05:44:16 for the
-  other two, `idle=2 actions=2` in the round between them, second pair dispatched
-  at 05:47:47: 7 min 24 s wall clock, where one wave is 3 min 45 s. The fix is to
-  bound start concurrency on the controller rather than on a single round, so a
-  round can return while its starts are still in flight.
+- **A start no longer blocks anything it is not responsible for.** Reconcile, the
+  pull sweep and LOST detection were freed in 0.9.5: a 0.9.6 cold start measured
+  `operation is busy` = 0, `lease_expiring_soon` = 0, and every pull round applied
+  all four of its events while the workers were loading.
+- **A round no longer waits for the starts it dispatches.** Until 0.9.7 a planner
+  round that had assigned two of four workers could not run again until those two
+  finished loading, so a pool whose prepare step finished unevenly was started in
+  two waves: 05:43:56 for two workers and 05:44:16 for the other two, `idle=2
+  actions=2` in the round between them, second pair dispatched at 05:47:47 — 7 min
+  24 s wall clock where one wave is 3 min 45 s. The concurrency bound moved from
+  the round to the controller, so a round now returns after dispatch and leaves
+  the instances it cannot serve to the next one.
+
+  The split has not been reproduced since: the 0.9.7 cold start came out as one
+  wave, `idle=4 actions=4` at 06:09:52, last worker serving at 06:13:39 — 3 min
+  47 s from dispatch, `up` 4 min 50 s end to end. So that path rests on a test
+  rather than on a measurement:
+  `TestARoundReturnsWhileItsStartIsStillLoading` parks a start in the gate and
+  fails if the round does not return, which it does against the waiting version.
 
   The `lease_expiring_soon` warning this section used to attribute to the load
   had a different cause and is fixed in 0.9.6: the start persisted the whole row
