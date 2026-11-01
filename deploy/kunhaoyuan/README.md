@@ -117,9 +117,14 @@ The router and the control plane are deliberately left running: neither holds a
 card, and a router restart throws away the worker ids it handed out. `kubectl
 scale` is not granted to this account, so the script patches `spec.replicas`.
 
-Measured on 2026-11-01 with a cold page cache: `down` 26 s, `up` 15 min 19 s to
-4/4 serving. The 15 minutes are not overhead — see the cold-start note under
-known gaps.
+Measured on 2026-11-01: `down` 26 s; `up` 4 min 24 s from Pod creation to 4/4
+serving, with all four workers loading together. The same measurement read
+15 min 19 s while the loads were serial, and the load itself did not get faster —
+a worker still takes 3 min 40 s (`service_starting` to `service_serving`). Both
+ends of the comparison were run within the hour, so this run had a warm page
+cache where the 15 min one was recorded cold; a cold one would add the same
+delay to all four loads rather than multiply it. What is left of the delay is
+described under known gaps.
 
 ### What `down` does before it scales
 
@@ -227,11 +232,18 @@ lines have aged out of the window.
   08:00 the cards have to come back. Raising the ceiling only moves the problem;
   the durable fix is on the worker side, where stop should refuse to return while
   `running_req > 0`.
-- **Cold start is serial, and it is the whole 15 minutes.** `ReconcileOnce` walks
-  the instances in one goroutine, and `StartService` blocks for the entire model
-  load, so the four workers load one after another: 03:28:53, 03:32:35, 03:36:17,
-  03:39:54 — 3 min 40 s each. The two Pods on a node have cards to spare, so they
-  could overlap; until they do, `20:00` means "serving at 20:15".
+- **A start still blocks the reconcile loop, though no longer the other starts.**
+  The four loads now overlap — dispatched 3.9 ms apart, done 3 min 46.5 s later
+  instead of one every 3 min 40 s — but `ReconcileOnce` is still one goroutine
+  that walks the instances, and a `StartService` blocks its round for the whole
+  load. What that costs is visible in a cold start: pull snapshots that land in
+  the window are answered `PENDING, instance lifecycle operation is busy`, so no
+  other instance's `DRAINING` completion or `LOST` detection is applied until the
+  load ends, and a long load trips `lease_expiring_soon` because the lease
+  observation for that instance is not persisted while it is busy. The window is
+  now one load long rather than four, which is why the warnings arrive at the end
+  of a cold start instead of throughout it. Fixing it properly means driving
+  instances independently instead of in a round.
 - `--force-stream-usage` means a client cannot get a stream without the trailing
   usage chunk. That is deliberate, but it is a behaviour a client could notice.
 - The control plane's instance store is an `emptyDir`, so rolling `talea-control`
