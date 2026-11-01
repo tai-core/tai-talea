@@ -1394,6 +1394,42 @@ func (c *Controller) markLost(ctx context.Context, instance domain.Instance, rea
 	return closeErr
 }
 
+// instanceHasWorkInFlight reports whether the Router has requests in flight to
+// this instance, which is what makes a missed health probe explainable rather
+// than incriminating.
+//
+// The probe is a real generation, so it queues behind whatever the instance is
+// already doing; every miss under sustained load is expected, and a busy model
+// is the one thing a miss cannot rule out. So the caller only counts a miss when
+// this returns false.
+//
+// "Cannot tell" returns false on purpose. If the Router cannot be asked, the
+// miss is counted, which is the pre-existing behaviour. Erring that way costs
+// an unnecessary reload of a model that was merely busy; erring the other way
+// leaves a wedged model in the pool indefinitely, and only one of those two
+// recovers on its own.
+func (c *Controller) instanceHasWorkInFlight(ctx context.Context, instance domain.Instance) bool {
+	if workerID := instance.RouterWorkerID; workerID != "" {
+		call, cancel := c.callContext(ctx)
+		defer cancel()
+		worker, err := c.router.GetWorker(call, workerID)
+		if err != nil {
+			return false
+		}
+		return worker.Load > 0
+	}
+	if !instance.HasService() {
+		return false
+	}
+	call, cancel := c.callContext(ctx)
+	worker, found, err := c.router.FindWorkerByURL(call, instance.ServiceURL())
+	cancel()
+	if err != nil || !found {
+		return false
+	}
+	return worker.Load > 0
+}
+
 func (c *Controller) closeReadiness(ctx context.Context, instance domain.Instance) error {
 	workerID := instance.RouterWorkerID
 	if workerID == "" && instance.HasService() {

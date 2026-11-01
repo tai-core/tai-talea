@@ -402,6 +402,25 @@ func (c *Controller) settleService(ctx context.Context, instance domain.Instance
 		// remove all four instances at once: with nothing routable the Router
 		// answers 503 to every caller, which is an outage produced entirely by
 		// traffic.
+		//
+		// A streak only helps if the individual misses mean something, which is
+		// the part the thresholds do not fix on their own. Under sustained load
+		// every probe misses, every streak reaches its threshold, and the model
+		// is condemned for being busy: a load test at 192 in flight reloaded two
+		// instances while both were serving normally, and the reload is what the
+		// caller saw as 503s and 50-second first tokens. So the miss is only
+		// counted when the instance had nothing to do - an idle model that
+		// cannot generate within the budget is evidence, a busy one is not.
+		if c.instanceHasWorkInFlight(ctx, instance) {
+			// Info, not Debug: this line is the only evidence that the gate is
+			// doing anything. Without it "no probe failures" is indistinguishable
+			// from "the probe never ran", which is exactly the kind of
+			// unobservable fix that rots.
+			c.log().Info("model health probe missed while the instance was busy; not counted",
+				"instance_id", instance.ID, "role", string(instance.Role),
+				"status", health.Status, "error", healthErr)
+			return "unhealthy", nil
+		}
 		streak := c.noteHealthFailure(instance.ID)
 		if streak >= c.ReadinessFailureThreshold() {
 			if err := c.closeReadiness(ctx, instance); err != nil {

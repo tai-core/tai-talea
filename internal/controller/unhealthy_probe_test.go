@@ -96,6 +96,59 @@ func TestConsecutiveMissesTakeTheInstanceOutOfRotation(t *testing.T) {
 	}
 }
 
+// A miss while the instance has work in flight is the probe queueing behind that
+// work, not the model failing. The thresholds alone cannot tell the difference,
+// and counting these misses condemns healthy models: a load test at 192 in
+// flight reloaded two instances that were serving normally, and the reload - not
+// the load - is what the callers behind them saw as 503s and 50-second first
+// tokens. The streak therefore only advances when the instance had nothing to
+// do; the test below is the same loop with an idle worker, and it must still
+// condemn.
+func TestAProbeMissWhileBusyIsNotEvidenceAgainstTheModel(t *testing.T) {
+	h := newHarness(t)
+	h.handle(h.addedEvent("node", h.bootstrap.Endpoint(), "lease", h.clock.Now()))
+	if err := h.ctrl.StartService(t.Context(), "node", domain.RolePrefill); err != nil {
+		t.Fatal(err)
+	}
+	workerID := h.instance("node").RouterWorkerID
+
+	// Every probe misses for the whole test, and the Router reports the instance
+	// generating throughout: exactly the shape of a worker under load.
+	h.bootstrap.setHealthStatus("degraded")
+	if !h.router.setLoad(h.instance("node").ServiceURL(), 4) {
+		t.Fatal("the Router fake lost the worker it just registered")
+	}
+
+	rounds := h.ctrl.HealthFailureThreshold() * 3
+	for round := 1; round <= rounds; round++ {
+		if _, err := h.ctrl.ReconcileOnce(t.Context()); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if state := h.instance("node").ServiceState; state != domain.ServiceServing {
+			t.Fatalf("round %d: a busy instance was condemned after %d missed probes: %s",
+				round, round, state)
+		}
+	}
+	if got := h.router.readinessOf(workerID); got != "ready" {
+		t.Fatalf("readiness=%s, want ready: a busy instance must stay routable", got)
+	}
+	if _, ok := h.ctrl.healthFailures.Load("node"); ok {
+		t.Fatal("a miss while the instance was busy must not start a failure streak")
+	}
+
+	// Once the work is gone the same miss does count, which is the check that
+	// the gate is a gate and not a way of ignoring the probe altogether.
+	if !h.router.setLoad(h.instance("node").ServiceURL(), 0) {
+		t.Fatal("could not clear the load")
+	}
+	if _, err := h.ctrl.ReconcileOnce(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := h.ctrl.healthFailures.Load("node"); !ok {
+		t.Fatal("an idle instance that cannot generate must start a streak")
+	}
+}
+
 func TestAHealthFailureThatPersistsCondemnsTheModel(t *testing.T) {
 	h := newHarness(t)
 	h.handle(h.addedEvent("node", h.bootstrap.Endpoint(), "lease", h.clock.Now()))
