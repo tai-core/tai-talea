@@ -89,6 +89,9 @@ OpenAI 兼容端点、每天 20:00 自动上电、08:00 自动把卡还给调度
 否则 Pod 会 `Ready`（readiness 打的是 bootstrap，不看模型）但一直加载不完；改权重两台都要改，
 不存在"改一处全都生效"。
 
+平台后续要收紧节点权限时，看 `docs/node-permission-inventory-2026-11-01.md`：
+逐条列了 4 条 hostPath、capabilities/seccomp 现状、以及实测过的收紧方案。
+
 ---
 
 ## 3. 每天自动发生的事
