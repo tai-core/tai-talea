@@ -173,7 +173,7 @@ func (a *Adapter) buildPod(name string) Pod {
 		ReadinessProbe: &Probe{
 			HTTPGet: &HTTPGetAction{
 				Path: "/bootstrap/health",
-				Port: a.cfg.BootstrapPort,
+				Port: Port{Number: a.cfg.BootstrapPort},
 				HTTPHeaders: []HTTPHeader{
 					{Name: "X-Bootstrap-Token", Value: a.cfg.BootstrapToken},
 				},
@@ -201,7 +201,7 @@ func (a *Adapter) buildPod(name string) Pod {
 		container.LivenessProbe = &Probe{
 			HTTPGet: &HTTPGetAction{
 				Path: livenessPath,
-				Port: a.cfg.BootstrapPort,
+				Port: Port{Number: a.cfg.BootstrapPort},
 				HTTPHeaders: []HTTPHeader{
 					{Name: "X-Bootstrap-Token", Value: a.cfg.BootstrapToken},
 				},

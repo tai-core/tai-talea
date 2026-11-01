@@ -306,8 +306,8 @@ func TestBuildPodInstallsALivenessProbeOnlyWhenAsked(t *testing.T) {
 	if probe.HTTPGet.Path != livenessPath {
 		t.Fatalf("liveness path = %q, want %q", probe.HTTPGet.Path, livenessPath)
 	}
-	if probe.HTTPGet.Port != 9001 {
-		t.Fatalf("liveness port = %d, want the bootstrap port", probe.HTTPGet.Port)
+	if probe.HTTPGet.Port.Numeric() != 9001 {
+		t.Fatalf("liveness port = %d, want the bootstrap port", probe.HTTPGet.Port.Numeric())
 	}
 	// The endpoint is behind the same shared secret as the rest of the
 	// surface; a probe without the header would be answered with a 401 and the

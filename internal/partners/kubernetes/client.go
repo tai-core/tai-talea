@@ -349,8 +349,49 @@ type Probe struct {
 // HTTPGetAction probes an HTTP endpoint.
 type HTTPGetAction struct {
 	Path        string       `json:"path,omitempty"`
-	Port        int          `json:"port"`
+	Port        Port         `json:"port"`
 	HTTPHeaders []HTTPHeader `json:"httpHeaders,omitempty"`
+}
+
+// Port is the Kubernetes int-or-string a probe uses to address its port.
+//
+// A probe names either a number or a container port, and the API server echoes
+// back whichever the Pod was written with. Modelling it as an int makes the
+// whole Pod list undecodable as soon as one workload in the namespace uses a
+// named port - and the namespace is shared, so one Deployment written by
+// somebody else would take the capacity snapshot down with it.
+type Port struct {
+	Number int
+	Name   string
+}
+
+// Numeric returns the port number, or 0 for a named port. Nothing in this
+// adapter acts on the probe port of a Pod it only lists, so a name is kept for
+// round-tripping rather than resolved.
+func (p Port) Numeric() int { return p.Number }
+
+func (p Port) MarshalJSON() ([]byte, error) {
+	if p.Name != "" {
+		return json.Marshal(p.Name)
+	}
+	return json.Marshal(p.Number)
+}
+
+func (p *Port) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		var name string
+		if err := json.Unmarshal(data, &name); err != nil {
+			return err
+		}
+		p.Name, p.Number = name, 0
+		return nil
+	}
+	var number int
+	if err := json.Unmarshal(data, &number); err != nil {
+		return err
+	}
+	p.Number, p.Name = number, ""
+	return nil
 }
 
 // HTTPHeader is one probe request header.
