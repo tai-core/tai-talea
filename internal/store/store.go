@@ -175,6 +175,7 @@ type Store interface {
 	CountServicesByRoleState(ctx context.Context) ([]RoleStateCount, error)
 
 	ApplyTransition(ctx context.Context, transition Transition) error
+	TouchInstanceObservation(ctx context.Context, id string, observedAt, seenAt time.Time) (bool, error)
 
 	SaveSnapshot(ctx context.Context, snapshot SnapshotRecord) error
 	GetSnapshot(ctx context.Context, partnerID string) (SnapshotRecord, bool, error)

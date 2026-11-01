@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +44,16 @@ func (c *Controller) pullAuthoritative(ctx context.Context, schedule PullSchedul
 		}
 	}
 	present := make(map[string]bool, len(plan.Snapshot.Instances))
+	// A sweep, not a transaction. One instance that cannot be applied yet must
+	// not stop the rest of the snapshot: the event that matters most here is a
+	// revocation, and a container that disappeared while another worker was
+	// loading still has to be revoked. Aborting at the first pending event left
+	// it registered for as long as the load lasted.
+	//
+	// Deferring is durable, not lossy: ClaimEvent already wrote the event with a
+	// pending result, and ResumePendingEvents replays it once the instance is
+	// free.
+	var deferred []string
 	apply := func(event domain.CapacityEvent, before *domain.Instance) error {
 		// Scope idempotency to this observation and the preceding intent. A
 		// content hash alone would suppress A -> B -> A changes forever.
@@ -53,6 +64,10 @@ func (c *Controller) pullAuthoritative(ctx context.Context, schedule PullSchedul
 		}{event, before, plan.Snapshot.Observed})
 		event.EventID = fmt.Sprintf("pull:%x", sha256.Sum256(key))
 		outcome, err := c.HandleCapacityEvent(ctx, event)
+		if outcome.Result == domain.ResultPending {
+			deferred = append(deferred, event.Instance.ID)
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("apply pull event: %w", err)
 		}
@@ -104,6 +119,10 @@ func (c *Controller) pullAuthoritative(ctx context.Context, schedule PullSchedul
 			Instance: &domain.EventInstance{ID: row.ID, LeaseID: row.LeaseID}}, &row); err != nil {
 			return err
 		}
+	}
+	if len(deferred) > 0 {
+		c.log().Info("pull round deferred instances that are mid-operation",
+			"partner_id", plan.PartnerID, "instances", strings.Join(deferred, ","))
 	}
 	c.audit(ctx, store.AuditEntry{Action: "capacity_snapshot_reconciled", PartnerID: plan.PartnerID,
 		Details: map[string]string{"version": plan.Snapshot.Version, "instance_count": fmt.Sprint(len(plan.Snapshot.Instances))}})

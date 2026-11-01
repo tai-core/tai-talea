@@ -645,6 +645,54 @@ func getInstanceTx(ctx context.Context, tx *sql.Tx, id string) (domain.Instance,
 	return instance, err
 }
 
+// TouchInstanceObservation records that the partner still reports the container.
+//
+// It writes two columns and nothing else, which is what makes it safe to run
+// while a lifecycle operation owns the instance. The alternative - refusing the
+// observation because a start is in flight - is not neutral: a start takes
+// minutes, the lease is what says the container is still there, and a lease that
+// stops moving while the partner keeps reporting the same container reads as an
+// expiring lease. The worker is healthy; the record was refused.
+//
+// updated_at is deliberately left alone. It is the clock the stuck-STARTING
+// heuristic measures from, so bumping it here would make an abandoned start look
+// fresh forever.
+//
+// Returns false when there is nothing to record: the row is gone, already
+// released or releasing, or the observation is older than the one already held.
+// The caller is then expected to take the ordinary locked path, which decides
+// between rejecting and applying.
+func (s *SQLiteStore) TouchInstanceObservation(ctx context.Context, id string, observedAt, seenAt time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin observation: %w", err)
+	}
+	defer tx.Rollback()
+
+	current, err := getInstanceTx(ctx, tx, id)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if current.PendingRelease || current.InstanceState == domain.InstanceReleased || current.InstanceState == domain.InstanceReleasing {
+		return false, nil
+	}
+	if observedAt.Before(current.LeaseUpdatedAt) {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE capacity_instances SET lease_updated_at = ?, last_seen_at = ? WHERE id = ?`,
+		nullTime(observedAt), nullTime(seenAt), id); err != nil {
+		return false, fmt.Errorf("record observation for %s: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func insertInstanceTx(ctx context.Context, tx *sql.Tx, instance domain.Instance) error {
 	specJSON, err := json.Marshal(instance.Spec)
 	if err != nil {

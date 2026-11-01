@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/tai-core/tai-talea/internal/domain"
@@ -29,6 +30,22 @@ type ReconcileReport struct {
 	ResumedEvents int      `json:"resumed_events"`
 }
 
+// absorb folds one instance's findings into the round's report. Each instance
+// fills its own report so the goroutines share nothing; the round merges them
+// under one lock at the end.
+func (r *ReconcileReport) absorb(piece ReconcileReport) {
+	r.Lost = append(r.Lost, piece.Lost...)
+	r.Reported = append(r.Reported, piece.Reported...)
+	r.Preparing = append(r.Preparing, piece.Preparing...)
+	r.Reregister = append(r.Reregister, piece.Reregister...)
+	r.Unhealthy = append(r.Unhealthy, piece.Unhealthy...)
+	r.Resumed = append(r.Resumed, piece.Resumed...)
+	r.Rearmed = append(r.Rearmed, piece.Rearmed...)
+	r.Recovered = append(r.Recovered, piece.Recovered...)
+	r.Released = append(r.Released, piece.Released...)
+	r.Drained = append(r.Drained, piece.Drained...)
+}
+
 // ReconcileOnce compares the database, the container, SGLang and the Router, and
 // moves every instance towards a legal state (§13).
 //
@@ -51,30 +68,56 @@ func (c *Controller) ReconcileOnce(ctx context.Context) (ReconcileReport, error)
 	}
 	report.Checked = len(instances)
 
-	lostCount := 0
-	activeCount := 0
+	// Every instance advances on its own. The round used to walk the table in one
+	// goroutine, and a start or a preparation holds that goroutine for minutes -
+	// so a worker that died while another was loading was not marked LOST until
+	// the load finished, and a drain that had already completed finished the same
+	// way. The instances share nothing but this report: each has its own row, its
+	// own operation lock and its own endpoint.
+	//
+	// Deliberately unbounded. Any fixed number of slots puts the defect back at a
+	// smaller scale: one loading worker occupies a slot for minutes, and the
+	// instances queued behind it are exactly the ones whose probe was late.
+	var (
+		wait   sync.WaitGroup
+		merge  sync.Mutex
+		lost   int
+		active int
+	)
 	for _, instance := range instances {
 		if !instance.Active() {
 			continue
 		}
-		activeCount++
-		reconciled, err := c.store.GetInstance(ctx, instance.ID)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
+		active++
+		wait.Add(1)
+		go func(id string) {
+			defer wait.Done()
+			var piece ReconcileReport
+			reconciled, err := c.store.GetInstance(ctx, id)
+			if err != nil {
+				if !errors.Is(err, store.ErrNotFound) {
+					c.log().Error("reconcile instance failed", "instance_id", id, "error", err.Error())
+				}
+				return
 			}
-			return report, err
-		}
-		if err := c.reconcileInstance(ctx, reconciled, &report); err != nil {
-			c.log().Error("reconcile instance failed", "instance_id", instance.ID, "error", err.Error())
-		}
-		refreshed, err := c.store.GetInstance(ctx, instance.ID)
-		if err == nil && refreshed.InstanceState == domain.InstanceLost {
-			lostCount++
-		}
+			if err := c.reconcileInstance(ctx, reconciled, &piece); err != nil {
+				c.log().Error("reconcile instance failed", "instance_id", id, "error", err.Error())
+			}
+			lostNow := false
+			if refreshed, err := c.store.GetInstance(ctx, id); err == nil {
+				lostNow = refreshed.InstanceState == domain.InstanceLost
+			}
+			merge.Lock()
+			report.absorb(piece)
+			if lostNow {
+				lost++
+			}
+			merge.Unlock()
+		}(instance.ID)
 	}
+	wait.Wait()
 
-	c.checkLostRate(ctx, lostCount, activeCount)
+	c.checkLostRate(ctx, lost, active)
 	return report, nil
 }
 
@@ -83,7 +126,16 @@ func (c *Controller) reconcileInstance(ctx context.Context, instance domain.Inst
 		return c.reconcileReclaim(ctx, instance, report)
 	}
 	if instance.PendingUpdate != nil && instance.ServiceState != domain.ServiceDraining {
-		return c.BeginDrain(ctx, instance.ID, "apply pending capacity update", c.DefaultDrainGrace())
+		// Try, never wait. Every other transition in this function already does:
+		// a start holds the instance for minutes, and a round that queues behind
+		// it stops noticing that other containers have gone away. The identity
+		// change is durable, so the next round takes it.
+		lock := c.instanceOperation(instance.ID)
+		if !lock.TryLock() {
+			return nil
+		}
+		defer lock.Unlock()
+		return c.beginDrain(ctx, instance.ID, "apply pending capacity update", c.DefaultDrainGrace(), false)
 	}
 	if err := c.checkLeaseExpiry(ctx, instance); err != nil {
 		c.log().Warn("lease expiry check failed", "instance_id", instance.ID, "error", err.Error())

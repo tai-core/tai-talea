@@ -276,6 +276,9 @@ func (c *Controller) handleCapacityUpdated(ctx context.Context, event domain.Cap
 	if event.Instance == nil {
 		return domain.ResultRejected, "", errors.New("CAPACITY_UPDATED requires an instance payload")
 	}
+	if handled, result, reason, err := c.observeOnly(ctx, event); handled {
+		return result, reason, err
+	}
 	if !c.capacityAdmissions.TryLock() {
 		return domain.ResultPending, "capacity admission is busy", store.ErrConflict
 	}
@@ -401,6 +404,65 @@ func (c *Controller) handleCapacityUpdated(ctx context.Context, event domain.Cap
 		return domain.ResultApplied, "instance metadata re-confirmed, nothing changed", nil
 	}
 	return domain.ResultApplied, "instance metadata updated: " + strings.Join(changed, ","), nil
+}
+
+// observeOnly records a CAPACITY_UPDATED that carries nothing new.
+//
+// The pull path re-asserts every instance it sees on every poll, and that is the
+// point of it: the observation is the proof that the container is still there.
+// Requiring the instance's lifecycle lock for that proof has a cost that is not
+// obvious until a cold start: a start holds the lock for the whole load, so the
+// observation is refused for minutes, the recorded lease stops advancing, and
+// lease_expiring_soon fires for a worker the partner is reporting as healthy the
+// entire time. The record was refused, not the container lost.
+//
+// So this path writes the observation and nothing else. The moment the event
+// would change identity, spec or lease it returns handled=false and the ordinary
+// locked path decides: those are transitions, and a transition must wait for
+// whatever owns the instance.
+func (c *Controller) observeOnly(ctx context.Context, event domain.CapacityEvent) (bool, domain.EventResult, string, error) {
+	instance, err := c.store.GetInstance(ctx, event.Instance.ID)
+	if err != nil {
+		// Unknown ids and read failures belong to the locked path, which has a
+		// considered answer for both.
+		return false, "", "", nil
+	}
+	if instance.PartnerID != event.PartnerID || instance.PendingUpdate != nil ||
+		instance.PendingRelease || instance.InstanceState == domain.InstanceReleasing ||
+		instance.InstanceState == domain.InstanceReleased {
+		return false, "", "", nil
+	}
+	// The comparisons below mirror the locked path exactly. Being more generous
+	// here would apply a change without the drain that change requires.
+	if endpoint := domain.NormalizeEndpoint(event.Instance.Endpoint); endpoint != "" && endpoint != instance.Endpoint {
+		return false, "", "", nil
+	}
+	if service := domain.NormalizeEndpoint(event.Instance.ServiceEndpoint); (service != "" || event.Source == domain.SourcePull) && service != instance.ServiceEndpoint {
+		return false, "", "", nil
+	}
+	if event.Instance.LeaseID != "" && event.Instance.LeaseID != instance.LeaseID {
+		return false, "", "", nil
+	}
+	if event.Instance.Spec != nil && !reflect.DeepEqual(*event.Instance.Spec, instance.Spec) {
+		return false, "", "", nil
+	}
+	if event.OccurredAt.Before(instance.LeaseUpdatedAt) {
+		return true, domain.ResultRejected, "update predates the newest lease observation", nil
+	}
+	touched, err := c.store.TouchInstanceObservation(ctx, instance.ID, event.OccurredAt, c.now())
+	if err != nil {
+		return true, domain.ResultFailed, "", err
+	}
+	if !touched {
+		// A transition landed between the read and the write. Let the locked
+		// path re-decide rather than reporting an observation that was not kept.
+		return false, "", "", nil
+	}
+	c.audit(ctx, store.AuditEntry{
+		Action: "capacity_updated", InstanceID: instance.ID, PartnerID: event.PartnerID, EventID: event.EventID,
+		Details: map[string]string{"changed": ""},
+	})
+	return true, domain.ResultApplied, "instance metadata re-confirmed, nothing changed", nil
 }
 
 func (c *Controller) handleCapacityRevoked(ctx context.Context, event domain.CapacityEvent) (domain.EventResult, string, error) {

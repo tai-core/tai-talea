@@ -486,30 +486,64 @@ func (c *Controller) RunPeriodic(ctx context.Context) {
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if _, err := c.ReconcileOnce(ctx); err != nil {
-				c.log().Error("reconcile round failed", "error", err.Error())
-				c.alert(ctx, obs.Alert{
-					Name:     obs.AlertReconcileFailed,
-					Severity: obs.SeverityCritical,
-					Message:  "reconcile round failed",
-					Details:  map[string]string{"error": err.Error()},
-				})
+	// Three drivers, not one loop. A planner round that starts services waits
+	// for every one of them, and a start takes minutes; when the loop drove the
+	// phases in sequence, that wait stopped the reconciler too, so for the length
+	// of a cold start nothing was probed and nothing that finished draining was
+	// finished. Overlapping the phases is safe for the reason the pull loop has
+	// always been allowed to overlap them: an instance's transitions are
+	// serialized by its own operation lock, and the reconciler only ever tries
+	// that lock, so it yields to whatever holds it instead of queueing behind it.
+	drivers := []struct {
+		name string
+		step func(context.Context)
+	}{
+		{"reconcile", c.reconcileDriver},
+		{"planner", c.plannerDriver},
+		{"gauges", c.publishGaugeDriver},
+	}
+	var wait sync.WaitGroup
+	for _, driver := range drivers {
+		wait.Add(1)
+		go func(step func(context.Context)) {
+			defer wait.Done()
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					step(ctx)
+				}
 			}
-			if _, err := c.Rebalance(ctx); err != nil {
-				c.log().Error("planner round failed", "error", err.Error())
-			}
-			if err := c.PublishGauges(ctx); err != nil {
-				c.log().Warn("publishing gauges failed", "error", err.Error())
-			}
-		}
+		}(driver.step)
+	}
+	wait.Wait()
+}
+
+func (c *Controller) reconcileDriver(ctx context.Context) {
+	if _, err := c.ReconcileOnce(ctx); err != nil {
+		c.log().Error("reconcile round failed", "error", err.Error())
+		c.alert(ctx, obs.Alert{
+			Name:     obs.AlertReconcileFailed,
+			Severity: obs.SeverityCritical,
+			Message:  "reconcile round failed",
+			Details:  map[string]string{"error": err.Error()},
+		})
+	}
+}
+
+func (c *Controller) plannerDriver(ctx context.Context) {
+	if _, err := c.Rebalance(ctx); err != nil {
+		c.log().Error("planner round failed", "error", err.Error())
+	}
+}
+
+func (c *Controller) publishGaugeDriver(ctx context.Context) {
+	if err := c.PublishGauges(ctx); err != nil {
+		c.log().Warn("publishing gauges failed", "error", err.Error())
 	}
 }
 

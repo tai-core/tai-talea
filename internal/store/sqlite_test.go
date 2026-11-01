@@ -360,3 +360,76 @@ func seedReleased(t *testing.T, persistence *store.SQLiteStore, id string) {
 		t.Fatalf("seed %s RELEASED: %v", id, err)
 	}
 }
+
+// The observation write is deliberately narrow: it exists so the partner's
+// "this container is still there" can land while a start owns the instance, and
+// it is only safe because it touches the two observation columns and nothing
+// else. A wider write here would let a poll during a load erase the lifecycle
+// state the load is in the middle of setting.
+func TestTouchInstanceObservationWritesOnlyTheObservation(t *testing.T) {
+	persistence := newStore(t)
+	ctx := context.Background()
+	observed := time.Now().UTC().Add(-time.Minute)
+	instance := domain.Instance{
+		ID: "container-1", PartnerID: "partner-a", Endpoint: "http://10.0.0.1:8080",
+		LeaseID: "lease-1", InstanceState: domain.InstanceAllocating,
+		ServiceState: domain.ServiceNone, LeaseUpdatedAt: observed,
+	}
+	if err := persistence.ApplyTransition(ctx, store.Transition{InstanceID: instance.ID, Next: instance}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	preparing := instance
+	preparing.InstanceState = domain.InstancePreparing
+	if err := persistence.ApplyTransition(ctx, store.Transition{
+		InstanceID: instance.ID, Next: preparing, ExpectInstanceState: domain.InstanceAllocating,
+	}); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	before, err := persistence.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	later := observed.Add(30 * time.Second)
+	seen := later.Add(time.Second)
+	touched, err := persistence.TouchInstanceObservation(ctx, instance.ID, later, seen)
+	if err != nil || !touched {
+		t.Fatalf("touch: touched=%v err=%v", touched, err)
+	}
+	after, err := persistence.GetInstance(ctx, instance.ID)
+	if err != nil {
+		t.Fatalf("get after touch: %v", err)
+	}
+	if !after.LeaseUpdatedAt.Equal(later) || !after.LastSeenAt.Equal(seen) {
+		t.Fatalf("observation not recorded: lease=%s seen=%s", after.LeaseUpdatedAt, after.LastSeenAt)
+	}
+	if after.InstanceState != before.InstanceState || after.ServiceState != before.ServiceState ||
+		after.Role != before.Role || after.Endpoint != before.Endpoint || after.LeaseID != before.LeaseID {
+		t.Fatalf("the observation moved something other than its own columns: %+v", after)
+	}
+	if !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatal("the observation moved updated_at; the stuck-STARTING heuristic measures from it")
+	}
+
+	// An observation older than the one already held is not a rollback.
+	stale := observed
+	if touched, err := persistence.TouchInstanceObservation(ctx, instance.ID, stale, seen); err != nil || touched {
+		t.Fatalf("a stale observation was accepted: touched=%v err=%v", touched, err)
+	}
+	if got, _ := persistence.GetInstance(ctx, instance.ID); !got.LeaseUpdatedAt.Equal(later) {
+		t.Fatalf("stale observation rolled the lease back to %s", got.LeaseUpdatedAt)
+	}
+
+	// The write belongs to live rows only: a reclaiming instance must not look
+	// freshly observed just because the container is still running.
+	if err := persistence.ApplyTransition(ctx, store.Transition{InstanceID: instance.ID, RequestRelease: true}); err != nil {
+		t.Fatalf("request release: %v", err)
+	}
+	if touched, err := persistence.TouchInstanceObservation(ctx, instance.ID, later.Add(time.Minute), seen); err != nil || touched {
+		t.Fatalf("an observation was recorded for a reclaiming instance: touched=%v err=%v", touched, err)
+	}
+
+	if touched, err := persistence.TouchInstanceObservation(ctx, "never-existed", later, seen); err != nil || touched {
+		t.Fatalf("unknown instance: touched=%v err=%v", touched, err)
+	}
+}
