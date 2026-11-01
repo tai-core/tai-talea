@@ -239,3 +239,11 @@ lines have aged out of the window.
   round, not a reload — `/bootstrap/start` against a worker that is already
   serving answers "already running" and the control plane adopts it, which is what
   the 03:21 re-adoption did in four seconds.
+- **The public entry is not reachable from the internet yet**, and the fix is not
+  on this host. nginx on the jump host listens on `0.0.0.0:80` and `:8000`, has no
+  local firewall, and answers 200 to `127.0.0.1:8000/health`. But the host's only
+  address is `10.5.0.2`; `36.138.20.89` is a platform EIP, and that EIP answers
+  `502 upstream connect failed: connection timed out` in the platform proxy's own
+  `text/plain` format — nothing reaches nginx. The EIP has to be mapped to
+  `10.5.0.2:80` and the port opened in the console's security group; until then
+  the deployment is only reachable as `192.168.239.{2,3,4}:31280` from inside.
