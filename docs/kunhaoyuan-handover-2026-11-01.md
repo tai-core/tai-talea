@@ -234,6 +234,11 @@ kubectl -n kunhaoyuan logs deploy/talea-router  -f     # 请求级日志（每�
 token 日志是否符合《第三方网关 Token 日志规范》v1.2、还缺什么、以及后续该由谁采到哪里，
 单独写在 `docs/ailog-conformance-2026-11-01.md`；`ops/analyze_ailog.py` 是可复跑的严格校验。
 
+Router 镜像是 `glm-5.3-flash-ailog4`（官方基镜像 + 一层自研二进制）。这一版有两处是跟"账"有关的：
+`request_id` 改为 Router 生成（调用方的只记进 `caller_request_id`），`reasoning_tokens` 抬进
+`output_token_details`。回滚只需把 `30-router.yaml` 的 tag 改回 `ailog3` 再 apply——worker 与
+control 都不动，模型不重载。
+
 控制面日志里两个关键词的含义：
 
 - `model health probe failed; instance taken out of rotation` —— 探针没答，摘流。

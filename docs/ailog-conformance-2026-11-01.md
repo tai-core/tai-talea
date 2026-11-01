@@ -38,7 +38,7 @@
 | 1 | 每行可 `parse_json`，单行、UTF-8、无 BOM | 通过 | 15,118/15,118；文件头无 `EF BB BF`；无行内换行 |
 | 2 | `ai_log` 是合法转义 JSON 字符串 | 通过 | 全部为 string，二次 `json.loads` 成功；无双重转义；无非 AI 行（Router 只记 AI 路由） |
 | 3 | `input_token_details` 为嵌套对象 | 通过 | 12,990 行带 `{"cached_tokens": N}`，是对象不是字符串 |
-| 4 | `request_id` 唯一 | 通过，但有风险 | 15,118 个唯一值，前缀统一 `nightgw-`（形如 `nightgw-gnt-<24 随机>`）。**调用方自带 `x-request-id` 时会被原样采用**，见 §3.0 |
+| 4 | `request_id` 唯一 | 通过（已加固） | 15,118 个唯一值，前缀统一 `nightgw-`（形如 `nightgw-gnt-<24 随机>`）。原先**调用方自带 `x-request-id` 会被原样采用**，已在 ailog4 改为总是生成、调用方的值只记 `caller_request_id`，见 §3.0 |
 | 5 | 耗时单位毫秒 | 通过 | 外层 p50 6,460 ms / p95 19,870 ms；`llm_service_duration` 同量级 |
 | 6 | `start_time` 带时区、可 RFC3339 解析 | 通过 | 全部 `2026-11-01T…Z`，毫秒 3 位 |
 | 7 | `gateway_type` 固定 | 通过（值待定，见 §5.2） | 全部 `nightgw` |
@@ -62,7 +62,7 @@
 
 ## 3. 五个真实发现
 
-### 3.0 调用方能左右 `request_id`，重放就会撞 id（已修，待出镜像）
+### 3.0 调用方能左右 `request_id`，重放就会撞 id（已修，11-01 20:19 上线 ailog4 验证）
 
 Router 的 request-id 中间件默认读入站 `x-request-id` 头（`server.rs:1369` 的
 `unwrap_or_else` 缺省是 `["x-request-id"]`），读到就直接用，只在没有 `nightgw-` 前缀时补一个。
@@ -97,7 +97,19 @@ request_id=nightgw-dup-probe-001  start=2026-11-01T11:17:40.945Z  code=200  toke
 > 出镜像后复核：带同一个 `x-request-id` 发两次，日志里两条 `request_id` 必须不同，且两条都出现
 > `caller_request_id`。核对命令见 §8。
 
-### 3.1 `reasoning_tokens` 被丢掉（已修，待出镜像）
+**线上复核（Router 镜像 `glm-5.3-flash-ailog4`，20:19 滚动上去，4 台 worker 全部
+`registered=4 router_healthy=4`，端点 200）**：同一个 `x-request-id: rid-probe-002` 连发两次，
+两条独立记录——
+
+```
+request_id=nightgw-chatcmpl-4ZRsoMAY61ag0QL50EOJD3c5  caller_request_id=rid-probe-002  code=200
+request_id=nightgw-chatcmpl-HVWkTZkNatGcI64JUg2PrOa7  caller_request_id=rid-probe-002  code=200
+```
+
+响应头也不再回显调用方的值：带 `x-request-id: rid-header-check` 请求，回来的是
+`x-request-id: chatcmpl-uAulz6U5m0Ntey4Z5EJqPrns`。
+
+### 3.1 `reasoning_tokens` 被丢掉（已修，11-01 20:19 随 ailog4 上线）
 
 线上 `/v1/chat/completions` 的 usage 实际长这样：
 
@@ -117,9 +129,10 @@ request_id=nightgw-dup-probe-001  start=2026-11-01T11:17:40.945Z  code=200  toke
 已修：`src/observability/ai_access_log.rs` 在合并 usage 时把顶层的 `reasoning_tokens`
 提进 `output_token_details`，并加了用例 `sglang_top_level_reasoning_tokens_reach_the_output_details`
 （用上面这条真实 shape，同时断言 `prompt_tokens_details: null` 不产生假的 `input_token_details`）。
-`cargo test --lib -- observability::ai_access_log`：**9 passed, 0 failed**。
+`cargo test --lib -- observability::ai_access_log`：**10 passed, 0 failed**。
 
-**要生效必须重出 Router 镜像并滚动重启**（只换 router，worker 不动、模型不重载）。
+**已上线**：`glm-5.3-flash-ailog4` 的第一条真实记录里就出现了
+`"output_token_details":{"reasoning_tokens":24}`（24/24 个 completion token 都是思考）。
 
 ### 3.2 旧二进制留下的 4 行（不是回归，两处旧缺口）
 

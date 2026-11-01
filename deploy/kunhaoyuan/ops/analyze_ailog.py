@@ -143,9 +143,16 @@ def main(path, sample):
                 prefixes[request_id.split("-")[0]] += 1
 
             for key in ("method", "path", "user_agent", "upstream_cluster",
-                        "response_flags", "response_code_details"):
+                        "response_flags", "response_code_details",
+                        "caller_request_id"):
                 if key in outer and not isinstance(outer[key], str):
                     note("outer field is not a string", "%s = %r" % (key, outer[key]), index, stamp)
+            # The caller's own id is a correlation aid, not a key. If the two
+            # ever come out equal the router is trusting a header again, and a
+            # replayed value would silently overwrite an earlier request's usage.
+            if outer.get("caller_request_id") == request_id:
+                note("caller id became the document id",
+                     "%r - the request id must be generated" % request_id, index, stamp)
             if isinstance(outer.get("path"), str):
                 paths[outer["path"]] += 1
             if isinstance(outer.get("user_agent"), str):
