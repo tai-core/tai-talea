@@ -185,12 +185,30 @@ func (f *fakePlatform) handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func newTestAdapter(t *testing.T, fake *fakePlatform) *Adapter {
+	return newTestAdapterWithHosts(t, fake, nil)
+}
+
+// newTestAdapterWithHosts is newTestAdapter for the deployments that name their
+// containers, which is what makes an unpublished port addressable.
+func newTestAdapterWithHosts(t *testing.T, fake *fakePlatform, hosts map[string]string) *Adapter {
+	return newTestAdapterWithConfig(t, fake, func(cfg *Config) {
+		cfg.AdvertiseHosts = hosts
+	})
+}
+
+// newTestAdapterWithConfig is the escape hatch for deployments that move their
+// ports: New() fills in 9001/9002, so a test about 9101/9102 has to say so.
+func newTestAdapterWithConfig(t *testing.T, fake *fakePlatform, mut func(*Config)) *Adapter {
 	server := httptest.NewServer(http.HandlerFunc(fake.handler))
 	t.Cleanup(server.Close)
-	adapter, err := New("alayanew", Config{
+	cfg := Config{
 		AccessKey: "ak-test", SecretKey: fake.secret, Timeout: 5 * time.Second,
 		ModelSupport: []string{"zai-org/GLM-5.3-Flash"},
-	})
+	}
+	if mut != nil {
+		mut(&cfg)
+	}
+	adapter, err := New("alayanew", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,5 +691,70 @@ func TestUnknownStatusIsNotTreatedAsQueued(t *testing.T) {
 	_, err := adapter.AwaitSSHAccess(context.Background(), "inst-unknown")
 	if err == nil || errors.Is(err, partner.ErrAwaitingCapacity) {
 		t.Fatalf("an unknown status must keep the bounded behaviour, got %v", err)
+	}
+}
+
+// endpointFor is where "the port the platform publishes" stops being the only
+// source of truth. Moving a service off 9001/9002 is only useful if an
+// unpublished port can still be addressed - otherwise the control plane cannot
+// manage the very deployment that moved it.
+func TestEndpointFor(t *testing.T) {
+	mapped := map[int]string{9001: "http://203.0.113.9:30086"}
+	cases := []struct {
+		name     string
+		mapped   map[int]string
+		internal string
+		port     int
+		want     string
+		ok       bool
+	}{
+		{"published, public address only", mapped, "", 9001, "http://203.0.113.9:30086", true},
+		{"published, internal address wins", mapped, "172.19.166.190", 9001, "http://172.19.166.190:9001", true},
+		{"unpublished, internal address known", mapped, "172.19.166.190", 9101, "http://172.19.166.190:9101", true},
+		{"unpublished, no internal address", mapped, "", 9101, "", false},
+		{"empty mapping, no internal address", map[int]string{}, "", 9001, "", false},
+	}
+	for _, c := range cases {
+		got, ok := endpointFor(c.mapped, c.internal, c.port)
+		if got != c.want || ok != c.ok {
+			t.Errorf("%s: got (%q,%v), want (%q,%v)", c.name, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// The 2026-11-02 deployment serves on 9101/9102 because the platform publishes
+// 9001/9002 to the internet and refuses to unpublish them. A pull must still
+// adopt those containers: advertise_hosts already names the address, so the
+// absence of a mapping is the intended state, not a broken container.
+func TestSnapshotAdoptsUnpublishedPortsWhenTheHostIsKnown(t *testing.T) {
+	fake := &fakePlatform{
+		t: t, secret: "sk-test",
+		instances: []map[string]any{
+			{"id": "inst-a", "name": "node-a", "status": "RUNNING", "aidcId": 2,
+				"resource": map[string]any{"gpuName": "NVIDIA-H100-80G", "gpuCount": 8}},
+		},
+		// 9001/9002 are published by the platform, but nothing listens on them;
+		// 9101/9102 never appear in the mapping at all.
+		ports: map[string]map[int]string{"inst-a": {9001: "30086", 9002: "30093"}},
+	}
+	adapter := newTestAdapterWithConfig(t, fake, func(cfg *Config) {
+		cfg.AdvertiseHosts = map[string]string{"node-a": "172.19.166.190"}
+		cfg.BootstrapPort = 9101
+		cfg.ServicePort = 9102
+	})
+
+	snapshot, err := partner.CollectSnapshot(context.Background(), adapter)
+	if err != nil {
+		t.Fatalf("collect snapshot: %v", err)
+	}
+	if len(snapshot.Instances) != 1 {
+		t.Fatalf("expected the container to be adopted, got %+v", snapshot.Instances)
+	}
+	got := snapshot.Instances[0]
+	if got.Endpoint != "http://172.19.166.190:9101" {
+		t.Errorf("bootstrap endpoint should use the configured ports, got %s", got.Endpoint)
+	}
+	if got.ServiceEndpoint != "http://172.19.166.190:9102" {
+		t.Errorf("service endpoint should use the configured ports, got %s", got.ServiceEndpoint)
 	}
 }

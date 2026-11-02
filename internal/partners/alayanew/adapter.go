@@ -414,10 +414,6 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 	if err != nil {
 		return partner.CapacityInstance{}, err
 	}
-	bootstrap, ok := mapped[a.cfg.BootstrapPort]
-	if !ok {
-		return partner.CapacityInstance{}, fmt.Errorf("bootstrap port %d not published", a.cfg.BootstrapPort)
-	}
 	// The operator-chosen instance name is the identity the control plane
 	// enrolled through onboarding. The platform UUID would look like a brand
 	// new container on every poll and revoke the managed node instead.
@@ -425,36 +421,58 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 	if name == "" {
 		name = record.ID
 	}
-	// The platform publishes the public ingress host, but Router health
-	// checks and PD disaggregation originate from inside the same network,
-	// where the public IP is a hairpin that never completes. Swap in the
-	// configured internal address and the container port (the published
-	// ingress port maps 1:1 to the container port, so inside the network
-	// peers reach the container port directly).
-	rewrite := func(endpoint string, containerPort int) string {
-		host := a.advertiseHost(name)
-		if host == "" {
-			return endpoint
-		}
-		u, err := url.Parse(endpoint)
-		if err != nil || u.Host == "" {
-			return endpoint
-		}
-		u.Host = net.JoinHostPort(host, strconv.Itoa(containerPort))
-		return u.String()
+	// The platform publishes 9001/9002 to the internet whether we ask or not,
+	// and refuses to unpublish them ("100021 系统端口不可移除"). A published port
+	// with a listener is reachable by anyone - on 2026-11-01 that is how a
+	// scanner killed the decode worker 126 times - so this deployment serves on
+	// 9101/9102 instead, which the platform never publishes. "Not in the
+	// mapping" is therefore a normal case here, not an error: when
+	// advertise_hosts names the container, the internal address is known
+	// without asking the platform. Without it the old rule still holds - an
+	// unpublished bootstrap port means the container cannot be managed.
+	internal := a.advertiseHost(name)
+	bootstrap, ok := endpointFor(mapped, internal, a.cfg.BootstrapPort)
+	if !ok {
+		return partner.CapacityInstance{}, fmt.Errorf("bootstrap port %d not published", a.cfg.BootstrapPort)
 	}
 	instance := partner.CapacityInstance{
 		ID:       name,
 		LeaseID:  leaseIDFor(name),
-		Endpoint: rewrite(bootstrap, a.cfg.BootstrapPort),
+		Endpoint: bootstrap,
 		Spec: domain.InstanceSpec{
 			GPU:          record.Resource.GPUName,
 			GPUCount:     int(record.Resource.GPUCount),
 			ModelSupport: a.cfg.ModelSupport,
 		},
 	}
-	if service, ok := mapped[a.cfg.ServicePort]; ok {
-		instance.ServiceEndpoint = rewrite(service, a.cfg.ServicePort)
+	if service, ok := endpointFor(mapped, internal, a.cfg.ServicePort); ok {
+		instance.ServiceEndpoint = service
 	}
 	return instance, nil
+}
+
+// endpointFor resolves one container port to the address peers should use.
+//
+// The platform publishes the public ingress host, but Router health checks and
+// PD disaggregation both originate inside the same network, where that public
+// IP is a hairpin that never completes. A configured internal address wins, and
+// it also makes an unpublished port usable: inside the network peers reach the
+// container port directly.
+func endpointFor(mapped map[int]string, internal string, port int) (string, bool) {
+	published, ok := mapped[port]
+	if !ok {
+		if internal == "" {
+			return "", false
+		}
+		return "http://" + net.JoinHostPort(internal, strconv.Itoa(port)), true
+	}
+	if internal == "" {
+		return published, true
+	}
+	u, err := url.Parse(published)
+	if err != nil || u.Host == "" {
+		return published, true
+	}
+	u.Host = net.JoinHostPort(internal, strconv.Itoa(port))
+	return u.String(), true
 }
