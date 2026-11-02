@@ -1,0 +1,359 @@
+# 九章 CCI（AlayaNeW）交接文档
+
+> 写于 2026-11-02 15:20Z+08。写给接下来接手这台机器的人。
+> 这里只写**现场成立的事实**和**踩过的坑**；设计取舍见 `architecture-and-design.md`，
+> 容量与配额的取证见 `alayanew-capacity-probe-2026-10-26.md`，
+> 自动部署链路的逐段核对见 `alayanew-automation-review-2026-10-27.md`。
+
+---
+
+## 0. 一句话
+
+九章这台是把 GLM-5.3-Flash 用 **1 prefill + 1 decode** 跑起来的验证环境，
+`2026-10-26` 验收通过；从 `2026-11-01 00:54` 起 **decode 侧陷入重启循环，服务不可用**，
+收尾时按「取证 → 记档 → 释放实例」处理。**它不是生产环境，不需要保活。**
+
+---
+
+## 1. 当前状态（2026-11-02 15:20）
+
+| 项 | 状态 |
+| --- | --- |
+| 实例 `glm53-pd2` | `RUNNING`，8×H100 80GB，创建于 2026-10-13 10:33 |
+| 实例 `glm53-pd3` | `RUNNING`，8×H100 80GB，创建于 2026-10-26 17:06 |
+| prefill（pd2） | `SERVING`，sglang 已连续跑 6 天 19 小时；`/server_info` 200 / 9ms，`/health_generate` 200 / 1.0s |
+| decode（pd3） | **循环重启中**：加载 → 8 个 rank 同时抛异常 → 进程死 → 重来，每轮约 17.5 分钟 |
+| Router（pd2:8000） | 活着，`prefill_count=1 / decode_count=1`，但 decode `is_healthy=false` |
+| 真实请求 | `POST /v1/chat/completions` → **503 `No available decode workers`** |
+| 控制面 | `tai-talea 0.9.1-cci`，pd2:8787，`planner_mode=fixed`、`capacity_actions=false`、`onboarding_enabled=false` |
+| 公网入口 | `120.220.102.21`：30020→Router 8000、30021→控制面 8787、30086/30093→pd2 的 9001/9002、30002/30003→pd3 的 9001/9002 |
+
+**收尾时的判断**：这台机器**本身是好的**——pd2 的 prefill 连续跑了 6 天 19 小时，
+pd3 每一轮都能把 305 GB 权重加载完、把 PD warmup 走完。坏的是**暴露面**：
+9002 在公网、`/begin_weight_update` 无鉴权，端口一开就被外面调崩（§7.1）。
+
+`2026-10-26` 那次 1P1D 验收是真的（`7*8=56`、0.72s），`11-01 00:54` 之前也一直能服务。
+所以不是「九章跑不了这个模型」，是「九章默认把推理端口摊在公网上」这件事后来被人踩到了。
+
+---
+
+## 2. 平台与账号
+
+| 项 | 值 |
+| --- | --- |
+| 平台 | 九章智算云（AlayaNeW）CCI，北京二区 `aidcId=2` |
+| API | `https://api.alayanew.com`，HMAC-SHA256 签名（`{ts_ms}\|{METHOD}\|{uri}`） |
+| 凭据 | AK/SK 在控制面配置 `/etc/tai-talea/tai-talea.yaml` 的 `partners[0].alayanew`；**不入库** |
+| 配额 | **按「实例个数」计，上限 3**。不是 16 卡（取证见 `alayanew-capacity-probe-2026-10-26.md`） |
+| 库存接口 | `GET /api/osm/v1/product/list-for-cci?aidcId=2` 的 `remainingCount` 是**平台池余量快照**，不是配额 |
+| 镜像 | `registry.hd-02.alayanew.com:8443/alayanew-public/sglang:20250930`（Ubuntu 22.04 / CUDA 12.9 / python 3.12 / sglang **0.5.3rc0**） |
+| NAS | `nas_storage_id=c1efadd1-…`，挂到 `/root/gongji`，含权重与运行时制品 |
+
+> 镜像不能直接用：0.5.3rc0 没有 `Glm5NextForConditionalGeneration`，加载会在第一步失败。
+> 真正跑起来的是从 NAS 铺进去的 `sglang 0.5.22 + torch 2.14.1+cu130`（见 §6.2）。
+
+---
+
+## 3. 拓扑
+
+```
+客户端 ──► 120.220.102.21:30020 ──► pd2:8000  Router（sgl-model-gateway, PD 模式）
+                                        │
+                    ┌───────────────────┴────────────────────┐
+                    ▼                                        ▼
+        pd2:9002  prefill (sglang 0.5.22)         pd3:9002  decode (sglang 0.5.22)
+                    │           ▲                            │           ▲
+                    │           └── mooncake KV ─────────────┘           │
+                    ▼                                                    ▼
+        pd2:9001  bootstrap（控制面下发 start/stop 的入口）    pd3:9001  bootstrap
+
+        pd2:8787  tai-talea 控制面（SQLite，每 10s reconcile 一次）
+```
+
+- 控制面和服务**不在数据面上**：控制面挂了不影响已注册的 worker 出 token。
+- Router 重启不会留空表：`reconcileServiceMembership` 每轮比对，实测 25 秒内自动回位。
+- 两台容器的内网地址分别是 `172.19.166.190`（pd2）、`172.19.232.225`（pd3），
+  写在控制面配置的 `advertise_hosts` 里。**重建实例后 IP 会变，这一条必须改。**
+
+---
+
+## 4. 机器上跑着什么
+
+| 路径 | 内容 |
+| --- | --- |
+| `/root/tai-talea` | 控制面二进制（`0.9.1-cci`，commit `0b7b5e4`） |
+| `/root/sgl-model-gateway` | Router 二进制 |
+| `/etc/tai-talea/tai-talea.yaml` | 控制面配置（**含平台 AK/SK**，worker 从不读它） |
+| `/etc/tai-talea/profile.json`、`bootstrap-token` | worker 自检口径与 bootstrap 鉴权 |
+| `/opt/tai-talea/venv` | 真运行时：sglang 0.5.22 + torch 2.14.1+cu130（约 7 GB） |
+| `/opt/tai-talea/bootstrap-src` | worker 侧 bootstrap 包（用系统 python3 跑，不用 venv） |
+| `/opt/tai-talea/logs/` | `control-plane.log`、`router.log`、`bootstrap.log`、`sglang-{prefill,decode}.log` |
+| `/var/lib/tai-talea/tai-talea.db` | 控制面 SQLite（实例/operation/audit） |
+| `/root/gongji/GLM-5.3-Flash` | 权重：62 shard、306 GB、76108 张量、FP8 block-wise |
+| `/root/gongji/tai-talea-runtime/` | 烤好的运行时：`venv-0.5.22-cu130.tar`(11.2G) + `tai-talea-bits.tar`(27.7M) + `jit-caches.tar`(122M) + `SHA256SUMS` |
+
+**overlay 会丢，NAS 不会**：容器 `STOP → START` 之后 `/etc/tai-talea`、`/opt/tai-talea`、
+`/root/tai-talea` 全部消失，只剩 `/root/gongji`。这是 N3 缺陷，不是故障（见 §8）。
+
+---
+
+## 5. 日常操作
+
+### 5.1 看状态
+
+```bash
+# Router 名册
+curl -s http://127.0.0.1:8000/workers | python3 -m json.tool
+
+# 控制面视角
+T=<admin_token>
+curl -s -H "Authorization: Bearer $T" http://127.0.0.1:8787/v1/capacity/instances
+curl -s -H "Authorization: Bearer $T" http://127.0.0.1:8787/v1/capacity/console
+```
+
+判据：
+
+| 想确认 | 看什么 | 正常值 |
+| --- | --- | --- |
+| 进程活着 | `ps -eo pid,etime,args \| grep -E 'sglang\|tai-talea\|gateway'` | 三个都在 |
+| 显存占到位 | `nvidia-smi --query-gpu=memory.used --format=csv` | **每卡约 73.5 / 80 GB**；只占 40 GB 说明还在加载 |
+| prefill 可用 | `curl -o /dev/null -w '%{http_code}' http://<ip>:9002/server_info` | 200，约 9 ms |
+| 模型能生成 | `curl -o /dev/null -w '%{http_code}' http://<ip>:9002/health_generate` | 200，**恒 1.0s**（代码里有 `sleep(1)`，不是慢） |
+| Router 认它 | `/workers` 里 `is_healthy` | true |
+| 端到端 | `POST /v1/chat/completions` | 200 且 `finish_reason=stop` |
+
+### 5.2 起 / 停
+
+```bash
+# 这条链只有三个脚本，都在 .workbuddy/tmp/alayanew/（未入库）
+bash cci-unpack-runtime.sh       # 铺运行时（容器重建后必跑，约 2 分钟）
+bash cci-config.sh               # 写 /etc/tai-talea/tai-talea.yaml 并校验
+bash cci-start-plane.sh          # 起 Router + 控制面，控制面自己拉 sglang
+```
+
+停：`pkill -x tai-talea` / `kill <router pid>`。控制面不托管 Router，两者分别起停。
+**注意 `pkill -x sgl-model-gateway` 打不中**——`comm` 只有 15 字符，实际是 `sgl-model-gatew`，
+脚本里用的是 `ps -eo pid,cmd | grep '[s]gl-model-gateway launch'`。
+
+### 5.3 排障入口
+
+```bash
+# 控制面：谁被判死、为什么
+grep -a 'reconcile instance failed\|alert' /opt/tai-talea/logs/control-plane.log | tail -20
+
+# worker：bootstrap 侧看到的(start/stop/health)
+grep -av 'bootstrap/health' /opt/tai-talea/logs/bootstrap.log | tail -40
+
+# sglang 自己的死法
+grep -a 'Scheduler hit an exception\|Traceback\|fired up and ready' /opt/tai-talea/logs/sglang-decode.log | tail
+```
+
+> `bootstrap.log` 会被控制面的健康探针刷屏（每 200 ms 一次），一天 100 MB+。
+> **先 `grep -av 'bootstrap/health'` 再读**，否则看到的全是 200。
+
+---
+
+## 6. 重建：从零到出 token
+
+### 6.1 下单
+
+```
+POST /api/osm/v1/subscription/CCI/create
+  productCode = skus.cci.gpu.h100.80gb.hbm3.b11.a2.5.11.s20a46b:2   # 8 卡
+  cciParams.image      = registry.hd-02.alayanew.com:8443/alayanew-public/sglang:20250930
+  cciParams.name       = glm53-pd2 / glm53-pd3
+  computeResourceType  = EXCLUSIVE, priority = 1
+  NAS: c1efadd1-… / glm53-weights → /root/gongji
+```
+
+- 新单秒级 `QUEUED`，落卡通常 1–3 分钟；**弹性（ELASTIC）GPU 取不到卡**，别试。
+- 实例 id 从 `GET /api/osm/v1/subscription/sku/cci/result/{key}` 取（旧路径 `.../CCI/result/`
+  已停用，返回 `212147`）。**订阅 `SUCCESS` ≠ 实例 `RUNNING`**。
+- 起来后 `POST /cci/instance/{id}/get-ssh` 拿 `ssh root@120.220.102.21 -p <port>` 和密码。
+
+### 6.2 铺运行时（约 2 分钟）
+
+```bash
+bash cci-unpack-runtime.sh
+# 先 sha256 -c，再解 venv/bits/jit-caches，最后断言：
+#   sglang 0.5.22 / torch 2.14.1+cu130 / Glm5NextForConditionalGeneration OK
+```
+
+⛔ **不要**用镜像自带的 sglang，也不要 `pip install` 现装（25 分钟，且 pypi 拉 torch 会踩版本）。
+⛔ `tar --exclude` 在 create 模式是**位置相关**的，写在成员路径后面会静默失效，
+曾把 venv 又打一遍（11 GB 而不是 200 MB）。
+
+### 6.3 起控制面
+
+```bash
+bash cci-config.sh        # 校验配置（会打印 check_rc）
+bash cci-start-plane.sh   # Router + 控制面
+```
+
+⚠️ 起控制面前**先确认没有手工起的 sglang 占着显存**（8×73.5 GB），否则控制面再起会 OOM。
+⚠️ 改过 `advertise_hosts` 之后必须重启控制面；它只在启动时读一次。
+
+### 6.4 控制面会自己做的事
+
+1. 每 10s reconcile 一次，两台实例分 prefill / decode（`planner.gear: "1:1"`）
+2. 通过 `POST http://<ip>:9001/bootstrap/start` 下发启动（异步 202）
+3. 等 `/bootstrap/health` 变 `ok` 且 phase `RUNNING`，再注册到 Router
+4. 注册成功后置 `SERVING`
+
+**加载时间**：`2026-10-26` 实测 19 分钟（305.8 GiB / 76108 张量 / 317 MB/s，
+上限是 CephFS 冷读 373 MB/s，加 concurrency 不会更快）；`2026-11-02` 缓存热后约 14–15 分钟。
+
+---
+
+## 7. 已知缺陷
+
+### 7.1 ⛔ decode 每轮都被外部 `begin_weight_update` 打崩（不是模型/运行时问题）
+
+**先给结论**：sglang 在九章能**完整启动**（权重加载完、PD warmup 完成、日志打出
+`End of disaggregation warmup`），坏的是**暴露面**——9002 在公网上，端口一开就有人调
+`/begin_weight_update`，把 8 个 rank 全打崩。
+
+现象：pd3 每次 `start` 后约 17 分钟（加载 15–16 分钟 + warmup 1 分钟），8 个 rank 同时抛：
+
+```
+RuntimeError: Blocked unsafe global (builtins.getattr) during pickle deserialization
+  at sglang/srt/utils/common.py:3424 find_class()
+  ← SafeUnpickler.load() (common.py:3157)
+  ← tp_worker.deserialize_own_rank (tp_worker.py:198)
+  ← weight_updater.update_weights_from_tensor (weight_updater.py:241)
+```
+
+决定性的一秒（`2026-11-02 15:18:07`，`sglang-decode.log` 连续 12 行）：
+
+```
+INFO: 172.31.71.17:3215 - "POST /begin_weight_update HTTP/1.1" 200 OK   ← 外部，不是 172.19.x
+Start of pd disaggregation warmup ...
+End of disaggregation warmup                                             ← 启动其实是成功的
+[TP0..TP7] Scheduler hit an exception: Blocked unsafe global (builtins.getattr)
+SIGQUIT received. It usually means one child failed.
+kill_process_tree called: parent_pid=948882, include_parent=True        ← sglang 自己杀整棵树
+```
+
+链条：`/begin_weight_update`（`http_server.py:1423`，`@auth_level(ADMIN_OPTIONAL)`，
+**没配 key 时对任何人敞开**）→ 打开权重更新会话 → `/update_weights_from_tensor` 用
+`SafeUnpickler` 反序列化 → 载荷里有 `builtins.getattr` 被拦 → 8 个 rank 全崩 →
+sglang 自杀 → bootstrap 记 `exit -9` → 控制面判 `sglang process failed during startup` → 重来。
+
+> 注意日志顺序会骗人：`The server is fired up and ready to roll!` 出现在 `SIGQUIT` **之后**，
+> 是崩溃流程里打的最后一行。**看到它就以为起成功了，会被带到沟里。**
+
+为什么停不下来：9002 是**平台系统端口，不可关闭**（§7.2），端口一开就在公网。
+所以不是"起不来"，是"一起来就被打"—— 122 轮全部落在 17 分钟左右，
+正好是"加载完、端口开始监听"的时刻。
+
+| 证据 | 说明 |
+| --- | --- |
+| **`grep -c begin_weight_update sglang-decode.log` = 126** | 与 122 轮崩溃**一一对应**，无一轮例外 |
+| 来源只有三个：`172.31.71.16 / .17 / .18` | 平台 NAT 后的公网源地址，轮换着打；同一批 IP 还在 `bootstrap.log` 里扫 `/phpinfo`、`/wiki`、TLS |
+| `11-01 00:54:00` 一次 `POST /update_weights_from_tensor`（172.31.71.18） | 13 秒后进程 `-9`，循环起点同一分钟 |
+| `11-02 15:18:07` 完整走完加载 + warmup | 6 秒后被 `kill_process_tree`，因为先中了 `begin_weight_update` |
+| `11-01 01:11–02:20` 有 4 次 `fired up and ready` | 说明**不是必崩**，取决于扫描器有没有打中 |
+
+修复路径（按代价排序，**都未实施**）：
+
+1. **给 sglang 加 `--api-key`** —— `srt/utils/auth.py` 的语义是「配了 key，NORMAL/ADMIN_OPTIONAL
+   端点都要求 key」。需要同时让 bootstrap 的 flag 白名单放行，并让 Router 注册 worker 时带同一个 key。
+2. **把 `service_port` 从 9002 改到 9102** —— 9002 无人监听，公网映射打空；控制面配置一处改。
+3. 别接公网（本来就是验证环境）。
+
+**收尾没有修它** —— 按用户决定，先记档再释放。
+
+### 7.2 ⛔ 9001/9002 永久对公网开放，且关不掉
+
+- 平台**默认**把容器 9001/9002 发布到公网（pd2: 30086/30093，pd3: 30002/30003），
+  它们出现在 `open-port/list` 的 `ports`（system 端口）里。
+- `POST /cci/instance/{id}/close-port {"port":9002}` → **`{"status":100021,"message":"系统端口不可移除"}`**。
+  只有自定义端口（8000/8787）能关。
+- 后果：sglang 的 `/update_weights_from_tensor`（会反序列化 pickle）**没有任何鉴权地对互联网开放**。
+  `bootstrap.log` 里能看到扫描流量：TLS 乱码、`/phpinfo`、`/wiki`、RDP cookie `mstshash=Administr`。
+- 可行的收敛办法（都未实施）：
+  1. sglang 监听改到 9102，让 9002 无人监听（控制面 `service_port` 一并改）；
+  2. 容器内 `iptables -I INPUT -p tcp --dport 9002 ! -s 172.19.0.0/16 -j DROP`；
+  3. 只在内网用，不接公网（本来就是验证环境）。
+
+### 7.3 自动扩容仍然是断的
+
+| 段 | 状态 |
+| --- | --- |
+| 决策扩容 | ✗ `capacity_actions=false` + `planner_mode=fixed`（`fixed` 禁止 capacity 动作） |
+| 等 instanceId | ✓ 已修（`0.9.1-cci` 换到 `/subscription/sku/cci/result/`） |
+| 铺装 | ✓ 已修（NAS runtime 分支，`ssh_install.py` 只传脚本） |
+| 节点自检 | ✗ 仓库默认 0.5.20/24.04/cu13，现场 0.5.22/22.04/cu12.9 |
+| 公网开端口 | ✗ 全仓只有 `open-port/list`（读），没有开端口调用 |
+
+⇒ **「把节点交进来之后」全自动，「把节点搞到手」全手工**（`2026-10-27` review 的结论没变）。
+
+### 7.4 其它
+
+- 控制面 / Router **无守护**：进程挂了不会自拉；容器重启清 overlay 后要手工重铺。
+- `bootstrap.log` 无轮转：一天 100 MB+，`2026-11-02` 已 111 MB。
+- `/health_generate` 恒 1.0s，是 sglang 代码里的 `sleep(1)`，不是性能问题。
+- 弹性 GPU 池取不到卡（CPU 22 秒能落，GPU 1 卡/8 卡都 300 秒不动），已取证。
+
+---
+
+## 8. 看到不要慌（8 条）
+
+1. **`/health_generate` 花 1.0 秒** —— 代码里的固定 sleep，正常。
+2. **显存只占 40 GB** —— 还在加载；加载完是 73.5/80。
+3. **控制面 `service_state` 卡在 `STARTING`** —— 先看 `ps` 里 sglang 起来多久；<20 分钟属正常。
+4. **`bootstrap.log` 里成片的 401/400/乱码** —— 公网扫描器打 9001/9002，不是我们的客户端。
+5. **`Instance Lost` / `AlertPartnerSyncFailed`** —— pull 快照里没看到实例只告警、**不释放**节点。
+6. **`QUEUED` 不等于失败** —— `AwaitSSHAccess` 在 QUEUED 时停表，`ErrAwaitingCapacity` 会让 job hold。
+7. **`40010 已达上限：3`** —— 配额是**实例个数**，不是卡数；`QUEUED` 的实例也占配额。
+8. **`pkill -x sgl-model-gateway` 没反应** —— 名字被截断成 15 字符，用 `ps | grep '[s]gl-model-gateway launch'`。
+
+---
+
+## 9. 交接清单
+
+| 东西 | 在哪 |
+| --- | --- |
+| 平台 AK/SK | 控制面配置 `/etc/tai-talea/tai-talea.yaml`（`partners[0].alayanew`）；**不在仓库** |
+| 控制面 admin token | 同上（`server.admin_token`）；也不在仓库 |
+| 实例 SSH 密码 | `POST /cci/instance/{id}/get-ssh` 现取，每次可能不同 |
+| 权重 | NAS `c1efadd1-…` → `/root/gongji/GLM-5.3-Flash`（306 GB，随 NAS 保留，**不随实例释放而丢失**） |
+| 运行时制品 | NAS `/root/gongji/tai-talea-runtime/`（3 个 tar + SHA256SUMS） |
+| 验收报告 | `docs/alayanew-1p1d-acceptance-2026-10-26.md` |
+| 容量/配额取证 | `docs/alayanew-capacity-probe-2026-10-26.md` |
+| 自动化 review | `docs/alayanew-automation-review-2026-10-27.md` |
+| 运行时与私有镜像 | `docs/alayanew-runtime-and-private-image-2026-10-26.md` |
+| 现场脚本 | `.workbuddy/tmp/alayanew/cci-*.sh`（**未入库**，见 §10） |
+
+> 私有镜像**打不出来**：`save-image` 返回 `100045 请求镜像仓库失败`，租户没开通「混闪-镜像」。
+> 所以重建只能走 NAS tar 这条路，不要指望镜像。
+
+---
+
+## 10. 还没做的（按优先级）
+
+1. **收 9002 的公网面**（§7.2）—— 加 `--api-key` 或把端口改到 9102，二选一。
+   这是让 decode 能活下来的**唯一前提**，比修模型本身更优先。
+2. **CCI 脚本入仓** —— `cci-unpack-runtime.sh`、`cci-config.sh`、`cci-start-plane.sh`、
+   `cci-elastic-probe.py`、`cci-probe-sweep.py` 仍只在 tmp，重建时找不到就是灾难。
+3. **控制面自启** —— 现在靠手工 `setsid nohup`；写个 systemd unit 或 cron 都行。
+4. **日志轮转** —— `bootstrap.log` 一天 100 MB+。
+5. 自动扩容的剩下两段（§7.3）—— 只有在真要无人值守时才值得做。
+
+---
+
+## 11. 时间线（事实）
+
+| 时间 | 事 |
+| --- | --- |
+| 2026-10-13 10:33 | pd2 创建 |
+| 2026-10-13 22:04 | pd2 曾 stop 一次（overlay 清空，证明 N3） |
+| 2026-10-26 17:06 | pd3 创建 |
+| 2026-10-26 18:29–18:53 | 手工起 prefill 成功（加载 17 分 14 秒） |
+| 2026-10-26 19:32 | **首次** `Blocked unsafe global` 异常（启动阶段） |
+| 2026-10-26 20:00 | 1P1D 端到端验收：`7*8=56`，0.72s |
+| 2026-10-26 20:40 | 公网 API 打通（8000→30020、8787→30021） |
+| 2026-10-27 15:10 | 控制面 `0.9.1-cci` 上线（WaitCreation 修好） |
+| 2026-11-01 00:54:00 | 外部 `POST /update_weights_from_tensor`（172.31.71.18） |
+| 2026-11-01 00:54:19 | **重启循环开始** |
+| 2026-11-02 15:20 | 收尾取证：122 轮、每轮 17.5 分钟、服务 100% 不可用 |
