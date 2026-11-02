@@ -29,3 +29,6 @@ provision/wheelhouse/dist/
 provision/wheelhouse/wheels/*.whl
 provision/wheelhouse/wheels/*.tar.gz
 provision/wheelhouse/wheels/*.zip
+
+# stage-B sandbox test artifacts (pid-suffixed)
+.tmp-stage-b-test-*

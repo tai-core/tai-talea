@@ -403,7 +403,7 @@ sglang 自杀 → bootstrap 记 `exit -9` → 控制面判 `sglang process faile
 | 控制面 admin token | 同上（`server.admin_token`）；也不在仓库 |
 | 实例 SSH 密码 | `POST /cci/instance/{id}/get-ssh` 现取，每次可能不同 |
 | 权重 | NAS `c1efadd1-…` → `/root/gongji/GLM-5.3-Flash`（306 GB，随 NAS 保留，**不随实例释放而丢失**） |
-| 运行时制品 | NAS `/root/gongji/tai-talea-runtime/`：`venv-0.5.22-cu130.tar`(11.2G)、`tai-talea-bits.tar`、`jit-caches.tar`、`SHA256SUMS`、**`live-2026-11-02.tar.gz`**（释放前的现役二进制+配置） |
+| 运行时制品 | NAS `/root/gongji/tai-talea-runtime/`：`venv-0.5.22-cu130.tar`(11.2G)、`tai-talea-bits.tar`、`jit-caches.tar`、`SHA256SUMS`、**`live-2026-11-02.tar.gz`**（释放前的现役二进制+配置）。⚠️ **旧制品是泄漏布局**：bits tar 含 AK/SK、live 快照明文含全部秘密——重打包（`ops/cci-pack-runtime.sh` 两信任域）+ 轮换后此行作废，见 §13 |
 | 验收报告 | `docs/alayanew-1p1d-acceptance-2026-10-26.md` |
 | 容量/配额取证 | `docs/alayanew-capacity-probe-2026-10-26.md` |
 | 自动化 review | `docs/alayanew-automation-review-2026-10-27.md` |
@@ -471,6 +471,42 @@ sglang 自杀 → bootstrap 记 `exit -9` → 控制面判 `sglang process faile
 没做控制面自启、没动日志轮转。
 
 **重建时多一步**：`cci-unpack-runtime.sh` 只认 10-26 的三个 tar；现役件在
-`live-2026-11-02.tar.gz` 里，解包用 `tar -xzf live-2026-11-02.tar.gz -C /`，
-解完 `chmod +x /root/tai-talea /root/sgl-model-gateway`。配置里的 `advertise_hosts`
+`live-2026-11-02.tar.gz` 里——**恢复不再直接 tar 解包**，改走
+`ops/cci-restore-plane.sh`（先对 pinned manifest 核 hash 再解密解包；
+对这份**未加密**的旧快照会响亮警告，详见 §13）。配置里的 `advertise_hosts`
 必须换成新实例的内网 IP，否则控制面探不到 worker。
+
+---
+
+## 13. 秘密分域与凭据轮换（2026-11-02 追加，重建前必读）
+
+旧布局把两类东西混在同一个所有人都能挂载的 NAS 目录里：
+
+1. `tai-talea-bits.tar`（10-26 烤制）整个装着 `/etc/tai-talea`——**平台 AK/SK 在里面**；
+2. `live-2026-11-02.tar.gz` 明文装着控制面二进制、全部 token、onboarding 状态。
+
+`deploy/alayanew/ops/cci-pack-runtime.sh` 把制品拆成两个信任域
+（worker 域无秘密 + 控制面域 AES-256 加密），`cci-restore-plane.sh` 以
+NAS 之外的 pinned manifest 为信任锚恢复。沙箱测试
+`ops/test-stage-b-sandbox.sh` 31 项全绿。
+
+**下次重建时的轮换清单**（进过旧布局的凭据一律视同已泄漏）：
+
+| 凭据 | 怎么换 | 备注 |
+| --- | --- | --- |
+| 平台 AK/SK | 九章控制台重置，随后把新值只写进控制面配置 | 旧值在 bits tar 里，worker 可读 |
+| bootstrap token | 部署 ③④ 重跑时用新 `openssl rand -hex 16`，两台与控制面一致 | 旧值在 live 快照与旧配置里 |
+| admin token / API key | 部署 ④ 重跑时换新；nginx 门面随 ⑥ 重新渲染 | 旧值在 live 快照里 |
+| onboarding 凭据（known_hosts 等） | 控制面域重新初始化，不从 live 快照恢复主机信任 | 若确需恢复，先轮换再恢复 |
+
+**打包/恢复两条命令**：
+
+```bash
+# 控制节点上（有运行时文件系统时）：
+TALEA_BACKUP_PASSPHRASE=<强口令> TALEA_RUNTIME_DIR=/root/gongji/tai-talea-runtime \
+  bash ops/cci-pack-runtime.sh
+# 产物：tai-talea-bits.tar(无秘密) + tai-talea-private-<date>.tar.gz.enc + SHA256SUMS + tai-talea-manifest.sha256
+# manifest 复制到 /etc/tai-talea/artifact-manifest.sha256（NAS 之外！）
+
+TALEA_BACKUP_PASSPHRASE=<强口令> bash ops/cci-restore-plane.sh <tai-talea-private-*.tar.gz.enc>
+```

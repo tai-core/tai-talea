@@ -56,15 +56,29 @@ bash ops/cci-unpack-runtime.sh
 ```
 
 从 NAS 解 `venv-0.5.22-cu130.tar` + `tai-talea-bits.tar` + `jit-caches.tar`，
-先校验 `SHA256SUMS`，最后断言 `sglang 0.5.22 / torch 2.14.1+cu130 / Glm5NextForConditionalGeneration`。
+`SHA256SUMS` **必须存在且通过**（缺失默认拒绝，`TALEA_ALLOW_MISSING_CHECKSUMS=1`
+是响亮的逃生门，不该成为常态），最后断言
+`sglang 0.5.22 / torch 2.14.1+cu130 / Glm5NextForConditionalGeneration`。
 镜像自带的 sglang 是 **0.5.3rc0，不认识 `glm5_next`**，不能直接用。
 
-> **第二台（纯 worker）加 `TALEA_WORKER_ONLY=1`**：tar 里带着控制节点的
-> `/etc/tai-talea/tai-talea.yaml`（含平台 AK/SK），worker 从不读它，解完就该删。
-> live snapshot（控制面二进制）只解到跑控制面的那台。
+**制品是两个信任域**（`ops/cci-pack-runtime.sh` 产出，计划书 P0-5）：
 
-现役二进制与配置另有一份 `live-2026-11-02.tar.gz`（控制面 `0.9.1-cci` + Router + `/etc/tai-talea/*`），
-解包：`tar -xzf live-2026-11-02.tar.gz -C / && chmod +x /root/tai-talea /root/sgl-model-gateway`。
+| 域 | 内容 | 放哪 |
+| --- | --- | --- |
+| worker 域（无秘密） | venv / JIT 缓存 / `tai-talea-bits.tar`（白名单：`opt/tai-talea` + `etc/tai-talea/profile.json`，打包时扫描拒绝 yaml/token/onboarding/db）+ `SHA256SUMS` | 共享 NAS |
+| 控制面域（私密，加密） | `tai-talea-private-<date>.tar.gz.enc`：控制面二进制、`/etc/tai-talea` 全部（AK/SK、token、onboarding）、SQLite | 只放控制节点；NAS 上只留加密件 |
+| 信任锚 | `tai-talea-manifest.sha256`（钉住以上每一个 hash，**含 SHA256SUMS 自身**） | **NAS 之外**：控制节点 `/etc/tai-talea/artifact-manifest.sha256` 或操作员本机 |
+
+NAS 上 `SHA256SUMS` 与 tar 同属一个信任域，所以**控制面恢复不认它**——恢复走
+`ops/cci-restore-plane.sh`（P1-12/P1-13）：显式指定归档、先对 pinned manifest 核 hash
+（缺失清单 = 拒绝；同时篡改 tar 与 NAS 清单过不了），再解密解包。
+**`cci-unpack-runtime.sh` 不再自动恢复 live snapshot**；worker（`TALEA_WORKER_ONLY=1`）
+永远不会碰控制面域，解完还会清掉旧版 bits tar 带进来的控制面配置（旧 tar 烤于
+秘密分域之前，`/etc/tai-talea` 整个在里面）。
+
+> 2026-11-02 之前的旧布局（bits tar 含 AK/SK、`live-2026-11-02.tar.gz` 明文躺在共享 NAS）
+> 已泄漏凭证——**凡是进过旧 tar / live 快照的 AK/SK、admin/bootstrap token 都必须轮换**，
+> 见计划书 P0-5 第 4 条。
 
 ### ③ 起 worker bootstrap（两台都跑，控制面之前）
 
@@ -217,10 +231,13 @@ deploy/alayanew/
 │   └── cci-edge.sh                 # probe / up / down / status，装 nginx、起 wg（本平台到不了）
 └── ops/
     ├── alaya_client.py             # 平台 OpenAPI 客户端（HMAC，AK/SK 读环境变量）
-    ├── cci-unpack-runtime.sh       # 从 NAS 铺运行时
+    ├── cci-pack-runtime.sh         # 打包两个信任域：worker 无秘密 tar + 加密控制面归档 + pinned manifest
+    ├── cci-unpack-runtime.sh       # 从 NAS 铺运行时（SHA256SUMS 强制；不恢复控制面）
+    ├── cci-restore-plane.sh        # 控制面恢复：pinned manifest 核 hash → 解密 → 解包
     ├── cci-config.sh               # 生成并校验控制面配置
     ├── cci-start-worker.sh          # worker 侧启动 9101 bootstrap（两台都跑）
     ├── cci-start-plane.sh          # 起 Router(8001) + 控制面
+    ├── test-stage-b-sandbox.sh     # 以上制品链路的沙箱正反向测试（31 项，无 GPU 无 root）
     ├── cci-elastic-probe.py        # 弹性资源探测（下单→轮询→必释放）
     └── cci-probe-sweep.py          # 清遗留实例 + 探测订阅结果接口
 ```

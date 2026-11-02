@@ -193,7 +193,9 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 ### P0-5 控制面秘密仍可从 worker 共享 NAS 读取
 
-**状态：制品路径已确认； NAS 当前成员需下次只读复核。**
+**状态：脚本侧已修复（2026-11-02，沙箱 31 项正反向测试通过）。** 新增 `ops/cci-pack-runtime.sh`（两个信任域打包：worker 域白名单 `opt/tai-talea` + `profile.json`，成员扫描拒绝 yaml/token/onboarding/db；控制面域 AES-256 加密，缺口令拒绝）与 `ops/cci-restore-plane.sh`（pinned manifest 核 hash → 解密 → 解包，worker 拒绝执行）；`cci-unpack-runtime.sh` 不再自动恢复 live，worker 解完清理旧 tar 带入的控制面配置。**真机执行与第 4 条（凭据轮换）仍待办**：旧 bits tar / live 快照进过的 AK/SK 与全部 token 在下次部署时必须全部换新（部署脚本本就从环境变量取值，重跑 ③④ 即轮换 bootstrap/admin token；平台 AK/SK 需在九章控制台重置）。
+
+原始问题：
 
 **问题：**`tai-talea-bits.tar` / `live-2026-11-02.tar.gz` 可包含控制面 YAML、AK/SK、admin/bootstrap token 和 onboarding 状态。`TALEA_WORKER_ONLY=1` 只删除解包后的副本，worker 仍能读取 NAS 上的原始 tar；`read_only` 不防读取。
 
@@ -224,8 +226,8 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 | P1-9 | provision job 只在内存 map；QUEUED 永久 outstanding，重启后丢失平台队列跟踪 | 持久化 result key、instance ID、阶段、游标、截止时间；启动恢复轮询；提供继续/取消/核对入口 | 排队超时、控制面重启、重名、长期 CREATING、SSH 失败均不重复创建或泄漏配额 |
 | P1-10 | 无内网地址时可能从公网 URL 的外部端口反推容器监听端口 | **已修复（2026-11-02）：** adapter 无 `advertise_hosts` 条目即拒绝纳管；实例模型继续以容器监听端口（9001/9002）为准，公网 URL 仅作参考（回归测试 `TestSnapshotRefusesInstancesWithoutAnInternalAddress`） | 公网 30093→容器 9002 的回归测试中，StartRequest 仍为 9002 |
 | P1-11 | 自动扩缩容配置未开，负载读取错误被忽略，webhook 为空 | G3 前不开 auto；负载失败显式指标/日志/告警；配置有效 webhook | 负载抓取失败可见；第三实例测试不会突然改变现役 1P1D |
-| P1-12 | 手工解包缺 SHA256SUMS 仍继续；live snapshot 可能因 bits 中旧二进制存在而不恢复 | 默认强制校验；控制面显式恢复指定版本并校验 hash；worker 不恢复 live | 归档版本与运行版本一致；错误/缺失清单默认拒绝 |
-| P1-13 | NAS 上 SHA256SUMS 与 tar 同属一个信任域 | 控制节点 manifest 钉住清单或各 tar 的独立 hash；高要求时使用签名清单 | 同时篡改 tar 与 NAS 清单不能通过控制面校验 |
+| P1-12 | 手工解包缺 SHA256SUMS 仍继续；live snapshot 可能因 bits 中旧二进制存在而不恢复 | **已修复（2026-11-02）：** `cci-unpack-runtime.sh` 缺清单默认拒绝（`TALEA_ALLOW_MISSING_CHECKSUMS=1` 为响亮逃生门）；live 恢复改走 `cci-restore-plane.sh`（显式归档 + hash 核验）；worker 永不恢复控制面 | 归档版本与运行版本一致；错误/缺失清单默认拒绝 |
+| P1-13 | NAS 上 SHA256SUMS 与 tar 同属一个信任域 | **已修复（2026-11-02）：** `cci-pack-runtime.sh` 产出 `tai-talea-manifest.sha256`（钉住全部制品 hash，含 SHA256SUMS 自身，指示存 NAS 之外）；`cci-restore-plane.sh` 以它为信任锚，清单缺失/未钉住/篡改均拒绝 | 同时篡改 tar 与 NAS 清单不能通过控制面校验 |
 
 ---
 
@@ -256,6 +258,8 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 **内容：**P0-5、P1-12、P1-13。  
 **产出：**无秘密 runtime 包、加密控制面备份、独立 hash/签名清单、凭据轮换记录、归档成员清单。  
 **出口：**worker 无法读取控制面秘密；控制面可恢复指定版本；旧凭据失效。
+
+**执行结果（2026-11-02）：脚本与信任域边界已完成。** 新增 `cci-pack-runtime.sh` / `cci-restore-plane.sh`，重写 `cci-unpack-runtime.sh`，入仓沙箱测试 `test-stage-b-sandbox.sh` 31 项全绿（打包两域、成员扫描、清单强制/篡改拒绝、pinned manifest 锚点、worker 永不触控制面、错误口令/坏 hash 拒绝）。**待真机/待协调：**① 下次部署在真机上重打包并把 manifest 存到 NAS 之外；② 凭据轮换（bootstrap/admin token 随部署重跑即换新；平台 AK/SK 需控制台重置，旧 live-2026-11-02.tar.gz 与旧 bits tar 中凭据视同已泄漏）。
 
 ### 阶段 C：单节点真实铺装 G1（约 0.5–1 人日 + 一台 8×H100）
 
