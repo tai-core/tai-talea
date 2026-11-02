@@ -40,6 +40,10 @@ ADVERTISE=$(printf '%s' "$TALEA_ADVERTISE_HOSTS" | tr ',' '\n' | awk -F= '
   NF==2 { printf "        %s: %s\n", $1, $2 }
 ')
 
+# The bits tarball normally creates both, but a config run on a bare container
+# should not fail on a missing directory.
+install -d -m 700 /etc/tai-talea /var/lib/tai-talea
+
 cat > /etc/tai-talea/tai-talea.yaml <<YAML
 # tai-talea control plane on the Jiuzhang CCI platform.
 #
