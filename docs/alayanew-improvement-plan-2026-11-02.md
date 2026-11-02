@@ -313,6 +313,22 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 **不通过：不得开第二台，不得公网开放门面。**
 
+**G1 执行记录（2026-11-02 晚，两台 8×H800A 实机 glm53-pd2b/pd3b，含 G2 大部分项）：**
+
+- 下单（`cci-order.py`，名字即幂等柄）→ RUNNING 约 1 分钟级；凭据按 §13 全部轮换。
+- NAS 真实解包 + SHA256SUMS 强制校验通过；9101 带 token 200 / 错 token 401；
+  prebuilt 无 wheelhouse 启动通过；9102 监听、9001/9002 无 listener；
+  worker 域无控制面私密（worker-only 解包检出并删除旧 tar 泄漏件，告警生效）。
+- 控制面事务化配置 + Router :8001 + 门面（200/401/403）+ 实例纳管全部真实执行；
+  现场修 4 个 bug（`2f4bcd1`）。
+- **端到端**：门面 `7*8=56`、`9*9=81`×3（0.4–0.6s）；SSE 分块；mooncake KV 传输
+  在连接快照中证实（prefill→decode 各 rank P2P+TcpTransport 全 mesh）。
+- **公网**：`open-port` 发布门面 8000→30118，无 key 401 / 带 key 200；
+  9001/9002 系统端口强制发布但容器内无监听（惰性）。
+- **G1 判定：通过**（超出原单机范围，实际在双机上执行）。
+- 遗留给 G2 收尾：Router 重启自动补注册、控制面加载中重启不假 FAILED、
+  「首请求撞 decode PD warmup 会楔死」的放流判据（见交接文档 §14.3，已升 P1）。
+
 ### G2：两台全新 EXCLUSIVE 8×H100
 
 - prefill/decode 各一台，角色、9101/9102、8998 正确。

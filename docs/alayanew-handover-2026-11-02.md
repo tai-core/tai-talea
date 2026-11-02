@@ -21,6 +21,9 @@
 
 ## 1. 当前状态（2026-11-02 15:30）
 
+> ⚠️ **本节是释放前的旧现场存档。** 同日晚间已重新下单并完成 G1 铺装，
+> 现役实例是 `glm53-pd2b` / `glm53-pd3b`，见 §14。
+
 > **收尾结果**：两台实例已于 `2026-11-02 15:26` **release**，实例列表已清空（0 条）。
 > 权重与全部运行时制品留在 NAS，下一步要重建按 §6 走，约 25 分钟。
 > 下表记录的是**释放前最后一刻**的现场，取证与判据以此为准。
@@ -510,3 +513,78 @@ TALEA_BACKUP_PASSPHRASE=<强口令> TALEA_RUNTIME_DIR=/root/gongji/tai-talea-run
 
 TALEA_BACKUP_PASSPHRASE=<强口令> bash ops/cci-restore-plane.sh <tai-talea-private-*.tar.gz.enc>
 ```
+
+---
+
+## 14. 重建现场：glm53-pd2b / pd3b（2026-11-02 晚，G1 已通过）
+
+> 现役现场。§1/§6/§13 的判据仍然有效；本节只记差异与新增事实。
+
+### 14.1 实例与网络
+
+| 项 | 值 |
+| --- | --- |
+| prefill + 控制面 + 门面 | `glm53-pd2b`，内网 `172.19.201.230`，SSH `120.220.102.21:30001` |
+| decode | `glm53-pd3b`，内网 `172.19.166.175`，SSH `120.220.102.21:30020` |
+| SKU | `skus.cci.gpu.h100.80gb.hbm3.b11.a2.5.11.s20a46b:2`，落地 GPU 实为 **NVIDIA-H800A-NV-80G ×8** |
+| NAS | `glm53-weights` 挂在 `/root/gongji`（只读），权重与运行时制品都在 |
+| 名字为何带 b | **释放过的实例名平台永不归还**（重名报 `212035`），重新下单必须换名 |
+| 下单工具 | `deploy/alayanew/ops/cci-order.py`（名字即幂等柄；API 需 `TALEA_ALAYA_DIRECT=1` 绕开本机注册表代理） |
+| **公网端口** | 每实例平台强制发布 9001/9002（pd2b→30002/30003、pd3b→30021/30064；容器内无监听 ⇒ 惰性）；SSH `22→30001/30020`；**自定义端口必须 `POST /cci/instance/{id}/open-port` 显式开**——门面 `8000→30118`，即 **`http://120.220.102.21:30118`**（列表用 `/open-port/list` 查） |
+
+凭据轮换已按 §13 全部落地：新平台 AK/SK（`ak_fb22…`）、新 bootstrap token、
+新 admin token、新 API key，全部只存在于控制面配置/`/root/.tai-talea-secrets`。
+旧 `ak_qryd…` 与旧控制台 AK/SK 待在九章控制台禁用；平台控制台账密出现过在
+聊天记录里，建议改密。
+
+### 14.2 G1 验收（2026-11-02 18:19–19:10）
+
+- 解包（SHA256SUMS 强制校验）→ worker bootstrap 9101（token 200/401/401）→
+  `cci-config.sh` 事务化（`-check-config` 通过，1 partner）→ `cci-start-plane.sh`
+  （Router :8001 pid 断言 + readyz）→ `cci-edge.sh` 门面（200/401/403，
+  `map_hash_bucket_size 128`）→ 控制面纳管两实例（pd2b=prefill、pd3b=decode）。
+- 模型加载 prefill ≈19 min、decode ≈21 min（含 CUDA graph 103 s）。
+- **端到端 4/4 通过**：经门面 `POST /v1/chat/completions`（Bearer API key），
+  `7*8=56`、`9*9=81`×3，0.4–0.6 s/次；Router 两 worker `is_healthy=true`。
+- **公网验收**：`http://120.220.102.21:30118`（pd2b 8000）——无 key/错 key 401、
+  带 key `/v1/models` 200、`/metrics` `/workers` 403、SSE 分块到达、
+  公网端到端 `7*8=56`；9001/9002 的公网映射是惰性端口（TCP accept 后无服务）；
+  8787/9101/9102/8001 无公网映射。
+- 铺装中修了 4 个现场 bug（`2f4bcd1`）：unpack 的 `tar -C "${ROOT:-/}"` 空串、
+  门面渲染先于 nginx 安装（`mkdir -p`）、map_hash_bucket_size、admin token 从
+  yaml 读回。
+
+### 14.3 ⛔ 新已知问题：首请求撞 decode PD warmup 窗口会楔死（会自愈，但会误判）
+
+时间线（第一轮验收 18:41–18:52）：
+
+1. decode 起来后先跑 **PD warmup（约 100 s，18:41:16–18:42:57）**；此时 router
+   已把 decode 当可用 worker。
+2. 首请求进来：prefill 把请求压在 **bootstrap 队列**等 decode 的 KVArgs 注册
+   （`disaggregation/prefill.py` 的 `pop_bootstrapped` 门控），等了 69 s——
+   注册要等 decode warmup 结束才发出。
+3. 18:42:58 注册到达、prefill 批次跑完、prefill 腿 200；但 decode 侧 room=1 的
+   KV 传输状态已乱，decode 挂在 transfer 等 KV，sglang `/health` 因
+   detokenizer 心跳停转报 **503** → router 熔断 → 第二个请求
+   `503 No available decode workers (all circuits open or unhealthy)`。
+4. 18:52:18 客户端断开触发 AbortReq，队列清理，**系统自愈**；此后 4/4 全过。
+
+判据：`Health check failed. Server couldn't get a response from detokenizer`
+（两侧同报）+ decode 日志 `Decode transfer failed … KVTransferError … Aborted by AbortReq`。
+这不是网络问题——三组跨实例端口（bootstrap HTTP :8998、各 rank ZMQ 随机端口、
+mooncake P2P+TcpTransport 随机端口 15xxx–16xxx）实测全通； mooncake 启动期
+`Local segment descriptor not found`（每 5 s×8 次）为良性。
+
+**待办**（升 P1）：控制面/worker 在把 decode 置 SERVING 前等待其 PD warmup
+完成（`/server_info` 可用后仍要再等约 100 s，或 watch decode 日志的
+`Capture target decode CUDA graph end` + warmup 结束标记），并在部署文档里写明
+「decode 起来后先空跑一个验证请求再放真实流量」。
+
+### 14.4 端口事实（排障用）
+
+- sglang 0.5.22 `mooncake_tcp` = mooncake 0.3.13.post1 + `MC_FORCE_TCP=1`；
+  每 TP rank 各绑 **P2P handshake**（16xxx）+ **TcpTransport**（15xxx–16xxx）+
+  sglang ZMQ rank 端口（4xxx–6xxx）三组随机端口，跨实例必须全通。
+- bootstrap HTTP :8998 双侧都跑；decode→prefill 查 room 元数据 + 注册，
+  prefill→decode 只推数据/通知（连接由 prefill 发起）。
+- 日志：`/opt/tai-talea/logs/{sglang-prefill,sglang-decode,bootstrap,router,control-plane}.log`。
