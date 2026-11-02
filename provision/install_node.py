@@ -17,8 +17,8 @@ def emit(**data):
     print(json.dumps(data, ensure_ascii=False), flush=True)
 
 
-def bootstrap_status(token):
-    request = urllib.request.Request('http://127.0.0.1:9001/bootstrap/status', headers={'X-Bootstrap-Token':token})
+def bootstrap_status(port, token):
+    request = urllib.request.Request(f'http://127.0.0.1:{port}/bootstrap/status', headers={'X-Bootstrap-Token':token})
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.load(response)
@@ -29,11 +29,15 @@ def bootstrap_status(token):
 def install():
     cfg = json.loads((ROOT/'onboarding/install.json').read_text())
     profile = cfg['profile']
+    # The listen port is part of the deployment, not a constant: a platform
+    # that publishes 9001 to the internet (CCI does) has to move the agent to
+    # a port it does not publish, so the control plane passes it in.
+    port = int(cfg.get('bootstrap_port') or 9001)
     for folder in ['run', 'logs']:
         (ROOT/folder).mkdir(parents=True, exist_ok=True)
     with (ROOT/'onboarding/install.lock').open('w') as lock, (ROOT/'logs/onboarding.log').open('a') as log:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        state = bootstrap_status(cfg['token'])
+        state = bootstrap_status(port, cfg['token'])
         if state and state.get('phase') in ['RUNNING','STARTING','INSTALLING','STOPPING']:
             raise RuntimeError('容器服务正在运行，已停止安装；请先回收原节点')
         env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', PIP_NO_CACHE_DIR='1')
@@ -90,7 +94,7 @@ def install():
             args = cmd.read_bytes().split(b'\0') if cmd.exists() else []
             if b'tai_talea_bootstrap' not in args or b'serve' not in args:
                 raise RuntimeError('已有管理进程身份不匹配，已停止安装')
-            latest = bootstrap_status(cfg['token'])
+            latest = bootstrap_status(port, cfg['token'])
             if not latest or latest.get('phase') in ['RUNNING','STARTING','INSTALLING','STOPPING']:
                 raise RuntimeError('管理服务状态已变化，已停止安装')
             os.kill(pid, signal.SIGTERM)
@@ -104,12 +108,12 @@ def install():
         emit(stage='启动节点管理服务')
         with (ROOT/'logs/bootstrap.log').open('ab') as output:
             process = subprocess.Popen([str(ROOT/'venv/bin/python'),'-m','tai_talea_bootstrap','serve','--profile',str(profile_path),
-                       '--host','0.0.0.0','--port','9001','--token-file',str(token_path),'--log-dir',str(ROOT/'logs')],
+                       '--host','0.0.0.0','--port',str(port),'--token-file',str(token_path),'--log-dir',str(ROOT/'logs')],
                        stdin=subprocess.DEVNULL,stdout=output,stderr=output,env=env,start_new_session=True)
         (ROOT/'run/bootstrap.pid').write_text(str(process.pid))
         for _ in range(90):
             if process.poll() is not None: raise RuntimeError('节点管理服务启动失败，请查看 bootstrap.log')
-            if bootstrap_status(cfg['token']):
+            if bootstrap_status(port, cfg['token']):
                 (ROOT/'onboarding/install.json').unlink(missing_ok=True)
                 emit(stage='节点管理服务已就绪'); return
             time.sleep(1)

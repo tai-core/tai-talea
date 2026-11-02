@@ -12,7 +12,12 @@
     "",
     "purge 不是可选项：tai-talea-bits.tar 是在控制节点上烤的，里面带着那份",
     "/etc/tai-talea/tai-talea.yaml — 含平台 access_key/secret_key。worker 从不读它",
-    "（bootstrap 只吃 --profile），留着等于把控制面凭据复制到每台推理机上。"
+    "（bootstrap 只吃 --profile），留着等于把控制面凭据复制到每台推理机上。",
+    "",
+    "bootstrap_port/service_port 必须是 9101/9102：CCI 强制发布 9001/9002 且不允许移除",
+    "（close-port 返回 100021 系统端口不可移除），9001 上有任何进程都会被公网扫描器打，",
+    "10-26 的 decode 反复崩溃就是这么来的。这两个值要与 partners[].alayanew 的",
+    "bootstrap_port/service_port 一致，否则控制面登记的地址会指向没人监听的端口。"
   ],
   "profile": {
     "os": "ubuntu-22.04",
@@ -44,6 +49,8 @@
     "purge": [
       "/etc/tai-talea/tai-talea*.yaml"
     ],
+    "bootstrap_port": 9101,
+    "service_port": 9102,
     "bootstrap_source": "/opt/tai-talea/bootstrap-src",
     "bootstrap_python": "python3",
     "token_file": "/etc/tai-talea/bootstrap-token",

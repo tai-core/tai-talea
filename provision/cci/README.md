@@ -18,7 +18,8 @@
 ## 怎么用
 
 1. 把 `manifest.example.json` 复制到控制节点（例如 `/etc/tai-talea/onboarding-cci.json`），
-   只改 `probe_ip`（控制节点内网地址）。
+   只改 `probe_ip`（控制节点内网地址）。`runtime.bootstrap_port` / `service_port`
+   **保持 9101/9102**，原因见下面 ④。
 2. 控制面配置里打开 onboarding：
 
 ```yaml
@@ -41,7 +42,7 @@ curl -X POST http://127.0.0.1:8787/v1/capacity/console/onboarding \
 `ID` 必须是**实例名**（partner 快照的 key），`LeaseID` 用 `cci-<实例名>`。
 用平台 UUID 会让 pull 每次轮询都把它当成新容器，从而反复撤销纳管。
 
-## 三个必须守住的细节
+## 四个必须守住的细节
 
 **① token 必须覆盖。** `tai-talea-bits.tar` 里带着烤制当时的
 `/etc/tai-talea/bootstrap-token`。控制面用 `controller.bootstrap_token` 签名，
@@ -56,18 +57,36 @@ curl -X POST http://127.0.0.1:8787/v1/capacity/console/onboarding \
 ```
 cwd=/opt/tai-talea/bootstrap-src
 python3 -m tai_talea_bootstrap serve --profile /etc/tai-talea/profile.json \
-  --host 0.0.0.0 --port 9001 --token-file /etc/tai-talea/bootstrap-token \
+  --host 0.0.0.0 --port 9101 --token-file /etc/tai-talea/bootstrap-token \
   --log-dir /opt/tai-talea/logs
 ```
 
 venv 里装的是 sglang 和 torch，让管理进程去 import 那一堆只会更慢更容易撞名；
 `cwd` 就是 `tai_talea_bootstrap` 的 import 锚点（安装器同时也设了 `PYTHONPATH`）。
 
+**④ 端口必须挪到 9101/9102。** CCI 把 9001/9002 作为**系统端口**强制发布到公网，
+`close-port` 会返回 `{"status":100021,"message":"系统端口不可移除"}`。2026-10-26 的
+decode 每 17.5 分钟崩一次，就是外部扫描器打 9001 上的 `/begin_weight_update` 造成的
+（126 次调用 ↔ 122 轮崩溃）。容器里**没有 iptables**，所以唯一的办法是让 9001/9002
+上根本没有进程：
+
+| | 端口 | 谁来听 |
+| --- | --- | --- |
+| bootstrap | **9101** | `tai_talea_bootstrap serve` |
+| sglang | **9102** | sglang 的 `--port` |
+| Router | 8001 | 只绑 `127.0.0.1` |
+| 门面 | 8000 | nginx，平台映射到唯一一个公网端口 |
+
+`bootstrap_port` / `service_port` 同时出现在两处，必须一致：manifest 的 `runtime`
+（决定进程实际监听哪个）和 `partners[].alayanew`（决定控制面怎么寻址）。平台不给
+9101/9102 建映射也没关系——adapter 会用 `advertise_hosts` 里的内网地址拼出来。
+
 ## 装完会怎样
 
-安装器最后会从**控制节点侧**请求 `http://<容器内网地址>:9001/bootstrap/health`，
-通过才算成功；返回的 `endpoint` / `service_endpoint` 就是控制面接下来用的地址
-（实测内网地址，不是平台公网 ingress —— 公网是 hairpin，PD 传输过不去）。
+安装器最后会从**控制节点侧**请求
+`http://<容器内网地址>:<bootstrap_port>/bootstrap/health`，通过才算成功；返回的
+`endpoint` / `service_endpoint` 就是控制面接下来用的地址（实测内网地址，不是平台
+公网 ingress —— 公网是 hairpin，PD 传输过不去）。
 
 之后全部自动：`EnrollPrepared` 入库 → planner 分 prefill/decode → 控制面下发
 start（`--disaggregation-mode` 由 bootstrap 按角色注入）→ worker 向 Router 注册。

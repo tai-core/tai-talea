@@ -143,9 +143,9 @@ phase=''
 occupied=False
 with socket.socket() as check:
     check.settimeout(2)
-    occupied=check.connect_ex(('127.0.0.1',9001))==0
+    occupied=check.connect_ex(('127.0.0.1',p['port']))==0
 try:
-    req=urllib.request.Request('http://127.0.0.1:9001/bootstrap/status',headers={'X-Bootstrap-Token':p['token']})
+    req=urllib.request.Request('http://127.0.0.1:%d/bootstrap/status'%p['port'],headers={'X-Bootstrap-Token':p['token']})
     with urllib.request.urlopen(req,timeout=5) as r:phase=json.load(r).get('phase','')
 except Exception:pass
 print(json.dumps(dict(uid=os.geteuid(),hostname=socket.gethostname(),python=f'{sys.version_info.major}.{sys.version_info.minor}',
@@ -215,7 +215,7 @@ for folder in ('logs','run'):
     os.makedirs(os.path.join(root,folder),exist_ok=True)
 def phase():
     try:
-        req=urllib.request.Request('http://127.0.0.1:9001/bootstrap/status',headers={'X-Bootstrap-Token':p['token']})
+        req=urllib.request.Request('http://127.0.0.1:%d/bootstrap/status'%p['port'],headers={'X-Bootstrap-Token':p['token']})
         with urllib.request.urlopen(req,timeout=3) as r:
             return json.load(r).get('phase','')
     except Exception:
@@ -239,7 +239,7 @@ log=open(os.path.join(root,'logs/bootstrap.log'),'ab')
 env=dict(os.environ)
 env['PYTHONPATH']=p['bootstrap_source']
 proc=subprocess.Popen([p['python'],'-m','tai_talea_bootstrap','serve',
-    '--profile',p['profile'],'--host','0.0.0.0','--port','9001',
+    '--profile',p['profile'],'--host','0.0.0.0','--port',str(p['port']),
     '--token-file',p['token_file'],'--log-dir',os.path.join(root,'logs')],
     cwd=p['bootstrap_source'],stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=env,start_new_session=True)
 open(pid_path,'w').write(str(proc.pid))
@@ -400,6 +400,18 @@ def runtime_plan(manifest, profile):
     for pattern in runtime.get('purge') or []:
         if not str(pattern).startswith('/'):
             raise InstallError('清理路径必须是绝对路径')
+    # Ports belong to the deployment: CCI publishes 9001/9002 to the internet
+    # and refuses to unpublish them, so a node there listens on 9101/9102 and
+    # leaves the published ports dead. Defaults keep every other platform on
+    # the historical layout.
+    for key, default in (('bootstrap_port', 9001), ('service_port', 9002)):
+        if runtime.get(key) is None:
+            runtime[key] = default
+        elif (isinstance(runtime[key], bool) or not isinstance(runtime[key], int)
+              or not 1 <= runtime[key] <= 65535):
+            raise InstallError('运行时清单的 %s 不是合法端口' % key)
+    if runtime['bootstrap_port'] == runtime['service_port']:
+        raise InstallError('bootstrap 端口不能与推理端口相同')
     return runtime
 
 
@@ -416,6 +428,10 @@ def install(payload):
     files = [] if volume else wheelhouse_files(manifest, profile)
     if volume:
         volume = runtime_plan(manifest, profile)
+    # Either channel may move the ports; the wheelhouse one reads them straight
+    # from the manifest, the runtime one has already been defaulted above.
+    bootstrap_port = int((volume or manifest).get('bootstrap_port') or 9001)
+    service_port = int((volume or manifest).get('service_port') or 9002)
     emit(stage='连接 SSH，核对容器环境')
     state_dir = Path(payload['state_dir'])
     hosts = state_dir / 'known_hosts'
@@ -440,7 +456,7 @@ def install(payload):
         actual = 'SHA256:' + base64.b64encode(hashlib.sha256(client.get_transport().get_remote_server_key().asbytes()).digest()).decode().rstrip('=')
         if request.get('host_key') and actual != request['host_key']:
             raise InstallError('SSH 主机指纹不匹配')
-        observed = remote(client, PROBE, {'probe_ip':manifest['probe_ip'], 'token':payload['bootstrap_token']})
+        observed = remote(client, PROBE, {'probe_ip':manifest['probe_ip'], 'token':payload['bootstrap_token'], 'port':bootstrap_port})
         if observed['uid'] != 0: raise InstallError('自动安装需要容器内 root 权限')
         # When the control plane intentionally shares a node with inference
         # (small deployments), the manifest opts out of this hostname guard.
@@ -449,7 +465,7 @@ def install(payload):
         if observed['phase'] in ['RUNNING', 'STARTING', 'INSTALLING', 'STOPPING']:
             raise InstallError('该容器已有运行中的服务，请先通过 Talea 回收原节点')
         if observed['occupied'] and not observed['phase']:
-            raise InstallError('容器 9001 端口被未知服务占用，已停止安装；请管理员核对')
+            raise InstallError('容器 %d 端口被未知服务占用，已停止安装；请管理员核对' % bootstrap_port)
         os_name = observed['os'].get('ID','').strip('"') + '-' + observed['os'].get('VERSION_ID','').strip('"')
         if observed['python'] != profile['python'] or os_name != profile['os']:
             raise InstallError('容器系统或 Python 版本与当前运行时不匹配，需要管理员提供对应制品')
@@ -457,8 +473,8 @@ def install(payload):
         host = request.get('advertise_host') or observed['ip']
         if not host: raise InstallError('无法探测内网地址，请填写控制节点可达地址')
         host_url = '['+host+']' if ':' in host else host
-        endpoint = 'http://' + host_url + ':9001'
-        service_endpoint = 'http://' + host_url + ':9002'
+        endpoint = 'http://' + host_url + ':' + str(bootstrap_port)
+        service_endpoint = 'http://' + host_url + ':' + str(service_port)
         if volume:
             # Nothing but a few hundred bytes crosses SFTP here: the tarballs
             # are on the platform volume the container already has mounted.
@@ -489,6 +505,7 @@ def install(payload):
                 'profile': profile_file,
                 'token_file': token_file,
                 'token': payload['bootstrap_token'],
+                'port': bootstrap_port,
             }, timeout=900)
             if started.get('error'):
                 raise InstallError(started['error'])
@@ -512,7 +529,8 @@ def install(payload):
                 put_bytes(sftp, '/opt/tai-talea/onboarding/sglang_compat.py', Path(__file__).with_name('sglang_compat.py').read_bytes())
                 runtime = dict(profile=profile, environment=manifest.get('environment',{}), token=payload['bootstrap_token'],
                                interface=observed['interface'], model_path=manifest['model_target'],
-                               transfer_backend=manifest.get('transfer_backend', 'nixl'))
+                               transfer_backend=manifest.get('transfer_backend', 'nixl'),
+                               bootstrap_port=bootstrap_port)
                 config_path = '/opt/tai-talea/onboarding/install.json'
                 put_bytes(sftp, config_path, json.dumps(runtime).encode())
             emit(stage='安装依赖并启动节点管理服务')
@@ -536,7 +554,7 @@ def install(payload):
                 health = json.load(response)
             if health.get('status') != 'ok': raise ValueError('not ready')
         except Exception:
-            raise InstallError('安装已完成，但控制节点无法访问容器 9001 端口；请检查内网连通性或可达地址')
+            raise InstallError('安装已完成，但控制节点无法访问容器 %d 端口；请检查内网连通性或可达地址' % bootstrap_port)
         return dict(endpoint=endpoint,service_endpoint=service_endpoint,spec=dict(gpu=observed['gpu'][0],gpu_count=len(observed['gpu'])))
     finally:
         client.close()

@@ -172,6 +172,33 @@ class RuntimeChannelTests(unittest.TestCase):
                       tarballs=[dict(name='bits.tar', target='/')],
                       purge=['etc/tai-talea/*.yaml'])
 
+    def test_ports_default_when_the_deployment_does_not_move_them(self):
+        planned = self.plan(source='/root/gongji/tai-talea-runtime',
+                            tarballs=[dict(name='bits.tar', target='/')])
+        self.assertEqual((planned['bootstrap_port'], planned['service_port']), (9001, 9002))
+
+    def test_a_moved_port_pair_is_kept(self):
+        # CCI publishes 9001/9002 and refuses to unpublish them, so this
+        # deployment listens on 9101/9102 and leaves the published ports dead.
+        # The plan has to carry that choice through, or the endpoint the control
+        # plane registers would point at a port nobody is bound to.
+        planned = self.plan(source='/root/gongji/tai-talea-runtime',
+                            tarballs=[dict(name='bits.tar', target='/')],
+                            bootstrap_port=9101, service_port=9102)
+        self.assertEqual((planned['bootstrap_port'], planned['service_port']), (9101, 9102))
+
+    def test_a_port_that_is_not_a_port_is_refused(self):
+        for bad in ['9101', 0, 70000, True]:
+            with self.assertRaisesRegex(self.installer.InstallError, '不是合法端口', msg=repr(bad)):
+                self.plan(source='/root/gongji/tai-talea-runtime',
+                          tarballs=[dict(name='bits.tar', target='/')], bootstrap_port=bad)
+
+    def test_one_port_cannot_serve_both_channels(self):
+        with self.assertRaisesRegex(self.installer.InstallError, '不能与推理端口相同'):
+            self.plan(source='/root/gongji/tai-talea-runtime',
+                      tarballs=[dict(name='bits.tar', target='/')],
+                      bootstrap_port=9101, service_port=9101)
+
     def test_a_valid_runtime_manifest_passes_the_artifact_gate(self):
         # Reaching the SSH phase is the assertion: it means no wheelhouse key or
         # checksum was demanded for a channel that uploads no wheels at all.
