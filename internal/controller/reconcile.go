@@ -306,16 +306,38 @@ func (c *Controller) reconcileInstance(ctx context.Context, instance domain.Inst
 			return nil
 		}
 		defer lock.Unlock()
-		// A STARTING instance older than a few rounds is stuck: nothing owns
-		// the operation any more, so restart the supervised attempt.
+		// A STARTING instance older than a few rounds has no in-memory owner
+		// any more. That is expected right after a control-plane restart: the
+		// bootstrap may legitimately still be loading a 300 GB model, and
+		// condemning that as an interrupted start fakes a failure out of a
+		// healthy start. Ask the bootstrap what it supervises: a service that
+		// is still running (loading or up) is resumed through the normal
+		// wait-and-register flow; only a bootstrap that reports nothing
+		// running - or is unreachable - is treated as interrupted.
 		stuck := c.now().Sub(instance.UpdatedAt) > 3*c.cfg.Controller.ReconcileInterval.Duration()
 		if stuck {
+			call, cancel := c.callContext(ctx)
+			status, statusErr := c.launcher.Status(call, instance.Endpoint)
+			cancel()
+			if statusErr == nil && status.Phase == launcher.PhaseRunning {
+				c.log().Info("resuming a start whose owner was lost to a restart",
+					"instance_id", instance.ID, "role", string(instance.Role),
+					"bootstrap_phase", status.Phase)
+				report.Resumed = append(report.Resumed, instance.ID)
+				return c.resumeStart(ctx, instance)
+			}
+			// failStart always returns the cause it was handed (wrapped), both
+			// when the condemnation was applied and - as a sentinel contract -
+			// to let callers tell "start was failed" from "the store refused".
+			// Only the latter is a reconcile error; the condemnation itself is
+			// this branch's success and must reach the report.
+			noOwner := errors.New("no owner for STARTING state")
 			if err := c.failStart(ctx, instance, &store.Operation{
 				OperationID: c.operationID(instance.ID, store.OpStart),
 				InstanceID:  instance.ID,
 				Type:        store.OpStart,
 				CreatedAt:   c.now(),
-			}, "start operation was interrupted", errors.New("no owner for STARTING state")); err != nil {
+			}, "start operation was interrupted", noOwner); err != nil && !errors.Is(err, noOwner) {
 				return err
 			}
 			report.Reported = append(report.Reported, instance.ID)

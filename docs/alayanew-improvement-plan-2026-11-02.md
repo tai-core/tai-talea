@@ -326,8 +326,22 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 - **公网**：`open-port` 发布门面 8000→30118，无 key 401 / 带 key 200；
   9001/9002 系统端口强制发布但容器内无监听（惰性）。
 - **G1 判定：通过**（超出原单机范围，实际在双机上执行）。
-- 遗留给 G2 收尾：Router 重启自动补注册、控制面加载中重启不假 FAILED、
-  「首请求撞 decode PD warmup 会楔死」的放流判据（见交接文档 §14.3，已升 P1）。
+- ~~遗留给 G2 收尾~~ **三项已全部完成（2026-11-02 晚）**：
+  1. **Router 重启自动补注册 ✓**：新 pid 持 :8001，双 worker 重注册
+     （prefill 带 bootstrap_port=8998），无需人工。
+  2. **控制面 SERVING 态重启 ✓**：IDLE/SERVING 正确恢复、0 FAILED 标记、
+     e2e 132 正常。
+  3. **控制面加载中重启不假 FAILED ✓（真机缺陷复现 + 修复 + 回归）**：
+     复现见交接文档 §14.3.2——kill decode → STARTING → 加载中重启控制面 →
+     旧代码打 FAILED（`no owner for STARTING state`）。修复：reconcile 的
+     STARTING-stuck 分支先问 bootstrap，phase=RUNNING 就走 `resumeStart`/
+     `finishStart` 等待注册；真机回归 decode 全程 STARTING → 20:14:40 自动
+     SERVING → 公网 e2e 200。测试
+     `TestRestartedControlPlaneResumesLoadingStartInsteadOfFakingFailed`、
+     `TestInterruptedStartWithNothingRunningStillFails`。
+     原 P1「decode warmup 放流判据」随 §14.3.1 的归因修正**撤销**：楔死与
+     warmup 无关（decode warmup 早于首请求 69 s 完成），系罕见一次性事件，
+     abort 自愈 + 调用方重试兜底。
 
 ### G2：两台全新 EXCLUSIVE 8×H100
 

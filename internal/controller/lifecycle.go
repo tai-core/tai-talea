@@ -271,10 +271,21 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 			"instance_id", instanceID, "role", string(role))
 	}
 
+	return c.finishStart(ctx, instance, role, operation, startedAt)
+}
+
+// finishStart is the post-dispatch half of StartService: wait for SGLang to
+// answer, verify the identity of what the bootstrap actually runs, then take
+// the worker through registration into the Router rotation. It is also the
+// resume path for a start whose in-memory owner was lost to a control-plane
+// restart (reconcile re-adopts a bootstrap that is still loading).
+func (c *Controller) finishStart(ctx context.Context, instance domain.Instance,
+	role domain.Role, operation *store.Operation, startedAt time.Time) error {
+	instanceID := instance.ID
 	if err := c.waitHealthy(ctx, instance); err != nil {
 		return c.failStart(ctx, instance, operation, "sglang health check failed", err)
 	}
-	callCtx, cancel = c.callContext(ctx)
+	callCtx, cancel := c.callContext(ctx)
 	status, statusErr := c.launcher.Status(callCtx, instance.Endpoint)
 	cancel()
 	if statusErr == nil && (status.Phase != launcher.PhaseRunning || status.Role != string(role) ||
@@ -359,6 +370,35 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 		"instance_id", instanceID, "role", string(role),
 		"router_worker_id", registration.WorkerID, "endpoint", instance.Endpoint)
 	return nil
+}
+
+// resumeStart re-adopts a start whose in-memory owner was lost to a
+// control-plane restart while the bootstrap was still working on it. It runs
+// the same post-dispatch flow as StartService; the health timeout, not the
+// reconcile pass that noticed the missing owner, decides when a slow load has
+// actually failed.
+func (c *Controller) resumeStart(ctx context.Context, instance domain.Instance) error {
+	current, err := c.store.GetInstance(ctx, instance.ID)
+	if err != nil {
+		return err
+	}
+	if current.ServiceState != domain.ServiceStarting {
+		// Something else moved the instance while this pass was setting up.
+		return nil
+	}
+	instance = current
+	operation, err := c.store.GetOperation(ctx, lifecycleOperationID(instance, store.OpStart))
+	if err != nil || operation.Status != store.OpInProgress {
+		operation = store.Operation{
+			OperationID: lifecycleOperationID(instance, store.OpStart),
+			InstanceID:  instance.ID,
+			Type:        store.OpStart,
+			Status:      store.OpInProgress,
+			Attempt:     instance.StartAttempts,
+			CreatedAt:   instance.UpdatedAt,
+		}
+	}
+	return c.finishStart(ctx, instance, instance.Role, &operation, instance.UpdatedAt)
 }
 
 // prefillBootstrapPort returns the bootstrap port to publish for a role. Only a

@@ -554,31 +554,48 @@ TALEA_BACKUP_PASSPHRASE=<强口令> bash ops/cci-restore-plane.sh <tai-talea-pri
   门面渲染先于 nginx 安装（`mkdir -p`）、map_hash_bucket_size、admin token 从
   yaml 读回。
 
-### 14.3 ⛔ 新已知问题：首请求撞 decode PD warmup 窗口会楔死（会自愈，但会误判）
+### 14.3 已知事件与缺陷（2026-11-02 晚复核后修正）
 
-时间线（第一轮验收 18:41–18:52）：
+#### 14.3.1 一次性楔死事件（18:41–18:52）——warmup 归因已被推翻
 
-1. decode 起来后先跑 **PD warmup（约 100 s，18:41:16–18:42:57）**；此时 router
-   已把 decode 当可用 worker。
-2. 首请求进来：prefill 把请求压在 **bootstrap 队列**等 decode 的 KVArgs 注册
-   （`disaggregation/prefill.py` 的 `pop_bootstrapped` 门控），等了 69 s——
-   注册要等 decode warmup 结束才发出。
-3. 18:42:58 注册到达、prefill 批次跑完、prefill 腿 200；但 decode 侧 room=1 的
-   KV 传输状态已乱，decode 挂在 transfer 等 KV，sglang `/health` 因
-   detokenizer 心跳停转报 **503** → router 熔断 → 第二个请求
-   `503 No available decode workers (all circuits open or unhealthy)`。
-4. 18:52:18 客户端断开触发 AbortReq，队列清理，**系统自愈**；此后 4/4 全过。
+**初版把事件归因于「首请求撞 decode PD warmup 窗口」，该归因错误**。复核时间戳：
 
-判据：`Health check failed. Server couldn't get a response from detokenizer`
-（两侧同报）+ decode 日志 `Decode transfer failed … KVTransferError … Aborted by AbortReq`。
-这不是网络问题——三组跨实例端口（bootstrap HTTP :8998、各 rank ZMQ 随机端口、
-mooncake P2P+TcpTransport 随机端口 15xxx–16xxx）实测全通； mooncake 启动期
+- prefill warmup 18:39:31 完成；decode warmup **18:41:22 完成**（早于 18:41:49 的
+  首请求 69 秒）；decode `/health_generate` 自 18:41:23 起持续 200。warmup 不是成因。
+- 修正后的事实链：prefill 收到请求后在 bootstrap 队列等 decode 的 KVArgs 注册
+  （`disaggregation/prefill.py` 的 `pop_bootstrapped` 门控）等了 69 s（~18:42:57）；
+  decode 在 18:42:57 **恰好**停搏（detokenizer 心跳停、`/health` 503 → router 熔断）；
+  prefill 200 后 decode 仍等不到 KV，直到 18:52:18 客户端断开触发 AbortReq 自愈。
+- **两次受控复现均未复现**（decode 重启后 ~3 min 窗口 0.69 s 成功、~30 s 紧窗口
+  0.94 s 成功）。Router 日志因重启被截断，原始事件不可回看。
+- 结论：**罕见一次性事件**。兜底仍在：abort 自愈 + 调用方重试。不设 warmup 放流
+  闸门；`settleService` 的健康连击阈值（busy 不计数）已覆盖「busy 被误杀」的方向。
+
+判据存档：`Health check failed. Server couldn't get a response from detokenizer`
+（两侧同报）+ decode 日志 `Decode transfer failed … KVTransferError … Aborted by
+AbortReq`。不是网络问题——三组跨实例端口实测全通；mooncake 启动期
 `Local segment descriptor not found`（每 5 s×8 次）为良性。
 
-**待办**（升 P1）：控制面/worker 在把 decode 置 SERVING 前等待其 PD warmup
-完成（`/server_info` 可用后仍要再等约 100 s，或 watch decode 日志的
-`Capture target decode CUDA graph end` + warmup 结束标记），并在部署文档里写明
-「decode 起来后先空跑一个验证请求再放真实流量」。
+#### 14.3.2 ⛔→✓ 已修复：控制面「加载中重启」把健康的 start 判成 FAILED
+
+缺陷（2026-11-02 真机确定性复现）：kill decode sglang → 控制面正确检测
+（`code -9`）→ STARTING(attempts=1) 重新派发 start → **模型加载中重启控制面** →
+reconcile 把 STARTING 判为「无属主卡死」→ `failStart` 打 FAILED
+（`start operation was interrupted: no owner for STARTING state`）。之后靠
+settleService 采纳路径自愈回 SERVING（重载仅 135 s，页缓存热；冷缓存则多烧
+约 19 min）。
+
+修复（同日）：reconcile 的 STARTING-stuck 分支先问 bootstrap——`launcher.Status`
+phase 仍为 `RUNNING`（加载中或已起）就走新抽出的 `finishStart`/`resumeStart`
+正常等待注册；只有 bootstrap 报「没有在跑」（或不可达）才维持原 failStart。
+健康超时仍是失败判据。测试：
+`TestRestartedControlPlaneResumesLoadingStartInsteadOfFakingFailed`、
+`TestInterruptedStartWithNothingRunningStillFails`。
+
+真机验收（20:12–20:14，修复版二进制）：kill decode → STARTING att=1 → 20:12:18
+加载中重启控制面 → decode **全程保持 STARTING**，日志
+`resuming a start whose owner was lost to a restart (bootstrap_phase=RUNNING)` →
+20:14:40 自动 SERVING（att=0）→ 公网端到端 200（56 token）。
 
 ### 14.4 端口事实（排障用）
 
