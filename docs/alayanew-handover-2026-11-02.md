@@ -226,7 +226,7 @@ bash deploy/alayanew/ops/cci-start-plane.sh   # Router + 控制面
 **加载时间**：`2026-10-26` 实测 19 分钟（305.8 GiB / 76108 张量 / 317 MB/s，
 上限是 CephFS 冷读 373 MB/s，加 concurrency 不会更快）；`2026-11-02` 缓存热后约 14–15 分钟。
 
-### 6.5 对外入口（与中国移动同一套）
+### 6.5 对外入口（中国移动同款门面，没有隧道）
 
 ```bash
 export TALEA_API_KEY=$(openssl rand -hex 16)
