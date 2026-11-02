@@ -305,3 +305,65 @@ python3 /root/talea-deploy/ops/check-ailog.py /root/talea-ai-access.jsonl
 ```
 
 两个脚本都在 `deploy/kunhaoyuan/ops/`，随仓库走。
+
+---
+
+## 9. 平台侧复核结果对齐（2026-11-02）
+
+平台给了一份《流式请求计量异常分析》，结论是"成功流式请求 13 条中 4 条用量不完整
+（30.77%）"。**方法没有问题，数字与本文 §3.2 完全一致**，但缺一个上下文：那份样本
+（`ailog-sample-2026-11-01.jsonl`，sha256 `2473bb98…`，我们给的就是这一份）的窗口是
+`01:04:03Z–04:25:24Z`，**全部早于 Router 换二进制的 `08:39:55Z`**。也就是说它测的是上版，
+不是现在的状态。
+
+### 9.1 用新样本跑同一套口径
+
+| 口径 | 旧样本（01:04–04:25Z） | 新样本（09:06–12:19Z，ailog4） |
+| --- | ---: | ---: |
+| 流式 2xx | 13 | 113 |
+| 三元组完整 | 9（69.2%） | **113（100%）** |
+| 三个 token 全缺 | 3 | **0** |
+| 有 in/out 缺 total | 1 | **0** |
+| 其中 `/generate` 流式行 | 2 条，1 条缺 total | **110 条，110 条带 total** |
+
+另有一次 1,200 行的窗口（09:00–12:19Z，含 1,160 条 `/generate`）用 `analyze_ailog.py`
+跑过：`partial token triple` 0 条，唯一的失败项是本文 §3.0 里我自己造的重复 request_id。
+
+新样本：`Documents/talea-api/ailog-sample-ailog4-2026-11-01.jsonl`（150 行）。
+
+旧样本里这 4 条按 UA 拆开看，能直接排除"某个客户端全程拿不到用量"的可能：
+
+| UA | 流式 2xx | 其中有 input_token |
+| --- | ---: | ---: |
+| `Python-urllib/3.12` | 6 | **3** |
+| `curl/8.5.0` | 7 | 7 |
+
+同一个客户端一半有一半没有 ⇒ 缺的是**那几次请求里的 `stream_options.include_usage`**，
+不是网关对这个客户端做了什么。
+
+### 9.2 四条逐条归因（与本文 §3.2 同一结论）
+
+| 行 | 现象 | 真因 | 现状 |
+| --- | --- | --- | --- |
+| L2 / L106 / L107 | 200 + stream，三个 token 全缺 | 三个都来自同一个客户端（UA `Python-urllib/3.12`），请求里**没带** `stream_options.include_usage`；sglang 不主动在流里返回 usage，旧 Router 也不代填。**同一 UA 的 6 条流式里另外 3 条就有 usage** ⇒ 差别在这一次请求带没带参数，不在网关 | 已修：Router 加 `--force-stream-usage`，对带 `stream_options` 的流式路由代填该字段（`router.rs:523`），客户端不用改 |
+| L114 | `/generate` 流式，1/4 但缺 total | 当时 total 完全取决于上游那次有没有给；**同接口同数字的 L119 就有 total**（`curl/8.5.0` 两条），说明不是接口固定行为，而是"给了就抄、不给就没有" | 已修（`f4493fa`）：`total_token` 缺失时用 `input+output` 推导，`ai_access_log.rs:565` 有注释和用例 `meta_info_without_a_total_still_writes_one` |
+
+所以平台在 §5.1 列出的四种可能里，**是第 1/2 种（请求侧未开启 usage），不是"网关没消费"
+也不是"日志写早了"**——否则同一客户端的另外几条不会有 usage。
+
+### 9.3 要回给采集端的两条
+
+1. **缺失 token 输出成 0（他们 §5.3 自己发现的）违反规范**。规范 §4.1 的 `total_token`
+   条目写明"可省略三个 token 字段，采集结果为 null，**不得把未知用量填成 0**"，§4.5
+   "值与缺省约定"又写"数值缺省 → 直接省略字段"。现在 0 让"未知"和"真实零消耗"在 ES 里
+   无法区分，而且 `callResult=true` 会把它标成成功。建议 VRL 改为不产出这三列（或产出 null），
+   由下游决定怎么呈现。**这条不在我们这边。**
+2. **`request_model: "none"` → `model=null`**（L114/L119，即 `/generate` 流量）。
+   `/generate` 请求体里没有 model 字段，是压测接口。要不要用 worker 的模型路径代填，
+   需要平台定口径——本文 §5.2 已列为待定项。
+
+### 9.4 待复核（当前登录不了机器）
+
+以上"新样本"结论只用本地已导出的两个文件验证过；等能登录后应再做一次：
+`export-ailog.sh 5000` → `analyze_ailog.py`，确认 `partial token triple = 0` 且
+`/generate` 流式全部带 `total_token`。
