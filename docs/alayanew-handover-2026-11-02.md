@@ -430,8 +430,8 @@ sglang 自杀 → bootstrap 记 `exit -9` → 控制面判 `sglang process faile
    `edge/cci-edge.sh probe` → `up` → `status`，重点看两件：
    - 9001/9002 是否真的空转（`ss -lnt | grep -E ':(9001|9002) '` 无输出）；
    - 不带 key 打 `/v1/models` 是否 401、带 key 是否 200。
-2. **控制面自启** —— 现在靠手工 `setsid nohup`；写个 systemd unit 或 cron 都行。
-3. **日志轮转** —— `bootstrap.log` 一天 100 MB+。
+2. **控制面自启** ✅ 已做（2026-11-02 晚，`cci-watchdog.sh` + cron，见 §14.5）。
+3. **日志轮转** ✅ 已做（同上；cap 200 MB，copytruncate+gzip，smg.* 三天过期）。
 4. 自动扩容的剩下两段（§7.3）—— 只有在真要无人值守时才值得做。
 
 ---
@@ -605,3 +605,32 @@ phase 仍为 `RUNNING`（加载中或已起）就走新抽出的 `finishStart`/`
 - bootstrap HTTP :8998 双侧都跑；decode→prefill 查 room 元数据 + 注册，
   prefill→decode 只推数据/通知（连接由 prefill 发起）。
 - 日志：`/opt/tai-talea/logs/{sglang-prefill,sglang-decode,bootstrap,router,control-plane}.log`。
+
+### 14.5 看门狗与日志轮转（2026-11-02 晚，§10-2/3 落地）
+
+**环境事实**：CCI 容器 PID 1 是 s6-svscan，`systemctl` 报 offline（不可用）；
+无 logrotate、无 crontab；s6-rc.d 只有空壳 bundle，别指望镜像 init。
+故采用 **cci-watchdog.sh（监管+轮转二合一）+ apt 装 cron 双通道**：
+
+- `deploy/alayanew/ops/cci-watchdog.sh`，装在两台 `/opt/tai-talea/sbin/`。
+  角色自动判：有 `/root/cci-start-plane.sh`+config = 控制面节点（pd2b），
+  否则 worker（pd3b，只管 bootstrap 进程 + 轮转）。
+- **监管是外科式的**：Router 健康（:8001 listener + /health 200）但控制面死 →
+  只用同款参数拉起控制面（不跑 cci-start-plane.sh，避免弹健康 Router）；
+  Router 也死 → 才跑完整 `cci-start-plane.sh`。worker 只管 bootstrap
+  （sglang 由控制面 reconcile 驱动重启，watchdog 不插手）。
+- **轮转**：`*.log` 超 200 MB（或磁盘 ≥85% 强制）→ copytruncate + gzip，
+  每个日志保 2 代；`smg.*` 日期日志大者 gzip、3 天过期；plane 的
+  `.prev-*` 7 天过期。copytruncate 有丢几行的窗口——记在这里，不是藏着。
+- **暂停阀**：`touch /opt/tai-talea/run/watchdog.pause` 挂起监管（轮转照跑），
+  供有意维护停机用。
+- **启动通道**：loop 模式（30 s）经 `setsid nohup` 常驻；cron（两台都已装并
+  手工拉起 `cron -f`——systemd offline 服务不会自启）带 `@reboot` 起 loop +
+  `*/2` 兜底 `once`。锁目录防双跑（带死 pid 接管）。
+- **真机验证**：pkill 控制面 → 14 s 后检测、17 s 后 readyz 200 自动恢复
+  （日志 `starting plane only` / `control plane restarted`），Router 进程
+  全程未动，双实例 SERVING，公网 e2e 200。轮转逻辑在 scratch 目录用 1 MB
+  cap 实测（rotate+gzip+truncate+prune 全过）。
+- ⚠️ 教训：SFTP put 前目标目录必须已存在，否则 ENOENT；曾把 watchdog 误
+  覆盖到 `/root/cci-start-worker.sh`，已用仓库原版恢复（md5 `dde0213a…`，
+  与运行中 bootstrap 参数一致，无漂移）。
