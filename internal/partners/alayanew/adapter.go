@@ -428,9 +428,20 @@ func (a *Adapter) toCapacityInstance(ctx context.Context, record InstanceRecord)
 	// 9101/9102 instead, which the platform never publishes. "Not in the
 	// mapping" is therefore a normal case here, not an error: when
 	// advertise_hosts names the container, the internal address is known
-	// without asking the platform. Without it the old rule still holds - an
-	// unpublished bootstrap port means the container cannot be managed.
+	// without asking the platform.
+	//
+	// An internal address is not optional, though. The published ingress is a
+	// hairpin that never completes from inside the network, and worse, the
+	// controller derives the container's SGLang listen port from the service
+	// URL - so adopting a public URL like :30093 would order the worker to
+	// bind the platform's external port. A container the control plane cannot
+	// reach internally is a container it cannot manage; say so instead of
+	// enrolling an address that is wrong in two ways at once.
 	internal := a.advertiseHost(name)
+	if internal == "" {
+		return partner.CapacityInstance{}, fmt.Errorf(
+			"no advertise_hosts entry for %q; the published ingress is hairpin-unreachable and cannot manage this container", name)
+	}
 	bootstrap, ok := endpointFor(mapped, internal, a.cfg.BootstrapPort)
 	if !ok {
 		return partner.CapacityInstance{}, fmt.Errorf("bootstrap port %d not published", a.cfg.BootstrapPort)

@@ -406,6 +406,11 @@ func TestQueuedCreationWaitMustFitInsideTheProvisionBudget(t *testing.T) {
 				AccessKey: "ak-test", SecretKey: "sk-test",
 				Timeout:     config.Duration(30 * time.Second),
 				WaitTimeout: config.Duration(35 * time.Minute),
+				// The CCI validation refuses the 9001/9002 defaults, so every
+				// fixture names the ports this deployment actually serves.
+				BootstrapPort:  9101,
+				ServicePort:    9102,
+				AdvertiseHosts: map[string]string{"node-a": "172.19.0.2"},
 			},
 		}}
 		return cfg
@@ -439,5 +444,82 @@ func TestQueuedCreationWaitMustFitInsideTheProvisionBudget(t *testing.T) {
 	cfg.Partners[0].AlayaNeW.WaitTimeout = config.Duration(5*time.Hour + 30*time.Minute)
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("a long provision budget must validate: %v", err)
+	}
+}
+
+// alayaNeWBase returns a minimal config whose single alayanew partner passes
+// validation; tests mutate one field at a time to pin a specific rule.
+func alayaNeWBase() config.Config {
+	cfg := config.Default()
+	cfg.Server.AdminToken = "admin-token-0123456789"
+	cfg.Router.URL = "http://127.0.0.1:30001"
+	cfg.Controller.ModelID = "model-a"
+	cfg.Controller.BootstrapToken = "bootstrap-token-0123456789"
+	cfg.Partners = []config.PartnerConfig{{
+		ID: "partner-a", Adapter: "alayanew", PushToken: "token-12345678",
+		PushSecret: "secret-0123456789", HMACTolerance: config.Duration(5 * time.Minute),
+		AlayaNeW: &config.PartnerAlayaNeWConfig{
+			AccessKey: "ak-test", SecretKey: "sk-test",
+			Timeout:        config.Duration(30 * time.Second),
+			WaitTimeout:    config.Duration(35 * time.Minute),
+			BootstrapPort:  9101,
+			ServicePort:    9102,
+			AdvertiseHosts: map[string]string{"node-a": "172.19.0.2"},
+		},
+	}}
+	return cfg
+}
+
+// The port rules encode the 2026-11-01 incident: CCI force-publishes 9001/9002
+// to the internet and refuses to unpublish them, so an operator who leaves the
+// adapter defaults in place hands a listener to every scanner on the network.
+// The defaults must be refused at load time, not discovered from a botnet.
+func TestAlayaNeWPortRules(t *testing.T) {
+	cases := map[string]func(*config.PartnerAlayaNeWConfig){
+		"unset bootstrap port":     func(a *config.PartnerAlayaNeWConfig) { a.BootstrapPort = 0 },
+		"unset service port":       func(a *config.PartnerAlayaNeWConfig) { a.ServicePort = 0 },
+		"legacy bootstrap port":    func(a *config.PartnerAlayaNeWConfig) { a.BootstrapPort = 9001 },
+		"legacy service port":      func(a *config.PartnerAlayaNeWConfig) { a.ServicePort = 9002 },
+		"out of range":             func(a *config.PartnerAlayaNeWConfig) { a.ServicePort = 70000 },
+		"same port for both roles": func(a *config.PartnerAlayaNeWConfig) { a.ServicePort = 9101 },
+		"no advertise hosts":       func(a *config.PartnerAlayaNeWConfig) { a.AdvertiseHosts = nil },
+		"scheme in the host value": func(a *config.PartnerAlayaNeWConfig) {
+			a.AdvertiseHosts = map[string]string{"node-a": "http://172.19.0.2"}
+		},
+		"port in the host value": func(a *config.PartnerAlayaNeWConfig) {
+			a.AdvertiseHosts = map[string]string{"node-a": "172.19.0.2:9102"}
+		},
+		"invalid instance name": func(a *config.PartnerAlayaNeWConfig) { a.AdvertiseHosts = map[string]string{"": "172.19.0.2"} },
+	}
+	for name, mutate := range cases {
+		cfg := alayaNeWBase()
+		mutate(cfg.Partners[0].AlayaNeW)
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("%s must be rejected", name)
+		}
+	}
+
+	if err := alayaNeWBase().Validate(); err != nil {
+		t.Fatalf("an explicit, non-legacy port pair with advertise hosts must validate: %v", err)
+	}
+}
+
+// The environment mode decides whether a start installs the wheelhouse or
+// trusts the virtualenv it finds. Anything outside the two known modes would
+// otherwise flow into the start request unvalidated and surface as a bootstrap
+// 422 on the first model start.
+func TestImageProfileEnvironmentMode(t *testing.T) {
+	build := func(mode string) config.Config {
+		cfg := config.Default()
+		cfg.ImageProfile.EnvironmentMode = mode
+		return cfg
+	}
+	for _, mode := range []string{"", "wheelhouse", "prebuilt"} {
+		if err := build(mode).ImageProfile.Validate(); err != nil {
+			t.Fatalf("mode %q must be accepted: %v", mode, err)
+		}
+	}
+	if err := build("containerless").ImageProfile.Validate(); err == nil {
+		t.Fatal("an unknown environment mode must be rejected")
 	}
 }

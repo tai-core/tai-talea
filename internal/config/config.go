@@ -268,6 +268,20 @@ type ImageProfile struct {
 	SGLang     string `yaml:"sglang" json:"sglang"`
 	Wheelhouse string `yaml:"wheelhouse" json:"wheelhouse"`
 	Virtualenv string `yaml:"virtualenv" json:"virtualenv"`
+	// EnvironmentMode decides what a start does before launching SGLang:
+	//
+	//   wheelhouse (default) - the bootstrap installs the pinned requirements
+	//     from the offline wheelhouse into the managed virtualenv, then starts.
+	//   prebuilt - the virtualenv was already assembled and validated outside
+	//     the worker (a platform shared-volume runtime), and the node may not
+	//     carry a wheelhouse at all. The start request tells the bootstrap to
+	//     skip installation and use the venv as it stands.
+	//
+	// The empty string means wheelhouse so every existing deployment keeps its
+	// semantics. "prebuilt" is what makes a NAS-runtime node startable: with
+	// the default, a start that reaches a prebuilt node asks for a wheelhouse
+	// that does not exist and dies in INSTALLING before touching the model.
+	EnvironmentMode string `yaml:"environment_mode" json:"environment_mode"`
 }
 
 // PartnerHTTPConfig is the generic HTTP adapter configuration.
@@ -453,6 +467,52 @@ type PartnerAlayaNeWConfig struct {
 	WaitTimeout Duration `yaml:"wait_timeout" json:"wait_timeout"`
 }
 
+// Validate checks the AlayaNeW adapter wiring.
+//
+// The port rules are CCI-specific and deliberate. The platform force-publishes
+// container ports 9001/9002 to the internet and refuses to unpublish them, so
+// a worker bound to either port is reachable by every scanner on the network -
+// on 2026-11-01 that is exactly how a decode worker was killed 122 times. The
+// defaults the adapter would otherwise apply are therefore refused at load
+// time: the operator must name ports that are not the platform's system ports,
+// which also documents the advertise_hosts contract the pull path depends on.
+func (a PartnerAlayaNeWConfig) Validate() error {
+	if a.AccessKey == "" || a.SecretKey == "" {
+		return errors.New("access_key and secret_key are required")
+	}
+	if a.Timeout.Duration() <= 0 {
+		return errors.New("timeout must be positive")
+	}
+	ports := map[string]int{"bootstrap_port": a.BootstrapPort, "service_port": a.ServicePort}
+	for name, port := range ports {
+		switch {
+		case port == 0:
+			return fmt.Errorf("%s must be set explicitly; the 9001/9002 default is the pair CCI force-publishes to the internet", name)
+		case port < 1 || port > 65535:
+			return fmt.Errorf("%s must be between 1 and 65535", name)
+		case port == 9001 || port == 9002:
+			return fmt.Errorf("%s must not be 9001/9002: CCI publishes those to the internet and cannot remove them", name)
+		}
+	}
+	if a.BootstrapPort == a.ServicePort {
+		return errors.New("bootstrap_port and service_port must differ")
+	}
+	if len(a.AdvertiseHosts) == 0 {
+		return errors.New("advertise_hosts is required; the published ingress is hairpin-unreachable and cannot manage a container")
+	}
+	for name, host := range a.AdvertiseHosts {
+		if !advertiseName.MatchString(name) {
+			return fmt.Errorf("advertise_hosts: %q is not a valid instance name", name)
+		}
+		// The value is joined with a container port into an authority, so a
+		// scheme, path or port here would silently produce a broken endpoint.
+		if !advertiseHost.MatchString(host) {
+			return fmt.Errorf("advertise_hosts: %q must be a bare hostname or IPv4 address, without scheme or port", host)
+		}
+	}
+	return nil
+}
+
 // StaticInstanceConfig is one container of the static adapter.
 type StaticInstanceConfig struct {
 	ID       string `yaml:"id" json:"id"`
@@ -503,10 +563,10 @@ func Default() Config {
 			// that queues behind the batch, so a single miss is what a busy
 			// instance looks like, not what a broken one looks like.
 			ReadinessFailureThreshold: 2,
-			StartTimeout:           Duration(10 * time.Minute),
-			ProvisionTimeout:       Duration(45 * time.Minute),
-			LeaseWarning:           Duration(120 * time.Second),
-			LostRateThreshold:      0.2,
+			StartTimeout:              Duration(10 * time.Minute),
+			ProvisionTimeout:          Duration(45 * time.Minute),
+			LeaseWarning:              Duration(120 * time.Second),
+			LostRateThreshold:         0.2,
 		},
 		Router: RouterConfig{
 			Name:           "primary",
@@ -752,11 +812,8 @@ func (p PartnerConfig) Validate() error {
 		if p.AlayaNeW == nil {
 			return errors.New("alayanew adapter requires alayanew configuration")
 		}
-		if p.AlayaNeW.AccessKey == "" || p.AlayaNeW.SecretKey == "" {
-			return errors.New("alayanew adapter requires access_key and secret_key")
-		}
-		if p.AlayaNeW.Timeout.Duration() <= 0 {
-			return errors.New("alayanew adapter requires a positive timeout")
+		if err := p.AlayaNeW.Validate(); err != nil {
+			return fmt.Errorf("alayanew adapter: %w", err)
 		}
 	case "kubernetes":
 		if p.Kubernetes == nil {
@@ -853,6 +910,16 @@ var kubernetesLabelValue = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za
 // reported, which turns a typo into a variable that is simply never set.
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// advertiseName is an instance name usable as an advertise_hosts key: the same
+// operator-chosen names the snapshot keys containers by.
+var advertiseName = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
+
+// advertiseHost is a bare hostname or dotted-quad IPv4 address. The adapter
+// joins it with a container port into a URL authority, so a scheme, a path or
+// a port in the value would not fail loudly - it would produce an endpoint
+// like http://http://172.19.0.2:9101 that no dial ever recovers from.
+var advertiseHost = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+
 // Validate checks one static instance configuration.
 // ToEventInstance is the single mapping from a configured container to the
 // partner event shape. Validation and the adapter builder both go through it,
@@ -896,6 +963,11 @@ func (p ImageProfile) Validate() error {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("%s is required in the controlled image route", name)
 		}
+	}
+	switch p.EnvironmentMode {
+	case "", "wheelhouse", "prebuilt":
+	default:
+		return fmt.Errorf("image_profile.environment_mode must be wheelhouse or prebuilt, got %q", p.EnvironmentMode)
 	}
 	return nil
 }

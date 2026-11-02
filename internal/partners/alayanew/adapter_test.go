@@ -228,7 +228,7 @@ func TestSnapshotConvertsRunningInstancesWithPortMapping(t *testing.T) {
 			"inst-a": {9001: "30086", 9002: "30093"},
 		},
 	}
-	adapter := newTestAdapter(t, fake)
+	adapter := newTestAdapterWithHosts(t, fake, map[string]string{"node-a": "172.19.166.190"})
 
 	snapshot, err := partner.CollectSnapshot(context.Background(), adapter)
 	if err != nil {
@@ -246,7 +246,10 @@ func TestSnapshotConvertsRunningInstancesWithPortMapping(t *testing.T) {
 	if got.ID != "node-a" || got.LeaseID != "cci-node-a" {
 		t.Errorf("unexpected identity: %+v", got)
 	}
-	if got.Endpoint != "http://203.0.113.9:30086" || got.ServiceEndpoint != "http://203.0.113.9:30093" {
+	// The published URLs carry the platform's external ports (30086/30093);
+	// the registered endpoints must carry the *container* ports, because the
+	// controller derives the SGLang listen port from the service URL.
+	if got.Endpoint != "http://172.19.166.190:9001" || got.ServiceEndpoint != "http://172.19.166.190:9002" {
 		t.Errorf("unexpected endpoints: %+v", got)
 	}
 	if got.Spec.GPU != "NVIDIA-H100-80G" || got.Spec.GPUCount != 8 {
@@ -257,27 +260,37 @@ func TestSnapshotConvertsRunningInstancesWithPortMapping(t *testing.T) {
 	}
 }
 
-func TestSnapshotSkipsInstanceWithoutBootstrapPort(t *testing.T) {
+// A container the control plane cannot reach internally is a container it
+// cannot manage: the published ingress is a hairpin from inside the network,
+// and adopting its URL would also hand the controller the platform's external
+// port as the SGLang listen port. Refuse the adoption instead.
+func TestSnapshotRefusesInstancesWithoutAnInternalAddress(t *testing.T) {
 	fake := &fakePlatform{
-		t: t, secret: "sk-test",
+		t:      t,
+		secret: "sk-test",
 		instances: []map[string]any{
-			{"id": "inst-good", "status": "RUNNING", "resource": map[string]any{"gpuName": "H100", "gpuCount": 8}},
-			{"id": "inst-bad", "status": "RUNNING", "resource": map[string]any{"gpuName": "H100", "gpuCount": 8}},
+			{"id": "inst-a", "name": "node-a", "status": "RUNNING", "aidcId": 2,
+				"resource": map[string]any{"gpuName": "NVIDIA-H100-80G", "gpuCount": 8}},
 		},
 		ports: map[string]map[int]string{
-			"inst-good": {9001: "30001", 9002: "30002"},
-			"inst-bad":  {9999: "39999"}, // no bootstrap port published
+			"inst-a": {9001: "30086", 9002: "30093"},
 		},
 	}
-	adapter := newTestAdapter(t, fake)
+	adapter := newTestAdapter(t, fake) // no advertise_hosts
+
 	snapshot, err := partner.CollectSnapshot(context.Background(), adapter)
 	if err != nil {
 		t.Fatalf("collect snapshot: %v", err)
 	}
-	if len(snapshot.Instances) != 1 || snapshot.Instances[0].ID != "inst-good" {
-		t.Fatalf("expected only inst-good, got %+v", snapshot.Instances)
+	if len(snapshot.Instances) != 0 {
+		t.Fatalf("a public-only container must not be adopted, got %+v", snapshot.Instances)
 	}
 }
+
+// Note: there is deliberately no "skips an instance without a published
+// bootstrap port" test any more. Since the 9101/9102 move, an unpublished
+// port with a known internal address is the *intended* state, and a missing
+// internal address is refused by TestSnapshotRefusesInstancesWithoutAnInternalAddress.
 
 func TestCreateAndWait(t *testing.T) {
 	fake := &fakePlatform{
@@ -540,8 +553,8 @@ func TestAdvertiseHostPrefersStaticThenVerifiedAddress(t *testing.T) {
 	if got := byID["node-b"]; got.Endpoint != "http://172.19.119.194:9001" || got.ServiceEndpoint != "http://172.19.119.194:9002" {
 		t.Fatalf("the verified address must be used: %+v", got)
 	}
-	if got := byID["node-c"]; got.Endpoint != "http://203.0.113.9:30011" || got.ServiceEndpoint != "http://203.0.113.9:30012" {
-		t.Fatalf("an unknown container keeps the published endpoint untouched: %+v", got)
+	if got, ok := byID["node-c"]; ok {
+		t.Fatalf("a container with no resolvable internal address must not be adopted: %+v", got)
 	}
 }
 

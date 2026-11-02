@@ -114,6 +114,14 @@ type StartRequest struct {
 	// port registered with the Router can never disagree. Zero lets the
 	// bootstrap pick its default.
 	Port int `json:"port,omitempty"`
+	// PrepareEnvironment tells the bootstrap whether to install the pinned
+	// requirements from the wheelhouse before launching. Nil keeps the
+	// bootstrap's default (install), which is the wheelhouse route. A prebuilt
+	// runtime - a virtualenv unpacked from a platform shared volume, with no
+	// wheelhouse on the node - must receive false: the install would either
+	// fail outright or silently rebuild the environment the volume just
+	// vouched for.
+	PrepareEnvironment *bool `json:"prepare_environment,omitempty"`
 }
 
 // StopRequest asks the bootstrap to stop SGLang and return an exit code.

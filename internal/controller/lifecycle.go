@@ -237,6 +237,13 @@ func (c *Controller) StartService(ctx context.Context, instanceID string, role d
 			instance.Spec.SGLangArgsOverride),
 		Port: servicePort(instance),
 	}
+	// A prebuilt runtime must not be re-installed: the node has no wheelhouse,
+	// and the venv it does have was validated when the volume was baked. Nil
+	// keeps the bootstrap's default for every wheelhouse deployment.
+	if c.cfg.ImageProfile.EnvironmentMode == "prebuilt" {
+		skip := false
+		request.PrepareEnvironment = &skip
+	}
 	// Record the command the control plane is about to hand over. Neither side
 	// logs it today: the bootstrap keeps the rendered command in its own
 	// /bootstrap/status history, which lives inside the worker and disappears
