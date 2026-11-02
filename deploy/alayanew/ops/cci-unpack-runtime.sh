@@ -73,14 +73,16 @@ else
     mv "$ROOT/opt/tai-talea/venv" "$ROOT/opt/tai-talea/venv.old"
   fi
   echo "unpacking venv"
-  tar -C "$ROOT/opt/tai-talea" -xf "$SRC/venv-0.5.22-cu130.tar"
+  tar -C "$ROOT/opt/tai-talea" -xf "$SRC/venv-0.5.22-cu130.tar" || die "venv unpack failed"
 fi
 
 echo "unpacking runtime bits"
-tar -C "$ROOT" -xf "$SRC/tai-talea-bits.tar"
+# TALEA_ROOT is normally unset: the empty string must become "/", not an
+# argument-less -C (which fails as "tar: : Cannot open").
+tar -C "${ROOT:-/}" -xf "$SRC/tai-talea-bits.tar" || die "bits unpack failed"
 
 echo "unpacking jit caches"
-tar -C "$ROOT/root" -xf "$SRC/jit-caches.tar"
+tar -C "$ROOT/root" -xf "$SRC/jit-caches.tar" || die "jit caches unpack failed"
 
 # Worker scrub for the OLD bits tar: it was baked on 2026-10-26 with
 # /etc/tai-talea inside, tenant AK/SK included. New packs (cci-pack-runtime.sh)

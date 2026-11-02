@@ -27,6 +27,14 @@ AK = os.environ.get("TALEA_ALAYA_AK", "")
 SK = os.environ.get("TALEA_ALAYA_SK", "")
 BASE = os.environ.get("TALEA_ALAYA_BASE", "https://api.alayanew.com")
 
+# TALEA_ALAYA_DIRECT=1 bypasses ALL proxies: on Windows urllib falls back to
+# the registry proxy once the env vars are unset, and local proxies that
+# cannot tunnel to the platform produce either "Tunnel connection failed"
+# or a getaddrinfo failure on the proxy host itself.
+_DIRECT = os.environ.get("TALEA_ALAYA_DIRECT", "") == "1"
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({})) if _DIRECT \
+    else urllib.request.build_opener()
+
 
 def sign(method, uri):
     """Build the Authorization header for one request."""
@@ -55,7 +63,7 @@ def call(method, path, query="", body=None, extra_headers=None, timeout=30):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _OPENER.open(req, timeout=timeout) as r:
             return r.status, json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         try:

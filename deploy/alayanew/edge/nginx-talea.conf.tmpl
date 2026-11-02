@@ -11,6 +11,9 @@
 # Who may call the inference surface.
 # `Bearer <key>` and a bare `<key>` are both accepted - the first is what OpenAI
 # SDKs send, the second is what people type after reading a curl example.
+# The key is long (48 hex chars); the default map_hash_bucket_size of 64 bytes
+# cannot hold "Bearer <key>", so raise it explicitly.
+map_hash_bucket_size 128;
 map $http_authorization $talea_key_ok {
     default                  0;
     "Bearer __API_KEY__"     1;

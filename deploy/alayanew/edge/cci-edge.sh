@@ -84,6 +84,10 @@ probe() {
 render_conf() {
   need_key || return 1
   install -d -m 755 "$LOG_DIR"
+  # nginx may not be installed yet (start_nginx installs it); the candidate
+  # still has to be writable now so the render happens before anything touches
+  # the live config.
+  mkdir -p "$(dirname "$CONF")"
   # Render to a sibling candidate first: conf.d/*.conf does not match
   # talea.conf.new, so the candidate is inert until it is moved into place.
   # Nothing overwrites the live config before it has passed nginx -t.
