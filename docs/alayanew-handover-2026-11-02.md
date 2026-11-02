@@ -411,8 +411,12 @@ sglang 自杀 → bootstrap 记 `exit -9` → 控制面判 `sglang process faile
 
 ## 10. 还没做的（按优先级）
 
-1. **把 §6.5 的门面真正跑一次** —— 脚本与配置已入库（`deploy/alayanew/`），
-   但**没有在九章上实跑过**（实例已释放）。重建后第一件事就是
+> 2026-11-02 代码复审后发现，重建链路还有配置、PD 8998、prebuilt 启动语义和 worker bootstrap/token 等硬断点。详细整改顺序、验收闸门与回滚见
+> `docs/alayanew-improvement-plan-2026-11-02.md`；以下只保留现场层面的简要清单。
+
+1. **先修完善计划中的 P0，再把 §6.5 的门面真正跑一次** —— 脚本与配置已入库
+   （`deploy/alayanew/`），但**没有在九章上实跑过**（实例已释放），且复审发现
+   配置生成和 worker 启动链路尚有硬断点。修复并通过 G0 后，重建时执行
    `edge/cci-edge.sh probe` → `up` → `status`，重点看两件：
    - 9001/9002 是否真的空转（`ss -lnt | grep -E ':(9001|9002) '` 无输出）；
    - 不带 key 打 `/v1/models` 是否 401、带 key 是否 200。

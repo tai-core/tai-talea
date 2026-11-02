@@ -1,0 +1,387 @@
+# 九章智算云 CCI 平台现况 Review 与完善计划书
+
+日期：2026-11-02  
+代码基线：`0374135`（`origin/main`）  
+范围：九章 CCI 上的 GLM-5.3-Flash 1P1D、控制面、Router、公网门面、NAS 制品、自动铺装与运维体系
+
+> 本计划基于交接记录、当前仓库代码审查和一次真实配置预检。实例释放后，本机没有九章 AK/SK，本次没有重新调用平台在线接口；因此「实例已释放」是最后一次已验证现场，不冒充本次在线复核。所有需要新实例才能确认的结论均标为「待真机」。
+
+---
+
+## 0. 管理层结论
+
+九章平台目前**没有正在提供服务的实例**。旧拓扑曾真实跑通 1P1D，但 decode 因公网 9002 被外部调用打崩；两台实例已于 2026-11-02 15:26 释放。随后仓库完成了 nginx 门面、9101/9102 端口迁移和自动铺装端口参数化，但这些改动**尚未在活实例上验收**。
+
+本次 review 的关键结论不是「还缺生产增强」，而是：
+
+> **新方案的代码方向正确，但当前重建链路存在确定性或高概率硬断点；在修复这些断点并完成 G0/G1/G2 验收前，不应开启自动扩缩容，也不应宣称平台已可重建。**
+
+优先级必须是：
+
+1. 先让重建入口可信；
+2. 再分离 NAS 中的秘密与运行时制品；
+3. 用真实单节点、双节点重新验收；
+4. 补自启、日志、备份、TLS、状态恢复；
+5. 最后才恢复自动创建与自动扩缩容。
+
+---
+
+## 1. 证据边界与当前事实
+
+### 1.1 已验证的历史现场
+
+| 事项 | 结论 | 证据 |
+| --- | --- | --- |
+| 旧 1P1D | 2026-10-26 曾端到端成功，`7*8=56`，0.72 秒 | `docs/alayanew-1p1d-acceptance-2026-10-26.md` |
+| 旧拓扑 | Router 8000、控制面 8787、SGLang 9002、bootstrap 9001、PD bootstrap 8998 | 同上 §1 |
+| decode 循环根因 | 126 次外部 `begin_weight_update` 与 122 轮崩溃对应；不是模型加载失败 | `docs/alayanew-handover-2026-11-02.md` §7.1 |
+| 平台端口限制 | 9001/9002 强制发布且不可移除；容器无 iptables；无 UDP 端口映射 | 交接文档 §6.5/§7.2、`docs/alayanew-cci.md` §3.3 |
+| 实例处置 | pd3 15:25、pd2 15:26 release，实例列表 0 条 | 交接文档 §1/§11 |
+| NAS 保留 | 权重、运行时 tar、`live-2026-11-02.tar.gz` 留在 NAS | 交接文档 §9 |
+
+### 1.2 当前代码已落地的能力
+
+- `internal/partners/alayanew/adapter.go`：`endpointFor` 支持「平台未发布、但 `advertise_hosts` 已知」的 9101/9102 内网纳管。
+- `provision/ssh_install.py`、`install_node.py`：bootstrap/service 端口已参数化，默认仍为 9001/9002。
+- `deploy/alayanew/edge/`：nginx `/health` 免 key、`/v1/*` 要 key、其它 403；Router 仅绑 `127.0.0.1:8001`。
+- `deploy/alayanew/ops/`：运行时解包、配置、控制面/Router 启动和平台 API 工具已入库。
+- 当前 Go `internal/...` 测试、`go vet ./...`、provision 52 项 Python 测试通过；但这些测试没有覆盖下述跨组件重建链路。
+
+### 1.3 本次实际复现
+
+按 `deploy/alayanew/ops/cci-config.sh` 的 heredoc 渲染配置，使用虚构凭据执行真实二进制：
+
+```text
+/root/tai-talea -check-config
+→ partners[0]: console_token must be at least 16 characters and distinct from all other credentials
+```
+
+去掉 `console_token` 行后，同一配置通过：
+
+```text
+configuration ... is valid (1 partners, router http://127.0.0.1:8001)
+```
+
+因此 P0-1 不是推测，而是**当前配置生成器的确定性缺陷**。
+
+---
+
+## 2. 目标状态
+
+完成本计划后，平台应达到以下可验证状态：
+
+```text
+客户端 ──HTTPS──> 平台唯一公网映射 ──> nginx ──> Router 127.0.0.1:8001
+                                             ├──> prefill  :9102
+                                             └──> decode   :9102
+
+prefill ──PD bootstrap 8998 / Mooncake KV──> decode
+控制面 ──> 两台 bootstrap :9101
+9001/9002：容器内无监听；公网映射打空
+```
+
+并满足：
+
+- 新拓扑双节点真实 1P1D、SSE、公网负例全部通过；
+- NAS 上 worker 可读制品不含平台 AK/SK、admin token、bootstrap token；
+- 控制面重启、Router 重启、短暂探针失败不会制造状态分裂；
+- 日志有轮转，SQLite 有一致性备份和恢复演练；
+- 自动创建任务可持久化恢复，自动扩缩容只有在 G3 后才能开启；
+- 文档中的每条「已验证」都有对应的真实验收记录。
+
+---
+
+## 3. P0：重建前必须修复的五个问题
+
+### P0-1 配置生成器生成非法配置，且校验失败可能被脚本掩盖
+
+**状态：已复现。**
+
+**位置：**
+
+- `deploy/alayanew/ops/cci-config.sh`：`admin_token`、`console_token`、`-check-config` 段
+- `internal/config/config.go`：`consoleTokens` 校验
+
+**问题：**
+
+- `console_token` 与 `admin_token` 被写成同一个值，违反配置校验。
+- 脚本没有 `set -e`；`check_rc` 只打印不退出，末尾 `ls` 可能让脚本最终返回 0。
+- 配置直接写正式文件，校验失败后仍留下不可用配置。
+
+**整改：**
+
+1. CCI 不需要 console token 时删除该项；确有需要则生成独立凭据。
+2. 配置先写 `tai-talea.next.yaml`，真实 `-check-config` 通过后再原子替换。
+3. 校验失败必须非零退出，禁止继续执行 `cci-start-plane.sh`。
+4. `TALEA_BOOTSTRAP_TOKEN` 改为 CCI 必填，不再每次随机生成一个只写在控制面的值。
+5. 收紧 `image_profile.sglang` 为已验证的 `0.5.22`。
+
+**验收：**G0 中执行真实生成脚本；合法配置通过，token 冲突、非法 host、缺失端口均非零退出，正式配置不被污染。
+
+### P0-2 新配置缺少 PD 的 8998 注册信息
+
+**状态：代码审查已确认；实际故障表现待真机。**
+
+**位置：**
+
+- `deploy/alayanew/ops/cci-config.sh` 的 `router:` 与 `extra_sglang_args:`
+- `internal/controller/lifecycle.go`：注册时 `BootstrapPort`
+- `internal/routeradapter/client.go`：`BootstrapPort == 0` 时不发送字段
+
+**问题：**新 `router:` 只有 name/url/mode/timeout，没有 `prefill_bootstrap_port: 8998`。进程可能健康，但 Router 注册请求没有 prefill 的 KV 握手端口，不能把 `/workers` healthy 当作 PD 可用。
+
+**整改：**
+
+- 显式配置 `router.prefill_bootstrap_port: 8998`。
+- 显式配置 SGLang `--disaggregation-bootstrap-port 8998`，让两侧都可审计。
+- 检查旧 worker 记录是否更新，避免只改配置却沿用旧注册。
+
+**验收：**Router 注册详情包含正确 8998；真实请求穿过 nginx/Router；日志证明发生 Mooncake/KV 传输，而非只返回进程健康。
+
+### P0-3 NAS prebuilt 运行时与 bootstrap 默认安装语义冲突
+
+**状态：代码路径冲突已确认；NAS 是否碰巧含有可掩盖问题的 requirements 待查。**
+
+**位置：**
+
+- `internal/launcher/client.go`：`StartRequest` 没有环境模式
+- `bootstrap/tai_talea_bootstrap/server.py`：`prepare_environment` 默认 `True`
+- `bootstrap/tai_talea_bootstrap/service.py`：默认调用 `installer.prepare()`
+- `bootstrap/tai_talea_bootstrap/environment.py`：强制要求 wheelhouse/requirements.txt
+
+**问题：**NAS 通道的设计是「解包已验证 venv，不再 pip install」，但控制面启动请求未携带 `prepare_environment=false`。即使 NAS 偶然带有 requirements，也会违背 prebuilt 语义并重复安装；没有则在启动模型前失败。
+
+**整改：**
+
+1. 增加明确的运行时模式，例如 `image_profile.environment_mode: prebuilt|wheelhouse`，默认保持 wheelhouse 兼容。
+2. `StartRequest` 能表达 prebuilt；CCI 配置明确使用 prebuilt。
+3. 不要全局把 bootstrap 默认值改成 false，避免破坏其它平台。
+4. 增加跨组件测试：真实 Go StartRequest JSON → bootstrap HTTP handler → prebuilt venv，无 wheelhouse 也能进入 SGLang 启动。
+5. 保留 wheelhouse 通道测试，证明原行为不变。
+
+**验收：**G1 在无 wheelhouse requirements 的全新节点上，控制面真实 StartRequest 能启动 9102 SGLang。
+
+### P0-4 手工重建流程没有启动 worker bootstrap，也没有同步 token
+
+**状态：代码与文档审查已确认。**
+
+**位置：**
+
+- `deploy/alayanew/README.md` 部署顺序
+- `deploy/alayanew/ops/cci-unpack-runtime.sh`
+- `deploy/alayanew/ops/cci-config.sh`
+- `deploy/alayanew/ops/cci-start-plane.sh`
+
+**问题：**现有顺序是解包 → 控制面配置 → 控制面/Router → 门面，没有启动两台 worker 的 9101 bootstrap。配置脚本随机生成 bootstrap token，却没有同步到 worker 的 `/etc/tai-talea/bootstrap-token`。结果可能是无 listener 或全部 401。
+
+**整改：**
+
+1. 新增 `ops/cci-start-worker.sh`：校验 profile、token、二进制，启动 9101 bootstrap，检查鉴权健康和 9001 空转。
+2. 控制面与所有 worker 使用同一份受控 token；token 不写入共享 NAS。
+3. 重建顺序改为：两台解包 → 两台 bootstrap 就绪 → 控制面配置预检 → 控制面/Router → 门面 → 数据面验收。
+4. 长期收敛到修复后的 onboarding，手工脚本只作为灾备路径，避免两套流程漂移。
+
+**验收：**G1/G2 从全新 overlay 执行，无手工补命令；错误 token 返回 401，正确 token 健康，控制面能下发 start。
+
+### P0-5 控制面秘密仍可从 worker 共享 NAS 读取
+
+**状态：制品路径已确认； NAS 当前成员需下次只读复核。**
+
+**问题：**`tai-talea-bits.tar` / `live-2026-11-02.tar.gz` 可包含控制面 YAML、AK/SK、admin/bootstrap token 和 onboarding 状态。`TALEA_WORKER_ONLY=1` 只删除解包后的副本，worker 仍能读取 NAS 上的原始 tar；`read_only` 不防读取。
+
+**整改：**
+
+1. 将制品拆成「worker 无秘密 runtime」与「控制面私密备份」两个信任域。
+2. worker NAS 只保留 venv、bootstrap 源码、JIT cache 及必要无秘密 profile。
+3. 控制面配置、token、SQLite、onboarding 状态放到仅控制节点可读的位置，并加密。
+4. 轮换已经进入共享归档的 AK/SK、admin token、bootstrap token 及相关 onboarding 凭据。
+5. worker 不恢复控制面二进制和 live 配置；控制面恢复 live snapshot 后校验版本/hash。
+
+**验收：**从 worker 实际尝试读取控制面私密备份必须失败；runtime tar 成员扫描无秘密；轮换后旧凭据全部失效。
+
+---
+
+## 4. P1：可用性、可信验收与无人值守前必须完成
+
+| 编号 | 问题与证据 | 整改要点 | 验收 |
+| --- | --- | --- | --- |
+| P1-1 | `cci-start-plane.sh` 只打印 Router health/listener，未断言新进程和端口 owner；控制面只 `pgrep` | 严格检查返回码、listener PID/命令行、Router health、控制面 ready 和首轮 reconcile；失败非零退出 | 注入端口冲突/假进程/启动失败，脚本均失败且不打印成功 |
+| P1-2 | `cci-edge.sh` 直接覆盖正式 nginx 配置；`nginx -t \| tail` 可能掩盖失败 | 临时文件 + 真实 `nginx -t` + 原子替换；reload 后验证 401/403/200 和 listener | 错误配置不生效，旧 key 不被误报为已轮换 |
+| P1-3 | 控制面、Router、bootstrap、nginx 无守护；容器 STOP/START 后 overlay 还需重铺 | 先确认 CCI entrypoint 能力；否则使用轻量 supervisor。恢复顺序包含制品、token、profile、进程 | kill 各进程能恢复；STOP/START 在测试窗口完成 G4 |
+| P1-4 | bootstrap 200ms 轮询刷日志；控制面 `.prev-*`、SGLang/nginx 日志无统一保留策略 | 降低探针频率或分离访问日志；统一大小/时间轮转、压缩、保留上限、磁盘告警 | 构造大量日志后磁盘受控，关键错误仍保留 |
+| P1-5 | live snapshot 不等于控制面备份；SQLite 在 `/var/lib/tai-talea/tai-talea.db`，无一致性备份/恢复演练 | SQLite 在线备份或受控 checkpoint；备份 DB、配置、known_hosts、manifest、密钥与制品版本 | 隔离恢复后实例/operation/audit 一致，首轮 reconcile 不重复启动或误释放 |
+| P1-6 | 公网门面是明文 HTTP + API key，无限流、轮换、撤销 | 先验证平台 `protocol=https` 语义；在平台或 nginx 终止 TLS；增加速率/并发限制、认证失败告警和 key 轮换流程 | 公网抓包无明文 key/prompt；错误 key 有告警；轮换不中断或按文档平滑完成 |
+| P1-7 | `/health` 只代表 Router；控制面 `/healthz` 固定 ok；recovery 失败仍 `ready.Store(true)` | 分进程 liveness、组件 readiness、数据面 readiness、低频端到端 synthetic；恢复失败不 ready | nginx 200 不再被当作端到端可用；恢复失败 `/readyz` 非 200 |
+| P1-8 | STARTING 超过 3 个 reconcile 周期即判无 owner；单次 endpoint 不可达即 LOST | 恢复时读取 bootstrap phase/PID/role/model；启动超时与 `start_timeout`/心跳关联；LOST 加连续失败阈值 | 控制面在 INSTALLING/STARTING/REGISTERING/SERVING 重启均不制造假 FAILED/LOST |
+| P1-9 | provision job 只在内存 map；QUEUED 永久 outstanding，重启后丢失平台队列跟踪 | 持久化 result key、instance ID、阶段、游标、截止时间；启动恢复轮询；提供继续/取消/核对入口 | 排队超时、控制面重启、重名、长期 CREATING、SSH 失败均不重复创建或泄漏配额 |
+| P1-10 | 无内网地址时可能从公网 URL 的外部端口反推容器监听端口 | 实例模型分别保存「容器监听端口」和「peer URL」；CCI 启动前必须有验证过的内部 service endpoint | 公网 30093→容器 9002 的回归测试中，StartRequest 仍为 9002 |
+| P1-11 | 自动扩缩容配置未开，负载读取错误被忽略，webhook 为空 | G3 前不开 auto；负载失败显式指标/日志/告警；配置有效 webhook | 负载抓取失败可见；第三实例测试不会突然改变现役 1P1D |
+| P1-12 | 手工解包缺 SHA256SUMS 仍继续；live snapshot 可能因 bits 中旧二进制存在而不恢复 | 默认强制校验；控制面显式恢复指定版本并校验 hash；worker 不恢复 live | 归档版本与运行版本一致；错误/缺失清单默认拒绝 |
+| P1-13 | NAS 上 SHA256SUMS 与 tar 同属一个信任域 | 控制节点 manifest 钉住清单或各 tar 的独立 hash；高要求时使用签名清单 | 同时篡改 tar 与 NAS 清单不能通过控制面校验 |
+
+---
+
+## 5. P2：主链路修复后收紧
+
+1. **AlayaNeW 配置校验**：补端口范围、两端口不同；CCI 可要求显式端口，避免 0 值静默回退到公网 9001/9002。
+2. **`cci-probe-sweep.py`**：用显式 `--result-key` 替代从 `sys.argv[-1]` 猜测，否则 argparse 会先拒绝 positional key。
+3. **WireGuard probe**：最终 verdict 纳入 CAP_NET_ADMIN；继续明确本平台无 UDP 映射，wg0 不是隔离手段。
+4. **配置渲染**：`advertise_hosts` 对实例名、IP、重复项、条目数 fail-fast；禁止 `NF!=2` 静默丢节点；YAML 生成后必须有两台预期实例。
+5. **文档口径**：历史 10-26 验收保留旧拓扑，不改写；新拓扑只有 G2 通过后才能标「已验证」。
+
+---
+
+## 6. 分阶段实施计划
+
+> 工作量为粗略工程估算，不含平台排队、GPU 空闲等待和跨团队凭据轮换审批。每一阶段必须以上一阶段验收通过为入口。
+
+### 阶段 A：修复重建入口（约 2–3 人日）
+
+**内容：**P0-1、P0-2、P0-3、P0-4、P1-1、P1-2、P1-10、P2 配置校验。  
+**产出：**可信配置生成器、worker 启动脚本、prebuilt 启动语义、启动/门面失败闸门、跨组件测试。  
+**出口：**G0 全部通过；不申请 GPU 也能证明静态和沙箱链路可信。
+
+### 阶段 B：重建制品与秘密边界（约 1–2 人日 + 凭据轮换协调）
+
+**内容：**P0-5、P1-12、P1-13。  
+**产出：**无秘密 runtime 包、加密控制面备份、独立 hash/签名清单、凭据轮换记录、归档成员清单。  
+**出口：**worker 无法读取控制面秘密；控制面可恢复指定版本；旧凭据失效。
+
+### 阶段 C：单节点真实铺装 G1（约 0.5–1 人日 + 一台 8×H100）
+
+**内容：**全新 overlay 解包、bootstrap 9101、prebuilt StartRequest、SGLang 9102、9001/9002 空转、版本/hash 验证。  
+**出口：**真实解包、真实 bootstrap、真实控制面启动请求、真实 SGLang 监听全部通过；不是 dry-run。
+
+### 阶段 D：双节点新拓扑验收 G2（约 1–2 人日 + 两台 8×H100）
+
+**内容：**完整 1P1D、8998、Mooncake KV、nginx key、SSE、公网负例、Router 补注册、控制面加载中重启。  
+**出口：**只有真实 PD 请求与全部负例通过，才把文档改为「9101/9102 新方案已验证」。
+
+### 阶段 E：运维与恢复（约 3–5 人日）
+
+**内容：**P1-3 至 P1-8、日志轮转、分层健康检查、SQLite 备份恢复、TLS/限流/key 轮换。  
+**出口：**G4 通过；可以讨论无人值守，但仍不自动扩容。
+
+### 阶段 F：自动创建与扩缩容（约 4–6 人日 + 第三实例）
+
+**内容：**P1-9、P1-11；先验证「已有实例自动铺装」，再持久化创建任务、恢复队列、补告警，最后开 auto。  
+**出口：**G3 通过；任何重名、重启、排队超时、失败释放都有可审计行为。
+
+---
+
+## 7. 验收闸门
+
+### G0：本地/一次性 Linux 沙箱
+
+- 真实执行配置生成 + 真实二进制 `-check-config`。
+- 断言 9101/9102、Router 8001、8998、两台 advertise_hosts。
+- 故障注入证明配置、控制面、Router、nginx 脚本不会假成功。
+- prebuilt/wheelhouse 双通道集成测试通过。
+- 公网外部端口不再被反推为容器监听端口。
+
+**不通过：不得申请新实例。**
+
+### G1：一台全新 8×H100
+
+- NAS 真实解包与 hash/版本检查。
+- 9101 鉴权健康，错误 token 401。
+- 无 wheelhouse requirements 也能通过 prebuilt StartRequest 启动。
+- SGLang 实际监听 9102；9001/9002 无 listener。
+- worker 不能读取控制面私密备份。
+
+**不通过：不得开第二台，不得公网开放门面。**
+
+### G2：两台全新 EXCLUSIVE 8×H100
+
+- prefill/decode 各一台，角色、9101/9102、8998 正确。
+- Router 注册含 prefill 握手端口。
+- 穿过 nginx/Router 的真实请求 200、`finish_reason=stop`，SSE 分块到达。
+- 日志证明 Mooncake/KV 传输。
+- 公网 9001/9002 连接失败；9101/9102/8001 无公网映射；8787 不可达。
+- 不带/错误 key 401；`/metrics`、`/server_info`、`/workers`、权重管理路径 403。
+- Router 重启自动补注册；控制面加载中重启不再假 FAILED。
+
+**不通过：保留为测试环境，不宣称新方案可用。**
+
+### G3：第三实例，仅验证自动化
+
+- 先设 `planner.max_serving: 2`，避免第三台改变现役 1P1D。
+- 已有实例自动铺装纳管。
+- 排队超时、控制面重启、重名、SSH 失败、长期 CREATING 都可恢复或明确失败。
+- 失败实例按策略释放，不泄漏最多 3 台的配额。
+- 负载读取失败有告警。
+
+**不通过：保持 `planner_mode=fixed`、`capacity_actions=false`。**
+
+### G4：故障与恢复
+
+- 分别 kill Router、控制面、bootstrap、SGLang、nginx。
+- 测试窗口 STOP/START，验证 overlay 清空后的完整恢复。
+- 日志轮转、磁盘告警、webhook 真实到达。
+- SQLite 隔离恢复，记录一致，首轮 reconcile 无副作用。
+- 再次验证 worker 无法读取控制面秘密。
+
+---
+
+## 8. 风险与回滚
+
+| 风险 | 预防 | 回滚/处置 |
+| --- | --- | --- |
+| 新配置再次生成非法文件 | `.next.yaml` + 真实预检 + 原子替换 | 保留上一份已验证配置，不启动新进程 |
+| 新拓扑 PD 不健康 | G1 后才开第二台；G2 前不开公网 | 保存日志和配置，关闭门面，释放测试实例 |
+| 凭据轮换影响现有调用方 | 先列使用方、分批轮换、设置验证窗口 | 在轮换窗口内保留受控回退凭据，完成后必须吊销旧凭据 |
+| 第三实例抢占角色或配额 | `max_serving: 2`，固定现役拓扑 | 立即停止 auto，按实例 ID 释放测试节点 |
+| 控制面重启误杀正常加载 | 先修 STARTING/LOST，再做重启演练 | 以 bootstrap 真实 phase/PID 为准人工 adopt，禁止盲目 restart |
+| NAS 制品被同时篡改 | 控制节点独立 hash/签名 | 停止使用该制品，恢复上一签名版本并轮换相关凭据 |
+| TLS/限流变更中断客户端 | 先旁路验证新 listener 和负例，再切映射 | 回退到上一份 nginx 配置并保留旧端口短时间只读验证 |
+
+---
+
+## 9. 交付物与责任边界
+
+| 交付物 | 主要位置 | 责任角色 |
+| --- | --- | --- |
+| 可信配置生成与 worker 启动脚本 | `deploy/alayanew/ops/` | 平台工程 |
+| prebuilt/wheelhouse 启动契约 | `internal/launcher/`、`bootstrap/` | 控制面工程 |
+| 双节点验收报告与公网负例 | `docs/alayanew-*-acceptance-*.md` | 平台工程 + 推理工程 |
+| 无秘密 runtime 与加密控制面备份 | NAS/控制节点制品目录 | 平台工程 + 安全/运维 |
+| 自启、日志轮转、备份恢复手册 | `deploy/alayanew/`、`docs/` | 运维 |
+| 自动创建持久化与恢复 | `internal/api/provision.go`、存储层 | 控制面工程 |
+| 新方案状态更新 | 交接文档 §1/§6/§7/§10 | 文档 owner；必须有验收证据才能改「已验证」 |
+
+---
+
+## 10. 完成定义（Definition of Done）
+
+### 可称为「新拓扑可用」
+
+- P0 全部关闭；
+- G0/G1/G2 有真实记录；
+- 公网负例和真实 PD/SSE 全部通过；
+- 文档不再把历史旧拓扑结果冒充新拓扑结果。
+
+### 可称为「可无人值守运行」
+
+- 上述条件 + G4；
+- 自启、日志、备份恢复、TLS、限流、告警、状态恢复均有验收。
+
+### 可称为「自动扩缩容可用」
+
+- 上述条件 + G3；
+- 创建任务持久化恢复、失败释放、配额保护、负载告警全部通过；
+- 最后才允许 `mode: auto`、`capacity_actions: true`。
+
+---
+
+## 11. 下一步执行顺序（直接照此推进）
+
+1. 修 `cci-config.sh` 的 token 冲突、校验退出码、8998、显式 bootstrap token。
+2. 修 prebuilt `prepare_environment` 契约，并加 Go→bootstrap 集成测试。
+3. 补 `cci-start-worker.sh`，重排手工重建顺序。
+4. 修控制面/Router/nginx 启动脚本的假成功和原子配置更新。
+5. 拆 NAS 秘密与 runtime，钉住制品 hash，安排凭据轮换。
+6. 跑 G0；通过后才申请一台实例跑 G1。
+7. G1 通过后开第二台跑 G2；G2 通过才更新「新方案已验证」。
+8. 再做运维恢复 G4，最后才用第三台做自动扩缩容 G3。
+
+**当前建议：暂停一切「直接开自动扩容」的工作，先完成第 1–6 步。**
