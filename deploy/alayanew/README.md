@@ -171,7 +171,8 @@ nginx 完全不在公网上。九章有两个叠在一起的阻碍：
 （`deploy/kunhaoyuan/ops/`）已经就位，把 peer 加上即可。
 
 推论只有一条，但很重要：**key 是唯一防线**，所以 9101/9102 挪端口不是可选项。
-门面退化到 `0.0.0.0:8000` 时，公网上只剩一个需要 key 的 `/v1/*` 和一个 `/health`。
+门面始终监听 `0.0.0.0:8000`（平台只映射这一个口），公网上能看到的只有需要 key 的
+`/v1/*` 和一个不碰模型的 `/health`。
 
 ---
 
@@ -181,7 +182,7 @@ nginx 完全不在公网上。九章有两个叠在一起的阻碍：
 | --- | --- | --- |
 | 门面活着 | `curl -s -o /dev/null -w '%{http_code}' localhost:8000/health` | 200 |
 | key 生效 | 不带 key 打 `/v1/models` | **401**（不是 200） |
-| 推理端口不在公网 | `curl -m 3 http://<公网IP>:30093/server_info` | 连不上 |
+| 推理端口不在公网 | `curl -m 3 http://<公网IP>:<9002 的映射端口>/server_info` | 连不上 |
 | 9001/9002 空转 | `ss -lntp \| grep -E ':(9001\|9002) '` | 无输出 |
 | worker 就绪 | `curl -s localhost:8001/workers` | `prefill_count=1 decode_count=1`，两个 `is_healthy=true` |
 | 显存到位 | `nvidia-smi --query-gpu=memory.used --format=csv` | 每卡约 73.5 / 80 GB |
