@@ -345,7 +345,7 @@ python3 /root/talea-deploy/ops/check-ailog.py /root/talea-ai-access.jsonl
 
 | 行 | 现象 | 真因 | 现状 |
 | --- | --- | --- | --- |
-| L2 / L106 / L107 | 200 + stream，三个 token 全缺 | 三个都来自同一个客户端（UA `Python-urllib/3.12`），请求里**没带** `stream_options.include_usage`；sglang 不主动在流里返回 usage，旧 Router 也不代填。**同一 UA 的 6 条流式里另外 3 条就有 usage** ⇒ 差别在这一次请求带没带参数，不在网关 | 已修：Router 加 `--force-stream-usage`，对带 `stream_options` 的流式路由代填该字段（`router.rs:523`），客户端不用改 |
+| L2 / L106 / L107 | 200 + stream，三个 token 全缺 | 三个都来自同一个客户端（UA `Python-urllib/3.12`），请求里**没带** `stream_options.include_usage`；sglang 不主动在流里返回 usage，旧 Router 也不代填。**同一 UA 的 6 条流式里另外 3 条就有 usage** ⇒ 差别在这一次请求带没带参数，不在网关 | 已修：Router 加 `--force-stream-usage`，对 `/v1/chat/completions`、`/v1/completions` 这两条接受 `stream_options` 的路由代填（`router.rs:523` / `890`），客户端不用改——代价是多收到一帧用量分片，见 §10.4 |
 | L114 | `/generate` 流式，1/4 但缺 total | 当时 total 完全取决于上游那次有没有给；**同接口同数字的 L119 就有 total**（`curl/8.5.0` 两条），说明不是接口固定行为，而是"给了就抄、不给就没有" | 已修（`f4493fa`）：`total_token` 缺失时用 `input+output` 推导，`ai_access_log.rs:565` 有注释和用例 `meta_info_without_a_total_still_writes_one` |
 
 所以平台在 §5.1 列出的四种可能里，**是第 1/2 种（请求侧未开启 usage），不是"网关没消费"
@@ -367,3 +367,70 @@ python3 /root/talea-deploy/ops/check-ailog.py /root/talea-ai-access.jsonl
 以上"新样本"结论只用本地已导出的两个文件验证过；等能登录后应再做一次：
 `export-ailog.sh 5000` → `analyze_ailog.py`，确认 `partial token triple = 0` 且
 `/generate` 流式全部带 `total_token`。
+
+---
+
+## 10. 用模拟后端重放这几种情况（2026-11-02）
+
+没有 GPU 也能验证那两处修复：`llm-d-inference-sim`（Go 写的假后端）当 worker，11-01 那个
+release 二进制当 Router，两者都跑在跳板机上，不碰集群。脚本
+`deploy/kunhaoyuan/ops/sim-stream-check.sh`，四组断言八条检查，最后一次运行全部通过。
+
+### 10.1 为什么这个 sim 能当替身
+
+它决定要不要在流里给 usage 的条件是
+`sendUsageData = true; if IsStream() { sendUsageData = IncludeUsage() }`
+（`pkg/endpoint/request.go:265`）——**流式、且请求没要 usage，就一帧都不给**。这与本文对
+L2/L106/L107 推断的上游行为是同一件事，所以在它上面能不能复现，本身就是对归因的检验。
+
+替代范围必须说清楚：只对 `/v1/chat/completions` 成立。它的 `/generate` 只由 vllm 引擎注册、
+路径是 `/inference/v1/generate`，返回的是 `usage` 对象而不是 sglang 的 `meta_info`
+（`pkg/api/response.go:715`），**不能**拿来验证 L114 那条路。L114 的形态用 §10.3 的办法单独造。
+
+### 10.2 复现出来的就是线上那三条
+
+| 组 | Router 参数 | 客户端请求 | ai_log 里的 token | 客户端拿到的 usage |
+| --- | --- | --- | --- | --- |
+| 1 | 无 `--force-stream-usage` | 流式，没要 usage | **三个都没有** | `"usage":null` |
+| 2 | 无 | 流式，`include_usage:true` | 8 / 2 / 10 | 有 |
+| 3 | `--force-stream-usage` | 流式，没要 usage | 8 / 4 / 12 | 有 |
+
+第 1 组写出的 ai_log 逐字如下：
+
+```json
+{"gateway_type":"nightgw","request_model":"testmodel","response_type":"stream","llm_first_token_duration":1,"llm_service_duration":1}
+```
+
+`response_type` 是 `stream`、`response_code` 是 200、三个 token 一个没有，与线上 L2/L106/L107
+完全同形。也就是说那个 30.77% 不需要 GPU 就能重放，不是"只有在集群里才出现"的现象。
+
+### 10.3 total 兜底：单独造一个缺陷上游
+
+sim 永远会把 total 填上，所以另起一个**只删 `total_tokens`** 的透传代理
+（`deploy/kunhaoyuan/ops/strip_total.py`），造出 L114 那种"给了 in/out 没有 total"的形态：
+
+- 客户端收到 `{"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{...}}`，**没有 total**
+- Router 的 ai_log 写 `input_token:8, output_token:3, total_token:11`
+- 客户端收到的那个对象一个字节没变 ⇒ **兜底只修日志，不改响应**
+
+### 10.4 顺带被实测确认的一个对外行为
+
+`force_include_usage`（`router.rs:905`）是直接覆盖，不是"仅在缺失时补"：客户端写
+`include_usage:false` 也会被改成 `true`。所以开着 `--force-stream-usage` 时，**没要 usage 的
+客户端也会在流末尾多收到一帧 `choices: []` + `usage` 的分片**——第 3 组比第 1 组多的就是这一帧。
+
+`deploy/kunhaoyuan/README.md` 早已记过这条，现在有实测支撑。但交接文档 §5 之前反着写
+（"不要 usage 就没有用量"），已一并修正：按 `chunk.choices[0].delta` 取值的客户端要防空
+`choices`。
+
+### 10.5 复跑
+
+```bash
+# 跳板机上，两个二进制就位后
+SIM_BIN=/root/simtest/sim-linux \
+ROUTER_BIN=/root/builds/sglang-router-target/release/sgl-model-gateway \
+./sim-stream-check.sh
+```
+
+sim 的随机长度每次不同，所以脚只比较"有没有 token / 有没有 usage 对象"，不比较分片数——
+同一份请求体连发两次得到的分片数都不一样，按分片数断言会假红。

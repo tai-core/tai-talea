@@ -217,13 +217,16 @@ curl -s http://10.66.0.1/v1/chat/completions \
 
 OpenAI SDK 直接把 `base_url` 指到 `http://10.66.0.1/v1` 即可。
 
-**必须知道的三个坑：**
+**必须知道的四个坑：**
 
 1. **`max_tokens` 至少 1024，建议 2048。** 这是 reasoning 模型，先吐
    `reasoning_content`，思维链要吃 300~700 tokens。给 512 会得到
    `finish_reason=length` 且 `content` 为空字符串——看着像接口坏了，其实不是。
-2. **流式要 `stream_options: {"include_usage": true}` 才有 usage**；否则末帧没有用量。
-   首帧实测 0.26 s，109 帧 1.5 s 走完。
+2. **流式不用自己带 `stream_options`，用量一定会来。** 部署里开了 `--force-stream-usage`
+   （`30-router.yaml:110`），Router 会把上游请求的 `include_usage` 置为 true，所以末帧一定
+   有一个用量分片——你甚至显式写 `include_usage: false` 也一样。代价是**那一帧的 `choices`
+   是空数组**，按 `chunk.choices[0].delta` 取值的客户端要防越界。实测见
+   `docs/ailog-conformance-2026-11-01.md` §10.4。
 3. **429 是正常的背压，不是故障。** 池级上限 192，拒绝会带
    `{"error":{"code":"concurrency_limit"}}` 与 `Retry-After: 1`，客户端按 1 秒退避重试即可。
    429 的 p95 只有 177 ms，不会拖住你。
