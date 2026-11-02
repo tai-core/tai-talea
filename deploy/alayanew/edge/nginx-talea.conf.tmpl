@@ -1,0 +1,57 @@
+# The only thing the platform publishes: 8000 -> 30020.
+#
+# Everything behind it - Router on 8001, control plane on 8787, sglang on 9102 -
+# stays inside the container. The two ports the platform *forces* open (9001 and
+# 9002) have no listener at all, which is the whole reason the services were
+# moved off them; see ../README.md §3.1.
+#
+# Rendered by cci-edge.sh from this template. Do not edit the rendered file:
+# the next `up` overwrites it.
+
+# Who may call the inference surface.
+# `Bearer <key>` and a bare `<key>` are both accepted - the first is what OpenAI
+# SDKs send, the second is what people type after reading a curl example.
+map $http_authorization $talea_key_ok {
+    default                  0;
+    "Bearer __API_KEY__"     1;
+    "__API_KEY__"            1;
+}
+
+server {
+    listen 8000;
+    server_name _;
+
+    access_log /opt/tai-talea/logs/edge-access.log;
+    error_log  /opt/tai-talea/logs/edge-error.log warn;
+    client_max_body_size 32m;
+
+    # Liveness without a key: a monitor should not need the secret, and this
+    # path touches no model.
+    location = /health {
+        proxy_pass http://127.0.0.1:8001/health;
+        proxy_read_timeout 10s;
+    }
+
+    # Inference. Buffering must be off or SSE arrives in one lump at the end.
+    location /v1/ {
+        if ($talea_key_ok = 0) {
+            return 401;
+        }
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # Everything else - /metrics, /server_info, /workers, /state/*, and the
+    # sglang admin endpoints - is not part of the contract. 403 distinguishes
+    # "path not allowed" from "key missing" (401).
+    location / {
+        return 403;
+    }
+}
