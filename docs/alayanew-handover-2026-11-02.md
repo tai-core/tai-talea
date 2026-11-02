@@ -147,11 +147,11 @@ curl -s -H "Authorization: Bearer $T" http://127.0.0.1:8787/v1/capacity/console
 ### 5.2 起 / 停
 
 ```bash
-# 四个脚本，都在 deploy/alayanew/（已入库，2026-11-02 收尾时收的）
+# cwd = deploy/alayanew/（脚本已入库，2026-11-02 收尾时收的）；日常就这四条
 bash ops/cci-unpack-runtime.sh   # 铺运行时（容器重建后必跑，约 2 分钟）
 bash ops/cci-config.sh           # 写 /etc/tai-talea/tai-talea.yaml 并校验（凭据走环境变量）
 bash ops/cci-start-plane.sh      # 起 Router(127.0.0.1:8001) + 控制面，控制面自己拉 sglang
-bash edge/cci-edge.sh up         # 起对外门面（nginx + 可选 wg），见 §6.5
+bash edge/cci-edge.sh up         # 起对外门面（nginx；wg 在本平台是空转，见 §6.5）
 ```
 
 停：`pkill -x tai-talea` / `kill <router pid>`。控制面不托管 Router，两者分别起停。

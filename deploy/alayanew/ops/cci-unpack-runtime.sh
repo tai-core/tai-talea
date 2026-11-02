@@ -68,4 +68,14 @@ print("sglang", sglang.__version__)
 print("torch", torch.__version__, "cuda", torch.version.cuda, "avail", torch.cuda.is_available())
 print("glm5 OK", Glm5NextForConditionalGeneration.__name__)
 EOF
+
+# Both tarballs carry the control node's /etc/tai-talea/tai-talea.yaml, tenant
+# AK/SK included. The container that runs the control plane needs it (and
+# cci-config.sh regenerates it anyway); a worker never reads it - bootstrap is
+# started with --profile - so keeping it there only spreads the credentials.
+if [ "${TALEA_WORKER_ONLY:-0}" = 1 ]; then
+  rm -f /etc/tai-talea/tai-talea*.yaml
+  echo "worker-only: removed the control plane config (AK/SK does not belong here)"
+fi
+
 echo "== restore done $(date -u +%FT%TZ) =="

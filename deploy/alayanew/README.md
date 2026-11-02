@@ -59,6 +59,9 @@ bash ops/cci-unpack-runtime.sh
 先校验 `SHA256SUMS`，最后断言 `sglang 0.5.22 / torch 2.14.1+cu130 / Glm5NextForConditionalGeneration`。
 镜像自带的 sglang 是 **0.5.3rc0，不认识 `glm5_next`**，不能直接用。
 
+> **第二台（纯 worker）加 `TALEA_WORKER_ONLY=1`**：tar 里带着控制节点的
+> `/etc/tai-talea/tai-talea.yaml`（含平台 AK/SK），worker 从不读它，解完就该删。
+
 现役二进制与配置另有一份 `live-2026-11-02.tar.gz`（控制面 `0.9.1-cci` + Router + `/etc/tai-talea/*`），
 解包：`tar -xzf live-2026-11-02.tar.gz -C / && chmod +x /root/tai-talea /root/sgl-model-gateway`。
 
