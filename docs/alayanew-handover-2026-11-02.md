@@ -15,7 +15,11 @@
 
 ---
 
-## 1. 当前状态（2026-11-02 15:20）
+## 1. 当前状态（2026-11-02 15:30）
+
+> **收尾结果**：两台实例已于 `2026-11-02 15:26` **release**，实例列表已清空（0 条）。
+> 权重与全部运行时制品留在 NAS，下一步要重建按 §6 走，约 25 分钟。
+> 下表记录的是**释放前最后一刻**的现场，取证与判据以此为准。
 
 | 项 | 状态 |
 | --- | --- |
@@ -318,7 +322,7 @@ sglang 自杀 → bootstrap 记 `exit -9` → 控制面判 `sglang process faile
 | 控制面 admin token | 同上（`server.admin_token`）；也不在仓库 |
 | 实例 SSH 密码 | `POST /cci/instance/{id}/get-ssh` 现取，每次可能不同 |
 | 权重 | NAS `c1efadd1-…` → `/root/gongji/GLM-5.3-Flash`（306 GB，随 NAS 保留，**不随实例释放而丢失**） |
-| 运行时制品 | NAS `/root/gongji/tai-talea-runtime/`（3 个 tar + SHA256SUMS） |
+| 运行时制品 | NAS `/root/gongji/tai-talea-runtime/`：`venv-0.5.22-cu130.tar`(11.2G)、`tai-talea-bits.tar`、`jit-caches.tar`、`SHA256SUMS`、**`live-2026-11-02.tar.gz`**（释放前的现役二进制+配置） |
 | 验收报告 | `docs/alayanew-1p1d-acceptance-2026-10-26.md` |
 | 容量/配额取证 | `docs/alayanew-capacity-probe-2026-10-26.md` |
 | 自动化 review | `docs/alayanew-automation-review-2026-10-27.md` |
@@ -356,4 +360,27 @@ sglang 自杀 → bootstrap 记 `exit -9` → 控制面判 `sglang process faile
 | 2026-10-27 15:10 | 控制面 `0.9.1-cci` 上线（WaitCreation 修好） |
 | 2026-11-01 00:54:00 | 外部 `POST /update_weights_from_tensor`（172.31.71.18） |
 | 2026-11-01 00:54:19 | **重启循环开始** |
-| 2026-11-02 15:20 | 收尾取证：122 轮、每轮 17.5 分钟、服务 100% 不可用 |
+| 2026-11-02 15:18:07 | 该轮**完整启动成功**（加载 + PD warmup 全过），6 秒后被外部 `begin_weight_update` 打崩 |
+| 2026-11-02 15:23 | 现役二进制与配置备份到 NAS：`live-2026-11-02.tar.gz`（39 MB） |
+| 2026-11-02 15:26 | **两台实例 release**，实例列表清空 |
+
+---
+
+## 12. 收尾做了什么
+
+| 动作 | 结果 |
+| --- | --- |
+| 只读盘点两台实例 | 进程、GPU、日志、端口、NAS 制品全部核对；**未改动任何服务** |
+| 定位 decode 循环根因 | 126 次外部 `POST /begin_weight_update` ↔ 122 轮崩溃，一一对应（§7.1） |
+| 尝试关 9002 公网映射 | **失败**：`{"status":100021,"message":"系统端口不可移除"}`（§7.2） |
+| 备份现役件到 NAS | `/root/gongji/tai-talea-runtime/live-2026-11-02.tar.gz`，39,343,801 B，sha256 `2a648d51…61173`，含 `root/tai-talea`(0.9.1-cci)、`root/sgl-model-gateway`、`etc/tai-talea/*`（配置 + profile + bootstrap-token + onboarding） |
+| 释放实例 | `glm53-pd3` 15:25、`glm53-pd2` 15:26，均 `HTTP 200 {"status":200,"message":"OK"}`；列表回到 0 条 |
+| 代码 | 本文档 `8188fee`，已推 `origin/main` |
+
+**没做的事**（下次接手时按 §10 的顺序补）：没修 9002 暴露面、没把 CCI 脚本入仓、
+没做控制面自启、没动日志轮转。
+
+**重建时多一步**：`cci-unpack-runtime.sh` 只认 10-26 的三个 tar；现役件在
+`live-2026-11-02.tar.gz` 里，解包用 `tar -xzf live-2026-11-02.tar.gz -C /`，
+解完 `chmod +x /root/tai-talea /root/sgl-model-gateway`。配置里的 `advertise_hosts`
+必须换成新实例的内网 IP，否则控制面探不到 worker。
