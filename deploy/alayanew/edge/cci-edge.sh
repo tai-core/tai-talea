@@ -27,6 +27,14 @@ say() { printf '%s\n' "$*"; }
 
 need_key() {
   : "${TALEA_API_KEY:?set TALEA_API_KEY (e.g. openssl rand -hex 16) - the door has no other authentication}"
+  # The key is spliced into a sed replacement and an nginx map pattern. `|`, `&`,
+  # `\` and whitespace all mean something in one of the two, and a key that
+  # renders into a broken map fails at `nginx -t` or, worse, matches nothing.
+  case "$TALEA_API_KEY" in
+    *[!A-Za-z0-9_-]*)
+      say "!! TALEA_API_KEY may only contain A-Z a-z 0-9 _ - (got ${#TALEA_API_KEY} chars)"
+      return 1 ;;
+  esac
 }
 
 # --------------------------------------------------------------------- probe
@@ -68,7 +76,7 @@ probe() {
 
 # ------------------------------------------------------------------------ up
 render_conf() {
-  need_key
+  need_key || return 1
   install -d -m 755 "$LOG_DIR"
   sed "s|__API_KEY__|${TALEA_API_KEY}|g" "$EDGE_DIR/nginx-talea.conf.tmpl" > "$CONF"
   chmod 600 "$CONF"
