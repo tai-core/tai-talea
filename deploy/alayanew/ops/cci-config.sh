@@ -13,38 +13,92 @@
 #                      /begin_weight_update and killed the decode worker
 #                      126 times on 2026-11-01)
 #   8001  router      (8000 is taken by the nginx door in edge/)
+#   8998  PD bootstrap (prefill's KV handshake port, registered with the
+#                      Router so decode knows where to pull KV from)
+#
+# The write is transactional: the candidate lands in tai-talea.next.yaml, the
+# real binary validates it, and only a passing candidate replaces the live
+# file. A rejected candidate is left next to the live config for inspection
+# and the script exits non-zero - a config the control plane cannot load must
+# never look like a successful config run.
 #
 # Everything secret comes from the environment; this repository is public.
-set -u
+set -eu
+
+die() { printf '!! %s\n' "$*" >&2; exit 1; }
 
 : "${TALEA_ADMIN_TOKEN:?set TALEA_ADMIN_TOKEN (openssl rand -hex 16)}"
+# The worker bootstrap authenticates with this same token; generating one here
+# at random would silently desynchronize the two sides (worker 401 on every
+# start), so it must be provided by the operator, not invented.
+: "${TALEA_BOOTSTRAP_TOKEN:?set TALEA_BOOTSTRAP_TOKEN - the same value the workers run with}"
 : "${TALEA_ALAYA_AK:?set TALEA_ALAYA_AK}"
 : "${TALEA_ALAYA_SK:?set TALEA_ALAYA_SK}"
 : "${TALEA_ADVERTISE_HOSTS:?set TALEA_ADVERTISE_HOSTS as name=ip[,name=ip]}"
+: "${TALEA_NAS_STORAGE_ID:?set TALEA_NAS_STORAGE_ID}"
+
+# Testability overrides: the defaults are the real deployment paths; G0 runs
+# the same script against a sandbox root and a locally built binary.
+CONFIG_DIR=${TALEA_CONFIG_DIR:-/etc/tai-talea}
+STATE_DIR=${TALEA_STATE_DIR:-/var/lib/tai-talea}
+TALEA_BIN=${TALEA_BIN:-/root/tai-talea}
+CONFIG="$CONFIG_DIR/tai-talea.yaml"
+CANDIDATE="$CONFIG_DIR/tai-talea.next.yaml"
 
 PUSH_TOKEN=${TALEA_PUSH_TOKEN:-$(openssl rand -hex 8)}
 PUSH_SECRET=${TALEA_PUSH_SECRET:-$(openssl rand -hex 16)}
-BOOTSTRAP_TOKEN=${TALEA_BOOTSTRAP_TOKEN:-$(openssl rand -hex 16)}
 AIDC_ID=${TALEA_AIDC_ID:-2}
 PRODUCT_CODE=${TALEA_PRODUCT_CODE:-skus.cci.gpu.h100.80gb.hbm3.b11.a2.5.11.s20a46b:2}
 IMAGE=${TALEA_IMAGE:-registry.hd-02.alayanew.com:8443/alayanew-public/sglang:20250930}
-NAS_STORAGE_ID=${TALEA_NAS_STORAGE_ID:?set TALEA_NAS_STORAGE_ID}
 NAS_DIR=${TALEA_NAS_DIR:-glm53-weights}
 NAS_MOUNT=${TALEA_NAS_MOUNT:-/root/gongji}
+# The runtime on the NAS is a validated virtualenv, not a wheelhouse; starts
+# must not try to pip-install anything (image_profile.environment_mode).
+MIN_HOSTS=${TALEA_MIN_HOSTS:-2}
 
 # "glm53-pd2=172.19.166.190,glm53-pd3=172.19.232.225" -> indented YAML pairs.
 # These are the container-internal addresses: Router health checks and PD
 # disaggregation both originate inside the same network, where the public
-# ingress is a hairpin that never completes.
-ADVERTISE=$(printf '%s' "$TALEA_ADVERTISE_HOSTS" | tr ',' '\n' | awk -F= '
-  NF==2 { printf "        %s: %s\n", $1, $2 }
-')
+# ingress is a hairpin that never completes. A malformed entry used to be
+# dropped silently by awk - the generated YAML then missed a worker and the
+# pull loop simply never saw it, so every entry is validated here instead.
+ADVERTISE=""
+HOST_COUNT=0
+declare -A SEEN_NAME=()
+for pair in $(printf '%s' "$TALEA_ADVERTISE_HOSTS" | tr ',' ' '); do
+  name=${pair%%=*}
+  host=${pair#*=}
+  [ "$name" != "$pair" ] || die "advertise host entry '$pair' is not name=ip"
+  case "$name" in
+    # '-' and '_' are fine *inside* the name (glm53-pd2); only leading/trailing
+    # edges and characters outside the set are a mistake.
+    -*|*-) die "advertise host name '$name' must not start or end with '-'" ;;
+    *[!A-Za-z0-9._-]*) die "advertise host name '$name' is not a valid instance name" ;;
+  esac
+  [ -z "${SEEN_NAME[$name]:-}" ] || die "duplicate advertise host name '$name'"
+  SEEN_NAME[$name]=1
+  case "$host" in
+    *.*.*) ;;  # dotted quad
+    *) die "advertise host '$host' must be a bare IPv4 address" ;;
+  esac
+  for octet in $(printf '%s' "$host" | tr '.' ' '); do
+    case "$octet" in
+      ''|*[!0-9]*) die "advertise host '$host' is not a valid IPv4 address" ;;
+    esac
+    [ "$octet" -le 255 ] || die "advertise host '$host' has an octet above 255"
+  done
+  ADVERTISE="${ADVERTISE}        ${name}: ${host}
+"
+  HOST_COUNT=$((HOST_COUNT + 1))
+done
+[ "$HOST_COUNT" -ge "$MIN_HOSTS" ] || die "expected at least $MIN_HOSTS advertise hosts (a 1P1D deployment needs two), got $HOST_COUNT"
 
-# The bits tarball normally creates both, but a config run on a bare container
-# should not fail on a missing directory.
-install -d -m 700 /etc/tai-talea /var/lib/tai-talea
+mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+# 700 matters on the deployment host; a dev sandbox (Windows) cannot chmod, so
+# the failure is tolerated rather than aborting a perfectly good config run.
+chmod 700 "$CONFIG_DIR" "$STATE_DIR" 2>/dev/null || true
 
-cat > /etc/tai-talea/tai-talea.yaml <<YAML
+cat > "$CANDIDATE" <<YAML
 # tai-talea control plane on the Jiuzhang CCI platform.
 #
 # Generated by deploy/alayanew/ops/cci-config.sh - do not edit in place, change
@@ -58,7 +112,7 @@ server:
   shutdown_timeout: 10s
 
 storage:
-  sqlite_path: /var/lib/tai-talea/tai-talea.db
+  sqlite_path: ${STATE_DIR}/tai-talea.db
 
 controller:
   reconcile_interval: 10s
@@ -78,7 +132,7 @@ controller:
   # multi-GPU reload, and the reload is what the caller sees as an outage.
   start_timeout: 90m
   health_failure_threshold: 3
-  bootstrap_token: ${BOOTSTRAP_TOKEN}
+  bootstrap_token: ${TALEA_BOOTSTRAP_TOKEN}
   model_id: zai-org/GLM-5.3-Flash
   model_path: ${NAS_MOUNT}/GLM-5.3-Flash
   # Every flag here is on the bootstrap's allowlist (bootstrap/roles.py).
@@ -101,12 +155,22 @@ controller:
     - "--enable-cache-report"
     - "--disable-flashinfer-autotune"
     - "--disaggregation-transfer-backend mooncake_tcp"
+    # Explicit, because the Router registration depends on it matching
+    # router.prefill_bootstrap_port below: decode pulls KV from the prefill's
+    # bootstrap on this port. An omitted flag defaults to the same 8998 today,
+    # but the pairing is load-bearing, so both sides say it out loud.
+    - "--disaggregation-bootstrap-port 8998"
 
 router:
   name: primary
   url: http://127.0.0.1:8001
   mode: readiness-v1
   timeout: 10s
+  # The port of the disaggregation bootstrap server on the prefill worker.
+  # Zero would omit the field from the Router registration entirely, leaving
+  # the Router nothing to inject: every worker would look healthy while no PD
+  # request can ever complete.
+  prefill_bootstrap_port: 8998
 
 planner:
   gear: "1:1"
@@ -127,20 +191,21 @@ alerts:
   ratio_tolerance: 0.15
 
 # The container is the platform's sglang image (Ubuntu 22.04, CUDA 12.9,
-# Python 3.12, sglang 0.5.3rc0). The wheelhouse is deliberately empty: the
-# runtime is unpacked from the shared volume, nothing is installed offline.
+# Python 3.12, sglang 0.5.3rc0). The runtime is the validated venv unpacked
+# from the shared volume - prebuilt, not a wheelhouse install - so starts must
+# skip environment preparation; the node has no wheelhouse to install from.
 image_profile:
   os: ubuntu-22.04
   cuda: "12.9"
   python: "3.12"
-  sglang: "0.5.x"
+  sglang: "0.5.22"
   wheelhouse: /opt/tai-talea/wheelhouse
   virtualenv: /opt/tai-talea/venv
+  environment_mode: prebuilt
 
 partners:
   - id: alayanew
     adapter: alayanew
-    console_token: ${TALEA_ADMIN_TOKEN}
     push_token: ${PUSH_TOKEN}
     push_secret: ${PUSH_SECRET}
     hmac_tolerance: 5m
@@ -153,12 +218,13 @@ partners:
         - zai-org/GLM-5.3-Flash
       # 9101/9102, not 9001/9002: the platform publishes those two to the
       # internet and refuses to remove them, so they must stay unbound.
+      # (The config validator refuses 9001/9002 outright.)
       bootstrap_port: 9101
       service_port: 9102
       product_code: ${PRODUCT_CODE}
       compute_resource: EXCLUSIVE
       image: ${IMAGE}
-      nas_storage_id: ${NAS_STORAGE_ID}
+      nas_storage_id: ${TALEA_NAS_STORAGE_ID}
       nas_file_directory: ${NAS_DIR}
       nas_mount_path: ${NAS_MOUNT}
       nas_read_only: true
@@ -169,11 +235,16 @@ partners:
 ${ADVERTISE}
 YAML
 
-chmod 600 /etc/tai-talea/tai-talea.yaml
+chmod 600 "$CANDIDATE"
 
-echo "===== check-config (the binary validates the file, nothing starts) ====="
-OUT=$(/root/tai-talea -config /etc/tai-talea/tai-talea.yaml -check-config 2>&1)
-RC=$?
-echo "$OUT" | tail -20
-echo "check_rc=$RC"
-ls -la /etc/tai-talea/tai-talea.yaml
+echo "===== check-config (the real binary validates the candidate; nothing starts) ====="
+if ! "$TALEA_BIN" -config "$CANDIDATE" -check-config; then
+  echo "!! the generated configuration was rejected; it is kept at $CANDIDATE for inspection and the live config was NOT touched" >&2
+  exit 1
+fi
+mv -f "$CANDIDATE" "$CONFIG"
+chmod 600 "$CONFIG"
+
+echo "===== installed $CONFIG ====="
+ls -la "$CONFIG"
+echo "bootstrap token: the workers must run with the same TALEA_BOOTSTRAP_TOKEN value"

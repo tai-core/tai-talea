@@ -147,9 +147,10 @@ curl -s -H "Authorization: Bearer $T" http://127.0.0.1:8787/v1/capacity/console
 ### 5.2 起 / 停
 
 ```bash
-# cwd = deploy/alayanew/（脚本已入库，2026-11-02 收尾时收的）；日常就这四条
-bash ops/cci-unpack-runtime.sh   # 铺运行时（容器重建后必跑，约 2 分钟）
-bash ops/cci-config.sh           # 写 /etc/tai-talea/tai-talea.yaml 并校验（凭据走环境变量）
+# cwd = deploy/alayanew/（脚本已入库，2026-11-02 收尾时收的）；完整顺序见 deploy/alayanew/README.md §2
+bash ops/cci-unpack-runtime.sh   # 铺运行时（两台都跑，容器重建后必跑，约 2 分钟）
+bash ops/cci-start-worker.sh     # 起 worker 侧 9101 bootstrap（两台都跑；token 与控制面一致）
+bash ops/cci-config.sh           # 写 /etc/tai-talea/tai-talea.yaml（候选→真实预检→原子替换）
 bash ops/cci-start-plane.sh      # 起 Router(127.0.0.1:8001) + 控制面，控制面自己拉 sglang
 bash edge/cci-edge.sh up         # 起对外门面（nginx；wg 在本平台是空转，见 §6.5）
 ```
@@ -206,10 +207,16 @@ bash deploy/alayanew/ops/cci-unpack-runtime.sh
 ⛔ `tar --exclude` 在 create 模式是**位置相关**的，写在成员路径后面会静默失效，
 曾把 venv 又打一遍（11 GB 而不是 200 MB）。
 
-### 6.3 起控制面
+### 6.3 起 worker bootstrap → 起控制面
 
 ```bash
-bash deploy/alayanew/ops/cci-config.sh        # 校验配置（会打印 check_rc）
+# 两台 worker 都要跑；token 与控制面必须一致（见 deploy/alayanew/README.md §2③）
+export TALEA_BOOTSTRAP_TOKEN=$(openssl rand -hex 16)
+bash deploy/alayanew/ops/cci-start-worker.sh
+
+# 只在控制面那台；先写候选配置、真实 -check-config、通过才替换
+export TALEA_BOOTSTRAP_TOKEN=<与上面相同的值>
+bash deploy/alayanew/ops/cci-config.sh
 bash deploy/alayanew/ops/cci-start-plane.sh   # Router + 控制面
 ```
 

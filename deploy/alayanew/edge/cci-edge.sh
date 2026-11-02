@@ -55,18 +55,24 @@ probe() {
   else
     say "nginx             no  -> 'up' will try apt-get install -y nginx"
   fi
-  # CAP_NET_ADMIN check that leaves nothing behind.
+  # CAP_NET_ADMIN check that leaves nothing behind. The result feeds the
+  # verdict below - a container without it cannot create wg0, and a verdict
+  # that ignored this check would point at a tunnel that can never come up.
+  cap="no"
   if command -v ip >/dev/null 2>&1; then
     if ip link add talea-cap-test type dummy 2>/dev/null; then
       ip link del talea-cap-test 2>/dev/null
+      cap="yes"
       say "CAP_NET_ADMIN     yes"
     else
       say "CAP_NET_ADMIN     NO  -> cannot create interfaces (WireGuard out, nginx still fine)"
     fi
+  else
+    say "ip tool           no  -> cannot test CAP_NET_ADMIN"
   fi
   say ""
   say "verdict: $(
-    if [ -c /dev/net/tun ] && command -v wg >/dev/null 2>&1 && command -v ip >/dev/null 2>&1; then
+    if [ -c /dev/net/tun ] && [ "$cap" = "yes" ] && command -v wg >/dev/null 2>&1; then
       echo "wg0 can be brought up, but CCI publishes TCP only - no peer can reach it; the door still faces the internet"
     else
       echo "no tunnel (and CCI maps no UDP anyway) - the door listens on 0.0.0.0:8000 and the API key is the only defence"
@@ -78,9 +84,13 @@ probe() {
 render_conf() {
   need_key || return 1
   install -d -m 755 "$LOG_DIR"
-  sed "s|__API_KEY__|${TALEA_API_KEY}|g" "$EDGE_DIR/nginx-talea.conf.tmpl" > "$CONF"
-  chmod 600 "$CONF"
-  say "rendered $CONF"
+  # Render to a sibling candidate first: conf.d/*.conf does not match
+  # talea.conf.new, so the candidate is inert until it is moved into place.
+  # Nothing overwrites the live config before it has passed nginx -t.
+  sed "s|__API_KEY__|${TALEA_API_KEY}|g" "$EDGE_DIR/nginx-talea.conf.tmpl" > "$CONF.new" \
+    || { rm -f "$CONF.new"; say "!! failed to render the candidate"; return 1; }
+  chmod 600 "$CONF.new" 2>/dev/null || true
+  say "rendered candidate $CONF.new"
 }
 
 start_nginx() {
@@ -94,13 +104,43 @@ start_nginx() {
   # The distribution's default site also listens on 80; harmless, but it is an
   # unauthenticated page, so drop it.
   rm -f /etc/nginx/sites-enabled/default
-  nginx -t 2>&1 | tail -3 || return 1
-  if pgrep -x nginx >/dev/null; then
-    nginx -s reload && say "nginx reloaded"
-  else
-    nginx && say "nginx started"
+  # Step 1: the config as it stands must be valid - if it is not, the problem
+  # predates this run and swapping files would only confuse the post-mortem.
+  if ! nginx -t >/dev/null 2>&1; then
+    { nginx -t; } 2>&1 | tail -3 || true
+    say "!! the current nginx config is invalid; refusing to touch it"
+    return 1
   fi
-  ss -lntp 2>/dev/null | grep ':8000 ' || say "!! nothing is listening on 8000"
+  # Step 2: swap in the candidate, then test the result as the live config.
+  # `nginx -t 2>&1 | tail` would report tail's exit status and mask the failure,
+  # which is how a broken key render could look like a deployed door.
+  local backup=""
+  if [ -f "$CONF" ]; then
+    cp "$CONF" "$CONF.bak" && backup="$CONF.bak"
+  fi
+  mv "$CONF.new" "$CONF" || return 1
+  if ! nginx -t >/dev/null 2>&1; then
+    say "!! the rendered config failed nginx -t; restoring the previous one"
+    { nginx -t; } 2>&1 | tail -3 || true
+    if [ -n "$backup" ]; then mv -f "$backup" "$CONF"; else rm -f "$CONF"; fi
+    return 1
+  fi
+  [ -n "$backup" ] && rm -f "$backup"
+  # Step 3: apply, then prove the listener exists before claiming success.
+  if pgrep -x nginx >/dev/null; then
+    nginx -s reload || { say "!! nginx -s reload failed"; return 1; }
+    say "nginx reloaded"
+  else
+    nginx || { say "!! nginx failed to start"; return 1; }
+    say "nginx started"
+  fi
+  local ok=""
+  for _ in $(seq 1 10); do
+    ss -lnt 2>/dev/null | grep -q ':8000 ' && { ok=1; break; }
+    sleep 1
+  done
+  [ -n "$ok" ] || { say "!! nothing is listening on 8000 after the reload"; return 1; }
+  say "ok: nginx is listening on :8000"
 }
 
 start_wg() {

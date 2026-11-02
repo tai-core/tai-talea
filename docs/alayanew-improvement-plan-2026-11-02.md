@@ -95,7 +95,9 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 ### P0-1 配置生成器生成非法配置，且校验失败可能被脚本掩盖
 
-**状态：已复现。**
+**状态：已修复（2026-11-02，G0 沙箱验收通过）。** `cci-config.sh` 重写为 `set -eu` + 事务写（候选 `tai-talea.next.yaml` → 真实二进制 `-check-config` → 原子 `mv`），删除 `console_token`，`TALEA_BOOTSTRAP_TOKEN` 必填，`image_profile.sglang` 钉住 `0.5.22`。G0 负向注入（token 缺失、非法 host、IP 越界、check 失败模拟）全部非零退出且正式配置未被污染。
+
+原始问题：
 
 **位置：**
 
@@ -120,7 +122,9 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 ### P0-2 新配置缺少 PD 的 8998 注册信息
 
-**状态：代码审查已确认；实际故障表现待真机。**
+**状态：配置侧已修复（2026-11-02）。** 生成配置现含 `router.prefill_bootstrap_port: 8998` 与 `--disaggregation-bootstrap-port 8998`（extra_sglang_args）。实际注册与 Mooncake KV 传输仍属「待真机」，G2 验收。
+
+原始状态：代码审查已确认；实际故障表现待真机。
 
 **位置：**
 
@@ -140,7 +144,9 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 ### P0-3 NAS prebuilt 运行时与 bootstrap 默认安装语义冲突
 
-**状态：代码路径冲突已确认；NAS 是否碰巧含有可掩盖问题的 requirements 待查。**
+**状态：代码侧已修复（2026-11-02）。** 新增 `image_profile.environment_mode: prebuilt|wheelhouse`（含校验测试）；`StartRequest.PrepareEnvironment *bool`（`internal/launcher/client.go` + `start_payload_test.go` 断言 JSON 契约）；controller 在 prebuilt 模式下发 `false`，其余平台默认语义不变。跨组件真实 HTTP 集成测试待 G1。
+
+原始状态：代码路径冲突已确认；NAS 是否碰巧含有可掩盖问题的 requirements 待查。
 
 **位置：**
 
@@ -163,7 +169,9 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 ### P0-4 手工重建流程没有启动 worker bootstrap，也没有同步 token
 
-**状态：代码与文档审查已确认。**
+**状态：已修复（2026-11-02）。** 新增 `deploy/alayanew/ops/cci-start-worker.sh`（token 必填、preflight、9001/9002 空转检查、启动后带 token 200 / 错 token 401 断言）；README 部署顺序重排为 7 步（解包 → worker bootstrap ×2 → 配置 → 控制面 → 门面 → 验证）；交接文档 §5.2/§6.3 同步更新。真机执行待 G1。
+
+原始状态：代码与文档审查已确认。
 
 **位置：**
 
@@ -205,8 +213,8 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 | 编号 | 问题与证据 | 整改要点 | 验收 |
 | --- | --- | --- | --- |
-| P1-1 | `cci-start-plane.sh` 只打印 Router health/listener，未断言新进程和端口 owner；控制面只 `pgrep` | 严格检查返回码、listener PID/命令行、Router health、控制面 ready 和首轮 reconcile；失败非零退出 | 注入端口冲突/假进程/启动失败，脚本均失败且不打印成功 |
-| P1-2 | `cci-edge.sh` 直接覆盖正式 nginx 配置；`nginx -t \| tail` 可能掩盖失败 | 临时文件 + 真实 `nginx -t` + 原子替换；reload 后验证 401/403/200 和 listener | 错误配置不生效，旧 key 不被误报为已轮换 |
+| P1-1 | `cci-start-plane.sh` 只打印 Router health/listener，未断言新进程和端口 owner；控制面只 `pgrep` | **已修复（2026-11-02）：** 严格检查返回码、listener PID/命令行、Router health、控制面 ready（`/readyz` + pgrep 双断言）；失败非零退出 | 注入端口冲突/假进程/启动失败，脚本均失败且不打印成功 |
+| P1-2 | `cci-edge.sh` 直接覆盖正式 nginx 配置；`nginx -t \| tail` 可能掩盖失败 | **已修复（2026-11-02）：** 候选文件 + 真实 `nginx -t` + 原子替换（失败自动回滚备份）；reload 后验证 listener | 错误配置不生效，旧 key 不被误报为已轮换 |
 | P1-3 | 控制面、Router、bootstrap、nginx 无守护；容器 STOP/START 后 overlay 还需重铺 | 先确认 CCI entrypoint 能力；否则使用轻量 supervisor。恢复顺序包含制品、token、profile、进程 | kill 各进程能恢复；STOP/START 在测试窗口完成 G4 |
 | P1-4 | bootstrap 200ms 轮询刷日志；控制面 `.prev-*`、SGLang/nginx 日志无统一保留策略 | 降低探针频率或分离访问日志；统一大小/时间轮转、压缩、保留上限、磁盘告警 | 构造大量日志后磁盘受控，关键错误仍保留 |
 | P1-5 | live snapshot 不等于控制面备份；SQLite 在 `/var/lib/tai-talea/tai-talea.db`，无一致性备份/恢复演练 | SQLite 在线备份或受控 checkpoint；备份 DB、配置、known_hosts、manifest、密钥与制品版本 | 隔离恢复后实例/operation/audit 一致，首轮 reconcile 不重复启动或误释放 |
@@ -214,7 +222,7 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 | P1-7 | `/health` 只代表 Router；控制面 `/healthz` 固定 ok；recovery 失败仍 `ready.Store(true)` | 分进程 liveness、组件 readiness、数据面 readiness、低频端到端 synthetic；恢复失败不 ready | nginx 200 不再被当作端到端可用；恢复失败 `/readyz` 非 200 |
 | P1-8 | STARTING 超过 3 个 reconcile 周期即判无 owner；单次 endpoint 不可达即 LOST | 恢复时读取 bootstrap phase/PID/role/model；启动超时与 `start_timeout`/心跳关联；LOST 加连续失败阈值 | 控制面在 INSTALLING/STARTING/REGISTERING/SERVING 重启均不制造假 FAILED/LOST |
 | P1-9 | provision job 只在内存 map；QUEUED 永久 outstanding，重启后丢失平台队列跟踪 | 持久化 result key、instance ID、阶段、游标、截止时间；启动恢复轮询；提供继续/取消/核对入口 | 排队超时、控制面重启、重名、长期 CREATING、SSH 失败均不重复创建或泄漏配额 |
-| P1-10 | 无内网地址时可能从公网 URL 的外部端口反推容器监听端口 | 实例模型分别保存「容器监听端口」和「peer URL」；CCI 启动前必须有验证过的内部 service endpoint | 公网 30093→容器 9002 的回归测试中，StartRequest 仍为 9002 |
+| P1-10 | 无内网地址时可能从公网 URL 的外部端口反推容器监听端口 | **已修复（2026-11-02）：** adapter 无 `advertise_hosts` 条目即拒绝纳管；实例模型继续以容器监听端口（9001/9002）为准，公网 URL 仅作参考（回归测试 `TestSnapshotRefusesInstancesWithoutAnInternalAddress`） | 公网 30093→容器 9002 的回归测试中，StartRequest 仍为 9002 |
 | P1-11 | 自动扩缩容配置未开，负载读取错误被忽略，webhook 为空 | G3 前不开 auto；负载失败显式指标/日志/告警；配置有效 webhook | 负载抓取失败可见；第三实例测试不会突然改变现役 1P1D |
 | P1-12 | 手工解包缺 SHA256SUMS 仍继续；live snapshot 可能因 bits 中旧二进制存在而不恢复 | 默认强制校验；控制面显式恢复指定版本并校验 hash；worker 不恢复 live | 归档版本与运行版本一致；错误/缺失清单默认拒绝 |
 | P1-13 | NAS 上 SHA256SUMS 与 tar 同属一个信任域 | 控制节点 manifest 钉住清单或各 tar 的独立 hash；高要求时使用签名清单 | 同时篡改 tar 与 NAS 清单不能通过控制面校验 |
@@ -223,10 +231,10 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 ## 5. P2：主链路修复后收紧
 
-1. **AlayaNeW 配置校验**：补端口范围、两端口不同；CCI 可要求显式端口，避免 0 值静默回退到公网 9001/9002。
-2. **`cci-probe-sweep.py`**：用显式 `--result-key` 替代从 `sys.argv[-1]` 猜测，否则 argparse 会先拒绝 positional key。
-3. **WireGuard probe**：最终 verdict 纳入 CAP_NET_ADMIN；继续明确本平台无 UDP 映射，wg0 不是隔离手段。
-4. **配置渲染**：`advertise_hosts` 对实例名、IP、重复项、条目数 fail-fast；禁止 `NF!=2` 静默丢节点；YAML 生成后必须有两台预期实例。
+1. **AlayaNeW 配置校验** —— **已修复（2026-11-02）**：`PartnerAlayaNeWConfig.Validate()` 拒绝 0 值端口与 9001/9002（强制公网对），要求 advertise_hosts 非空且 name/host 合法；10 个拒绝 case + 1 个通过 case（`TestAlayaNeWPortRules`）。
+2. **`cci-probe-sweep.py`** —— **已修复（2026-11-02）**：显式 `--result-key` argparse 参数替代 `sys.argv[-1]` 猜测。
+3. **WireGuard probe** —— **已修复（2026-11-02）**：`cci-edge.sh` 的 verdict 纳入 CAP_NET_ADMIN 检测结果；本平台无 UDP 映射的口径不变。
+4. **配置渲染** —— **已修复（2026-11-02）**：`cci-config.sh` 对 advertise_hosts 逐条 fail-fast（name=ip、重名、IPv4 逐 octet 校验、首尾连字符拒绝），最少 `TALEA_MIN_HOSTS`（默认 2）台；生成后真实 `-check-config` 把关。
 5. **文档口径**：历史 10-26 验收保留旧拓扑，不改写；新拓扑只有 G2 通过后才能标「已验证」。
 
 ---
@@ -240,6 +248,8 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 **内容：**P0-1、P0-2、P0-3、P0-4、P1-1、P1-2、P1-10、P2 配置校验。  
 **产出：**可信配置生成器、worker 启动脚本、prebuilt 启动语义、启动/门面失败闸门、跨组件测试。  
 **出口：**G0 全部通过；不申请 GPU 也能证明静态和沙箱链路可信。
+
+**执行结果（2026-11-02）：阶段 A 已完成。** G0 通过，详见 §7 G0 记录。范围外未动：P0-5（阶段 B）；P1-3～P1-9/P1-11～P1-13（阶段 E/F）。
 
 ### 阶段 B：重建制品与秘密边界（约 1–2 人日 + 凭据轮换协调）
 
@@ -280,6 +290,14 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 - 公网外部端口不再被反推为容器监听端口。
 
 **不通过：不得申请新实例。**
+
+**G0 执行记录（2026-11-02，本地 Windows 沙箱）：**
+
+- 正向：真实 `cci-config.sh` 生成配置 + 真实二进制 `-check-config` 通过（`is valid (1 partners, router http://127.0.0.1:8001)`）；生成结果含 9101/9102、`prefill_bootstrap_port: 8998`、`--disaggregation-bootstrap-port 8998`、`environment_mode: prebuilt`、`sglang: "0.5.22"`、两台 advertise_hosts，且无 `console_token`。
+- 负向注入 6 项全部拒绝且正式配置不被污染：bootstrap token 缺失、advertise 单台、重名、IP octet 越界（999）、非 IP、`-check-config` 失败模拟（候选保留、live 未触碰）。
+- 管道断言：`cci-start-plane.sh` 断言 Router listener pid == 本脚本启动 pid 且 `/health` 200，控制面 `/readyz` 轮询 + pgrep 双断言；`cci-edge.sh` 候选 → `nginx -t` → 原子替换 → reload 轮询。
+- 测试：`go test ./internal/...` 全绿；`go vet` 干净；provision 56 项 Python unittest 全绿（1 项平台相关跳过）；全部 shell `bash -n` 通过。
+- **G0 判定：通过。可申请 G1 单节点真机。**
 
 ### G1：一台全新 8×H100
 

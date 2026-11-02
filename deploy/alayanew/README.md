@@ -26,11 +26,11 @@
 ## 2. 部署顺序
 
 ```
-下单 → 铺运行时 → 写配置 → 起控制面 → 起门面 → 验证
- ①      ②          ③          ④          ⑤        ⑥
+下单 → 铺运行时 → 起 worker bootstrap → 写配置 → 起控制面 → 起门面 → 验证
+ ①      ②            ③（两台）          ④         ⑤          ⑥        ⑦
 ```
 
-> ②–⑥ 的命令都在**容器内**、且 cwd = `deploy/alayanew/`（路径写成 `ops/...`、`edge/...`）。
+> ②–⑦ 的命令都在**容器内**、且 cwd = `deploy/alayanew/`（路径写成 `ops/...`、`edge/...`）。
 > 仓库根目录执行时补上 `deploy/alayanew/` 前缀。
 
 ### ① 下单
@@ -49,7 +49,7 @@ POST /api/osm/v1/subscription/CCI/create
 - **订阅 `SUCCESS` ≠ 实例 `RUNNING`**。
 - 起来后 `POST /cci/instance/{id}/get-ssh` 拿地址和密码。
 
-### ② 铺运行时（约 2 分钟）
+### ② 铺运行时（约 2 分钟，两台都跑）
 
 ```bash
 bash ops/cci-unpack-runtime.sh
@@ -61,34 +61,49 @@ bash ops/cci-unpack-runtime.sh
 
 > **第二台（纯 worker）加 `TALEA_WORKER_ONLY=1`**：tar 里带着控制节点的
 > `/etc/tai-talea/tai-talea.yaml`（含平台 AK/SK），worker 从不读它，解完就该删。
+> live snapshot（控制面二进制）只解到跑控制面的那台。
 
 现役二进制与配置另有一份 `live-2026-11-02.tar.gz`（控制面 `0.9.1-cci` + Router + `/etc/tai-talea/*`），
 解包：`tar -xzf live-2026-11-02.tar.gz -C / && chmod +x /root/tai-talea /root/sgl-model-gateway`。
 
-### ③ 写配置
+### ③ 起 worker bootstrap（两台都跑，控制面之前）
+
+控制面下发启动用的是 `http://<worker>:9101/bootstrap/start`：**没有这一步，
+后面一切都会 401 或超时**。token 必须与 ④ 写进控制面的完全一致。
+
+```bash
+export TALEA_BOOTSTRAP_TOKEN=$(openssl rand -hex 16)   # 两台用同一个值
+bash ops/cci-start-worker.sh
+# 自检三条：9101 带 token 200、错 token 401、9001/9002 无监听
+```
+
+### ④ 写配置（只在控制面那台）
 
 ```bash
 export TALEA_ADMIN_TOKEN=$(openssl rand -hex 16)
+export TALEA_BOOTSTRAP_TOKEN=<与 ③ 相同的值>
 export TALEA_ALAYA_AK=... TALEA_ALAYA_SK=...          # 平台 AK/SK，不入库
 export TALEA_ADVERTISE_HOSTS="glm53-pd2=<内网IP>,glm53-pd3=<内网IP>"
 bash ops/cci-config.sh
 ```
 
-`cci-config.sh` 写 `/etc/tai-talea/tai-talea.yaml` 并用 `-check-config` 校验（只校验，不启动）。
+`cci-config.sh` 先写 `tai-talea.next.yaml`，用**真实二进制** `-check-config` 校验，
+通过才原子替换正式文件；被拒的候选保留在原地供检查，脚本非零退出。
 **必需手工确认的一处**：`advertise_hosts` 必须是**这次**实例的内网 IP——
 实例重建后 IP 会变，写错的表现是「控制面永远连不上 worker」，日志里只有超时。
+缺 advertise_hosts 的实例 pull 会直接拒绝纳管（公网入口是 hairpin，管控不了容器）。
 
-### ④ 起控制面 + Router
+### ⑤ 起控制面 + Router
 
 ```bash
 bash ops/cci-start-plane.sh
 ```
 
 Router 监听 **`127.0.0.1:8001`**（不是 8000），控制面监听 8787。
-8000 留给门面（⑤）。控制面自己按 `planner.gear` 分角色、下发 `POST /bootstrap/start`、
+8000 留给门面（⑥）。控制面自己按 `planner.gear` 分角色、下发 `POST /bootstrap/start`、
 注册 Router。**两台加载约 15–20 分钟**，期间 `/workers` 里 decode `is_healthy=false` 是正常的。
 
-### ⑤ 起门面
+### ⑥ 起门面
 
 ```bash
 bash edge/cci-edge.sh probe     # 先探测容器能力：/dev/net/tun、CAP_NET_ADMIN、nginx
@@ -97,7 +112,7 @@ bash edge/cci-edge.sh up        # 装/起 nginx（wg 仅在本机可用，见 §
 
 见 §3。
 
-### ⑥ 验证
+### ⑦ 验证
 
 ```bash
 curl -s localhost:8000/health                                  # 免 key，200
@@ -204,6 +219,7 @@ deploy/alayanew/
     ├── alaya_client.py             # 平台 OpenAPI 客户端（HMAC，AK/SK 读环境变量）
     ├── cci-unpack-runtime.sh       # 从 NAS 铺运行时
     ├── cci-config.sh               # 生成并校验控制面配置
+    ├── cci-start-worker.sh          # worker 侧启动 9101 bootstrap（两台都跑）
     ├── cci-start-plane.sh          # 起 Router(8001) + 控制面
     ├── cci-elastic-probe.py        # 弹性资源探测（下单→轮询→必释放）
     └── cci-probe-sweep.py          # 清遗留实例 + 探测订阅结果接口

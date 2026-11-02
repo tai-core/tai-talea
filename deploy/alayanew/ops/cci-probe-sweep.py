@@ -47,11 +47,10 @@ def sweep(keep):
     return targets
 
 
-def probe_results():
+def probe_results(key):
     """Compare the dead path with the live one; needs a key, so it is optional."""
-    key = sys.argv[-1] if len(sys.argv) > 1 and sys.argv[-1].count(":") >= 3 else ""
     if not key:
-        print("\n== subscription result paths: skipped (pass a result key to test) ==")
+        print("\n== subscription result paths: skipped (pass --result-key to test) ==")
         print("   old: /api/osm/v1/subscription/CCI/result/<key>         -> 212147 已停用")
         print("   new: /api/osm/v1/subscription/sku/cci/result/<key>     -> 200 data.status/resources[]")
         return
@@ -67,6 +66,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", default=DEFAULT_KEEP, help="comma-separated names to keep")
     ap.add_argument("--sweep-only", action="store_true")
+    # An explicit flag, not a positional: a result key contains colons, and the
+    # old "last argv with >=3 colons" heuristic could never be reached - argparse
+    # rejected the unknown positional before the heuristic ever ran.
+    ap.add_argument("--result-key", default="", help="subscription result key to probe both result paths with")
     args = ap.parse_args()
     keep = {n for n in args.keep.split(",") if n}
     swept = sweep(keep)
@@ -77,7 +80,7 @@ def main():
         sweep(keep)
     if not args.sweep_only:
         print("\n== subscription result paths ==")
-        probe_results()
+        probe_results(args.result_key)
     return 0
 
 
