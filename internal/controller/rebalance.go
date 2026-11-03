@@ -129,8 +129,8 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 				Severity: obs.SeverityWarning,
 				Message:  "planner load input unavailable while instances serve",
 				Details: map[string]string{
-					"serving":    fmt.Sprintf("%d", serving),
-					"telemetry":  fmt.Sprintf("%t", healthy),
+					"serving":       fmt.Sprintf("%d", serving),
+					"telemetry":     fmt.Sprintf("%t", healthy),
 					"telemetry_why": reason,
 				},
 			})
@@ -597,6 +597,16 @@ func (c *Controller) RunPeriodic(ctx context.Context) {
 				}
 			}
 		}(driver.step)
+	}
+	// The synthetic probe has its own cadence: one real completion every few
+	// minutes, not a component check every reconcile interval. Zero disables
+	// it - the historical behaviour, and what the tests want.
+	if synth := c.cfg.Controller.SyntheticInterval.Duration(); synth > 0 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			c.RunSynthetic(ctx)
+		}()
 	}
 	wait.Wait()
 }

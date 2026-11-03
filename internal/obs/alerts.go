@@ -41,6 +41,7 @@ const (
 	AlertBootstrapFailure         = "bootstrap_failure"
 	AlertEnvironmentMismatch      = "environment_mismatch"
 	AlertLoadUnavailable          = "load_unavailable"
+	AlertSyntheticFailed          = "synthetic_probe_failed"
 )
 
 // Severities.

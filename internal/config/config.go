@@ -148,6 +148,23 @@ type ControllerConfig struct {
 	// cleanup that already had a drain deadline.
 	// Zero or negative means the default of ten minutes.
 	RevocationGrace Duration `yaml:"revocation_grace" json:"revocation_grace"`
+	// SyntheticInterval is how often the control plane proves the whole
+	// serving path - facade, router, workers - by pushing one small real
+	// completion through it (plan P1-7). Every other check in the system
+	// verifies a component; only this one verifies the product, and without
+	// it a pool that answers every probe but serves no tokens looks healthy.
+	// Zero disables the probe.
+	SyntheticInterval Duration `yaml:"synthetic_interval" json:"synthetic_interval"`
+	// SyntheticURL is the endpoint the synthetic probe posts to. Empty means
+	// the Router directly (its own URL), which proves model serving but not
+	// the facade; point it at the edge URL to cover the whole path.
+	SyntheticURL string `yaml:"synthetic_url" json:"synthetic_url"`
+	// SyntheticAPIKey authorizes the synthetic probe when the endpoint checks
+	// keys - the facade does. Empty means no Authorization header.
+	SyntheticAPIKey string `yaml:"synthetic_api_key" json:"synthetic_api_key"`
+	// SyntheticModel is the model name the probe requests. Empty means the
+	// configured controller.model_id.
+	SyntheticModel string `yaml:"synthetic_model" json:"synthetic_model"`
 	// StartTimeout bounds how long the control plane waits for a freshly
 	// started SGLang to answer its health check. Loading a model legitimately
 	// takes minutes, so this is deliberately not call_timeout: that bounds one
@@ -593,7 +610,11 @@ func Default() Config {
 			// The CCI list can omit a RUNNING instance for minutes after
 			// START answers; ten minutes covers that with margin while a
 			// genuine release still completes inside one grace period.
-			RevocationGrace:   Duration(10 * time.Minute),
+			RevocationGrace: Duration(10 * time.Minute),
+			// Five minutes keeps a probe every interval inside a rounding
+			// error of the token budget while still catching a dead pool
+			// long before an operator would.
+			SyntheticInterval: Duration(5 * time.Minute),
 			StartTimeout:      Duration(10 * time.Minute),
 			ProvisionTimeout:  Duration(45 * time.Minute),
 			LeaseWarning:      Duration(120 * time.Second),

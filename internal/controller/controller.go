@@ -134,7 +134,10 @@ type Controller struct {
 	// the list trails START by minutes - and one absent snapshot used to fire
 	// CAPACITY_REVOKED at that live container, whose reclaim path ends in
 	// deleting it. Absence is only trusted once it outlasts the grace.
-	pullMissingSince   sync.Map
+	pullMissingSince sync.Map
+	// syntheticFailures counts consecutive failed end-to-end probes (plan
+	// P1-7). Only the synthetic loop writes it, under mu.
+	syntheticFailures  int
 	eventOperations    [64]sync.Mutex
 	capacityAdmissions sync.Mutex
 	pullOperations     sync.Map
