@@ -306,7 +306,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 // Moving this value is a two-sided change. The worker image must carry a
 // matching bootstrap, and this binary must be rebuilt and rolled; either half
 // alone leaves the two disagreeing. That disagreement is loud on purpose.
-const bootstrapVersion = "tai-talea-bootstrap/2"
+const bootstrapVersion = "tai-talea-bootstrap/3"
 
 // capacityBridge hands the controller a way to ask for capacity without giving
 // it the provisioning pipeline. The pipeline needs the SSH onboarding intake,

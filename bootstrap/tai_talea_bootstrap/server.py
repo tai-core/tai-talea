@@ -90,6 +90,21 @@ class BootstrapHandler(BaseHTTPRequestHandler):
             "%s - %s", self.address_string(), fmt % args
         )
 
+    # The control plane polls these paths every few seconds for hours while a
+    # model loads; a successful poll is the absence of news, not news. Log
+    # every non-200 and every other path, so failures stay loud while the
+    # success stream stops filling the disk (plan P1-4).
+    QUIET_OK_PATHS = (PATH_STATUS, PATH_LIVENESS, "/bootstrap/health")
+
+    def log_request(self, code="-", size="-"):
+        try:
+            path = self.path.split("?", 1)[0]
+        except Exception:
+            path = ""
+        if path in self.QUIET_OK_PATHS and code == 200:
+            return
+        self.log_message('"%s" %s %s', self.requestline, str(code), str(size))
+
     def _write(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)

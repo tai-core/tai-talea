@@ -1223,5 +1223,43 @@ class ExitCodeTests(unittest.TestCase):
         self.assertEqual(exitcodes.describe(200), "unknown exit code")
 
 
+class QuietAccessLogTests(unittest.TestCase):
+    """Successful polls of the polling paths are the absence of news (P1-4)."""
+
+    def _handler(self, path):
+        from tai_talea_bootstrap.server import BootstrapHandler
+
+        handler = BootstrapHandler.__new__(BootstrapHandler)
+        handler.path = path
+        handler.requestline = "GET %s HTTP/1.1" % path
+        return handler
+
+    def test_successful_polls_are_quiet(self):
+        for path in ("/bootstrap/status", "/bootstrap/liveness", "/bootstrap/health"):
+            handler = self._handler(path)
+            with patch.object(handler, "log_message") as log:
+                handler.log_request(200)
+            log.assert_not_called()
+
+    def test_query_strings_do_not_sneak_past_the_quiet_list(self):
+        handler = self._handler("/bootstrap/status?verbose=1")
+        with patch.object(handler, "log_message") as log:
+            handler.log_request(200)
+        log.assert_not_called()
+
+    def test_failures_stay_loud(self):
+        handler = self._handler("/bootstrap/status")
+        with patch.object(handler, "log_message") as log:
+            handler.log_request(503)
+        log.assert_called_once()
+
+    def test_other_paths_stay_loud(self):
+        for path, code in (("/bootstrap/start", 200), ("/nope", 200), ("/bootstrap/status", 401)):
+            handler = self._handler(path)
+            with patch.object(handler, "log_message") as log:
+                handler.log_request(code)
+            log.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

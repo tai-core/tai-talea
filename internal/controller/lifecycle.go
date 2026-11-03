@@ -413,8 +413,16 @@ func prefillBootstrapPort(role domain.Role, port int) int {
 
 // waitHealthy polls the bootstrap health endpoint until SGLang answers or the
 // call timeout expires.
+//
+// The poll backs off: 200 ms only while the start could still be failing
+// fast, then two seconds. Loading 306 GiB of FP8 weights takes 15-20 minutes
+// here, and a flat 200 ms poll fired five thousand status requests into the
+// worker during one load - a meaningful slice of the worker log volume P1-4
+// complained about - while learning nothing sooner than a two-second poll
+// would have.
 func (c *Controller) waitHealthy(ctx context.Context, instance domain.Instance) error {
 	deadline := c.now().Add(c.StartTimeout())
+	started := c.now()
 	var lastErr error
 	for {
 		current, err := c.store.GetInstance(ctx, instance.ID)
@@ -441,10 +449,16 @@ func (c *Controller) waitHealthy(ctx context.Context, instance domain.Instance) 
 		if c.now().After(deadline) {
 			return fmt.Errorf("health check did not pass within %s: %w", c.StartTimeout(), lastErr)
 		}
+		interval := 2 * time.Second
+		if c.now().Sub(started) < 5*time.Second {
+			// A start that dies at all usually dies at once: poll fast until
+			// the process has proven it intends to load something.
+			interval = 200 * time.Millisecond
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(interval):
 		}
 	}
 }
