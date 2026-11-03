@@ -414,8 +414,10 @@ endpoint 里钉死的旧 IP 会把控制面 probe/stop/load 全部打进黑洞�
 1. **pull 快照误报 CAPACITY_REVOKED（最危险）**：平台 START 返回 RUNNING ≠ list
    短暂包含该实例 → pull 报 revoke → 控制面走 reclaim（pending_release +
    drain_deadline）→ **BeginRelease 到期会真调平台 ReleaseInstance 删容器**。
-   实测一次误报（14:54:22），靠 SIGSTOP 冻结控制面 + SQL 撤销解除。**待代码修复**：
-   revoke 判定前查平台实例状态或加宽限期。
+   实测一次误报（14:54:22），靠 SIGSTOP 冻结控制面 + SQL 撤销解除。
+   **已修复（0.9.9，commit 616dd76，已部署 pd2b）**：缺席必须超过
+   `controller.revocation_grace`（默认 10 分钟）才发 revoke；重现即原谅并重置计时。
+   全量测试绿，e2e 200。
 2. **watchdog 拉不起 worker bootstrap**：原版要求 env TALEA_BOOTSTRAP_TOKEN，无人
    值守必失败。已修：watchdog 从 /etc/tai-talea/bootstrap-token 读（双节点已部署）。
 3. **STOP/START 后 cron 不自启**（s6 不管 cron、@reboot 永不触发）→ watchdog 自启
