@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"strings"
@@ -88,10 +89,51 @@ type Collector struct {
 	client *http.Client
 	mu     sync.RWMutex
 	frames []frame
+
+	// Sample health (plan P1-11): a load fetch that fails silently is the one
+	// signal an operator must never learn to ignore - the planner keeps making
+	// decisions, only without input. failures counts consecutive samples that
+	// could not observe what they were told to observe; noteSampleFailure logs
+	// the first and every tenth, noteSampleOK logs the recovery.
+	log      *slog.Logger
+	failures int
+	lastOK   time.Time
 }
 
-func New(store inventory, router router) *Collector {
-	return &Collector{store: store, router: router, client: &http.Client{Timeout: 4 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+func New(store inventory, router router, log ...*slog.Logger) *Collector {
+	logger := slog.Default()
+	if len(log) > 0 && log[0] != nil {
+		logger = log[0]
+	}
+	return &Collector{store: store, router: router, client: &http.Client{Timeout: 4 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, log: logger}
+}
+
+func (c *Collector) noteSampleFailure(reason string) {
+	c.failures++
+	if c.failures == 1 || c.failures%10 == 0 {
+		c.log.Warn("telemetry sample failed", "consecutive_failures", c.failures, "reason", reason)
+	}
+}
+
+func (c *Collector) noteSampleOK(observed int) {
+	if c.failures > 0 {
+		c.log.Info("telemetry recovered", "failed_samples", c.failures, "nodes_observed", observed)
+	}
+	c.failures = 0
+	c.lastOK = time.Now()
+}
+
+// LoadInputHealthy reports whether the collector has produced a usable sample
+// recently. zero samples (fresh start) count as unhealthy: "never observed" is
+// the same silence as "stopped observing".
+func (c *Collector) LoadInputHealthy() (bool, string) {
+	if c.failures > 0 {
+		return false, fmt.Sprintf("%d consecutive samples failed", c.failures)
+	}
+	if c.lastOK.IsZero() {
+		return false, "no sample has succeeded yet"
+	}
+	return true, ""
 }
 func (c *Collector) Run(ctx context.Context) {
 	timer := time.NewTicker(Interval)
@@ -248,6 +290,7 @@ func (c *Collector) scrape(ctx context.Context, instance domain.Instance, old No
 func (c *Collector) Sample(ctx context.Context) {
 	instances, err := c.store.ListInstances(ctx)
 	if err != nil {
+		c.noteSampleFailure("instance inventory unavailable: " + err.Error())
 		return
 	}
 	old := map[string]Node{}
@@ -268,12 +311,13 @@ func (c *Collector) Sample(ctx context.Context) {
 	var wg sync.WaitGroup
 	limit := make(chan struct{}, 8)
 	var loads []routeradapter.WorkerLoad
+	var loadsErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		call, cancel := context.WithTimeout(ctx, 4*time.Second)
 		defer cancel()
-		loads, _ = c.router.GetLoads(call)
+		loads, loadsErr = c.router.GetLoads(call)
 	}()
 	for idx, i := range active {
 		wg.Add(1)
@@ -307,6 +351,24 @@ func (c *Collector) Sample(ctx context.Context) {
 	if len(c.frames) > 100 {
 		c.frames = c.frames[len(c.frames)-100:]
 	}
+	// Sample health accounting (plan P1-11). Nothing active is not a failure:
+	// there is nothing to observe. Every active node reporting an error is -
+	// that is the router-down / sglang-down shape the old code swallowed.
+	if len(active) == 0 {
+		c.noteSampleOK(0)
+		return
+	}
+	failed := 0
+	for _, n := range nodes {
+		if n.Error != "" {
+			failed++
+		}
+	}
+	if failed == len(active) {
+		c.noteSampleFailure(fmt.Sprintf("all %d nodes failed to report; router loads: %v", failed, loadsErr))
+		return
+	}
+	c.noteSampleOK(len(active) - failed)
 }
 func aggregate(nodes []Node, role domain.Role, at time.Time) Role {
 	r := Role{}

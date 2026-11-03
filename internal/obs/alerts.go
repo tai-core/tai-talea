@@ -40,6 +40,7 @@ const (
 	AlertOperationRetryExhausted  = "operation_retry_exhausted"
 	AlertBootstrapFailure         = "bootstrap_failure"
 	AlertEnvironmentMismatch      = "environment_mismatch"
+	AlertLoadUnavailable          = "load_unavailable"
 )
 
 // Severities.

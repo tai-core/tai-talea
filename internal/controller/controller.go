@@ -106,6 +106,9 @@ type Controller struct {
 	metrics   *obs.Registry
 	alerts    *obs.Alerter
 	logger    *slog.Logger
+	// loadAlertSince rate-limits the load_unavailable alert (plan P1-11):
+	// the planner loop is the only writer, so no lock.
+	loadAlertSince time.Time
 	now       func() time.Time
 
 	mu          sync.Mutex
@@ -239,7 +242,7 @@ func New(deps Deps) (*Controller, error) {
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Controller{
-		telemetry: telemetry.New(deps.Store, deps.Router),
+		telemetry: telemetry.New(deps.Store, deps.Router, logger),
 		cfg:       deps.Config,
 		store:     deps.Store,
 		router:    deps.Router,

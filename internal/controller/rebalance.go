@@ -113,6 +113,40 @@ func (c *Controller) Rebalance(ctx context.Context) (planner.Decision, error) {
 		input.Load.OutputTokenRate = load.Regular.TokenRate
 	}
 
+	// Plan P1-11: an invalid load input while instances serve is the one
+	// signal an operator must never learn to ignore - auto mode would keep
+	// deciding with no eyes. Fire on the transition into invalid, then at
+	// most once per cooldown; the planner loop is the only writer.
+	serving := prefillServing + decodeServing + regularServing
+	if !input.Load.Valid && serving > 0 {
+		if c.loadAlertSince.IsZero() || c.now().Sub(c.loadAlertSince) >= c.cfg.Controller.ReconcileInterval.Duration()*30 {
+			c.loadAlertSince = c.now()
+			healthy, reason := c.telemetry.LoadInputHealthy()
+			c.log().Warn("planner load input is invalid while instances are serving",
+				"serving", serving, "telemetry_healthy", healthy, "telemetry_reason", reason)
+			c.alert(ctx, obs.Alert{
+				Name:     obs.AlertLoadUnavailable,
+				Severity: obs.SeverityWarning,
+				Message:  "planner load input unavailable while instances serve",
+				Details: map[string]string{
+					"serving":    fmt.Sprintf("%d", serving),
+					"telemetry":  fmt.Sprintf("%t", healthy),
+					"telemetry_why": reason,
+				},
+			})
+		}
+	} else if input.Load.Valid {
+		c.loadAlertSince = time.Time{}
+	}
+	if c.metrics != nil {
+		valid01 := 0.0
+		if input.Load.Valid {
+			valid01 = 1
+		}
+		c.metrics.SetGauge("planner_load_input_valid",
+			"1 when the planner's last round had a valid load input.", nil, valid01)
+	}
+
 	decision, err := c.planner.Plan(input)
 	if err != nil {
 		return planner.Decision{}, err
