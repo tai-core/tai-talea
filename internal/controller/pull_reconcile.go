@@ -93,6 +93,11 @@ func (c *Controller) pullAuthoritative(ctx context.Context, schedule PullSchedul
 	for _, offered := range plan.Snapshot.Instances {
 		present[offered.ID] = true
 		row, found := current[offered.ID]
+		if found {
+			// Visible again: any absence clock is forgiven, so a later
+			// absence owes its full grace from its own first miss.
+			c.pullMissingSince.Delete(offered.ID)
+		}
 		if found && (row.PendingRelease || row.InstanceState == domain.InstanceReleasing) {
 			continue // A local reclaim has precedence until the current lease ends.
 		}
@@ -124,10 +129,34 @@ func (c *Controller) pullAuthoritative(ctx context.Context, schedule PullSchedul
 			return err
 		}
 	}
+	// An instance absent from the authoritative snapshot is only believed to
+	// be revoked once its absence outlasts the grace (plan G4). The AlayaNeW
+	// list can omit a RUNNING instance for minutes after a STOP/START, and a
+	// revocation fired at that live container ends in the reclaim deleting it.
 	for _, row := range instances {
-		if row.PartnerID != plan.PartnerID || !row.Active() || row.PendingRelease || present[row.ID] || row.LeaseUpdatedAt.After(observed) {
+		if row.PartnerID != plan.PartnerID || present[row.ID] {
 			continue
 		}
+		if !row.Active() || row.PendingRelease {
+			// Not a revocation candidate this round: drop any stale clock so
+			// a future absence owes its full grace from its own first miss.
+			c.pullMissingSince.Delete(row.ID)
+			continue
+		}
+		if row.LeaseUpdatedAt.After(observed) {
+			continue // A Push received during this poll is newer than this snapshot.
+		}
+		since, missing := c.pullMissingSince.Load(row.ID)
+		if !missing {
+			c.pullMissingSince.Store(row.ID, observed)
+			c.log().Info("snapshot is missing an active instance - revocation grace starts",
+				"partner_id", plan.PartnerID, "instance", row.ID, "grace", c.RevocationGrace().String())
+			continue
+		}
+		if observed.Sub(since.(time.Time)) < c.RevocationGrace() {
+			continue
+		}
+		c.pullMissingSince.Delete(row.ID)
 		if err := apply(domain.CapacityEvent{PartnerID: plan.PartnerID, Type: domain.EventCapacityRevoked,
 			OccurredAt: observed, Source: domain.SourcePull, ReceivedAt: c.now(),
 			Instance: &domain.EventInstance{ID: row.ID, LeaseID: row.LeaseID}}, &row); err != nil {

@@ -326,6 +326,21 @@ func TestPullSweepDoesNotStopAtAnInstanceThatIsMidOperation(t *testing.T) {
 		t.Fatalf("pull round: %v", err)
 	}
 
+	// The first absent snapshot only starts the revocation grace: the
+	// platform list can omit a live instance for minutes after a STOP/START,
+	// and one miss must not fire the reclaim that deletes the container.
+	if gone := h.instance("gone"); gone.InstanceState != domain.InstanceIdle && !gone.PendingRelease {
+		t.Fatalf("the first miss already condemned the vanished worker: state %s/%s, pending_release=%v",
+			gone.InstanceState, gone.ServiceState, gone.PendingRelease)
+	}
+
+	// Absence that outlasts the grace is a real revocation, and the sweep
+	// still has to work around the held lock of the sibling worker.
+	h.clock.Advance(h.ctrl.RevocationGrace() + time.Minute)
+	if err := h.ctrl.PullOnce(ctx, PullSchedule{Adapter: h.adapter, Puller: puller}); err != nil {
+		t.Fatalf("pull round after the grace: %v", err)
+	}
+
 	revoked := h.instance("gone")
 	if revoked.InstanceState != domain.InstanceReleased && !revoked.PendingRelease {
 		t.Fatalf("the vanished worker was not reclaimed: state %s/%s, pending_release=%v",

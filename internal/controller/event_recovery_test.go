@@ -318,9 +318,19 @@ func TestPullRepairsUnchangedSnapshotDriftAndABA(t *testing.T) {
 			t.Fatal("snapshot A -> B -> A change suppressed by event deduplication")
 		}
 	}
-	// A node introduced only by Push is also revoked by an unchanged full view.
+	// A node introduced only by Push is also revoked by an unchanged full
+	// view - but only after its absence outlasts the revocation grace, which
+	// protects a live container the list omits during a STOP/START window.
 	extra := h.addedEvent("extra", "http://10.0.0.7:8080", "extra-lease", h.clock.Now())
 	h.handle(extra)
+	h.clock.Advance(h.ctrl.RevocationGrace() + time.Minute)
+	if err := h.ctrl.PullOnce(ctx, schedule); err != nil {
+		t.Fatal(err)
+	}
+	if row := h.instance("extra"); row.InstanceState == domain.InstanceReleased || row.PendingRelease {
+		t.Fatal("the first absent snapshot revoked a container inside the grace")
+	}
+	h.clock.Advance(h.ctrl.RevocationGrace() + time.Minute)
 	if err := h.ctrl.PullOnce(ctx, schedule); err != nil {
 		t.Fatal(err)
 	}

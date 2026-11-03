@@ -132,6 +132,22 @@ type ControllerConfig struct {
 	// threshold in seconds and is condemned just as before.
 	// Zero or negative falls back to one, restoring the historical behaviour.
 	LostFailureThreshold int `yaml:"lost_failure_threshold" json:"lost_failure_threshold"`
+	// RevocationGrace is how long a managed instance may be absent from the
+	// authoritative snapshot before a pull round concludes the platform really
+	// took it away and emits CAPACITY_REVOKED (plan G4).
+	//
+	// One absent snapshot used to revoke immediately. On the AlayaNeW CCI
+	// platform a STOP/START window breaks that assumption: START answers
+	// RUNNING while the instance list still omits the instance for a few
+	// minutes (measured ~3 on 2026-11-03), the pull diff therefore fired
+	// CAPACITY_REVOKED against a live container, and the reclaim that follows
+	// a revocation ends in ReleaseInstance - the control plane deleting a
+	// container that came back on its own. Absence that outlasts the grace is
+	// still a revocation, and is handled exactly as before: a genuinely
+	// released instance waits one grace period longer, which only stretches a
+	// cleanup that already had a drain deadline.
+	// Zero or negative means the default of ten minutes.
+	RevocationGrace Duration `yaml:"revocation_grace" json:"revocation_grace"`
 	// StartTimeout bounds how long the control plane waits for a freshly
 	// started SGLang to answer its health check. Loading a model legitimately
 	// takes minutes, so this is deliberately not call_timeout: that bounds one
@@ -574,10 +590,14 @@ func Default() Config {
 			// instance looks like, not what a broken one looks like.
 			ReadinessFailureThreshold: 2,
 			LostFailureThreshold:      3,
-			StartTimeout:              Duration(10 * time.Minute),
-			ProvisionTimeout:          Duration(45 * time.Minute),
-			LeaseWarning:              Duration(120 * time.Second),
-			LostRateThreshold:         0.2,
+			// The CCI list can omit a RUNNING instance for minutes after
+			// START answers; ten minutes covers that with margin while a
+			// genuine release still completes inside one grace period.
+			RevocationGrace:   Duration(10 * time.Minute),
+			StartTimeout:      Duration(10 * time.Minute),
+			ProvisionTimeout:  Duration(45 * time.Minute),
+			LeaseWarning:      Duration(120 * time.Second),
+			LostRateThreshold: 0.2,
 		},
 		Router: RouterConfig{
 			Name:           "primary",

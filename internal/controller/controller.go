@@ -109,7 +109,7 @@ type Controller struct {
 	// loadAlertSince rate-limits the load_unavailable alert (plan P1-11):
 	// the planner loop is the only writer, so no lock.
 	loadAlertSince time.Time
-	now       func() time.Time
+	now            func() time.Time
 
 	mu          sync.Mutex
 	ratioStreak int
@@ -122,13 +122,20 @@ type Controller struct {
 	// evidence of a broken model: the bootstrap answers "degraded" whenever a
 	// single /health_generate call misses, and condemning on the first miss
 	// costs a full multi-GPU reload.
-	healthFailures     sync.Map
+	healthFailures sync.Map
 	// unreachableFailures counts consecutive reconcile rounds in which a
 	// container endpoint was unreachable, keyed by instance ID (plan P1-8).
 	// One probe miss is not evidence of a lost container: marking LOST on the
 	// first miss costs the whole re-preparation pipeline for a dropped packet.
 	unreachableFailures sync.Map
-	eventOperations     [64]sync.Mutex
+	// pullMissingSince records when an active instance was first seen absent
+	// from the authoritative snapshot, keyed by instance ID (plan G4). The
+	// platform list can omit an instance that is alive - after a STOP/START
+	// the list trails START by minutes - and one absent snapshot used to fire
+	// CAPACITY_REVOKED at that live container, whose reclaim path ends in
+	// deleting it. Absence is only trusted once it outlasts the grace.
+	pullMissingSince   sync.Map
+	eventOperations    [64]sync.Mutex
 	capacityAdmissions sync.Mutex
 	pullOperations     sync.Map
 	eventRecovery      sync.Mutex
@@ -204,6 +211,18 @@ func (c *Controller) LostFailureThreshold() int {
 		return threshold
 	}
 	return 1
+}
+
+// RevocationGrace is how long an active instance may be absent from the
+// authoritative snapshot before pull concludes the platform really took it
+// away. A non-positive configuration means the default of ten minutes: the
+// AlayaNeW list can omit a RUNNING instance for minutes after a STOP/START,
+// and revoking on the first absent snapshot ends in deleting a live container.
+func (c *Controller) RevocationGrace() time.Duration {
+	if grace := c.cfg.Controller.RevocationGrace; grace > 0 {
+		return grace.Duration()
+	}
+	return 10 * time.Minute
 }
 
 // HealthFailureThreshold is how many consecutive failed probes condemn a
