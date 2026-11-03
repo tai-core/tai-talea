@@ -34,8 +34,9 @@
 #                            hatch; loud warning, still a last resort)
 set -eu
 
-R=${TALEA_PACK_ROOT:-}
+R=${TALEA_PACK_ROOT:-/}
 R=${R%/}
+[ -n "$R" ] || R=/   # ${R%/} strips "/" itself down to ""; the real root must stay usable
 OUT=${TALEA_PACK_OUT:-$PWD}
 STAMP=$(date -u +%Y%m%d)
 BITS_TAR=tai-talea-bits.tar
@@ -107,11 +108,12 @@ for f in "$BITS_TAR"; do
   ( cd "$OUT" && sha256sum "$f" ) >> "$SUMS"
 done
 if [ -n "${TALEA_RUNTIME_DIR:-}" ]; then
-  for f in venv-*.tar jit-caches*.tar; do
-    if [ -f "$TALEA_RUNTIME_DIR/$f" ]; then
-      ( cd "$TALEA_RUNTIME_DIR" && sha256sum "$f" ) >> "$SUMS"
-    else
-      echo "note: $TALEA_RUNTIME_DIR/$f not found, not hashed" >&2
+  # glob outside the quotes, and -f on the expansion, so the pattern cannot
+  # be tested as a literal filename (which always failed, leaving venv/jit
+  # out of SHA256SUMS while the manifest pinned them)
+  for f in "$TALEA_RUNTIME_DIR"/venv-*.tar "$TALEA_RUNTIME_DIR"/jit-caches*.tar; do
+    if [ -f "$f" ]; then
+      ( cd "$TALEA_RUNTIME_DIR" && sha256sum "$(basename "$f")" ) >> "$SUMS"
     fi
   done
 else
