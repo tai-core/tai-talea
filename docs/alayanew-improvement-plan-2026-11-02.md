@@ -357,6 +357,14 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 
 ### G3：第三实例，仅验证自动化
 
+**G3 尝试记录（2026-11-03 凌晨–中午）：未开始，已改期。** 下单 `glm53-pd4b`
+（EXCLUSIVE 8×H800A，NAS 随单，create/订阅 SUCCESS）后实例在平台侧 **QUEUED
+12.5 小时**（00:23–12:47，`updateTime` 零变化，无排队位次/ETA）——池子无卡，
+平台侧不受本系统控制。经用户确认释放回收配额（`POST /cci/instance/{id}/release`
+即时生效，实例名不归还）。前置准备已完成：`planner.max_serving: 2` 已在现役
+控制面生效；onboarding payload 形状已考证。下次执行从「下单」重新开始，
+建议挑池子空闲时段。
+
 - 先设 `planner.max_serving: 2`，避免第三台改变现役 1P1D。
 - 已有实例自动铺装纳管。
 - 排队超时、控制面重启、重名、SSH 失败、长期 CREATING 都可恢复或明确失败。
