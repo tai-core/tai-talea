@@ -1,5 +1,10 @@
 # 九章 CCI（AlayaNeW）交接文档
 
+> **⚠️ 已被取代（2026-11-03）**：当前事实的完整快照见
+> `alayanew-handover-2026-11-03.md`。本文的 §4「STOP→START 后 overlay 全丢」
+> 是**错误结论**（那是实例重建的行为；STOP/START 保留 overlay，只丢进程与内网 IP），
+> 其余章节作为历史流水保留。
+
 > 写于 2026-11-02 15:20Z+08。写给接下来接手这台机器的人。
 > 这里只写**现场成立的事实**和**踩过的坑**；设计取舍见 `architecture-and-design.md`，
 > 容量与配额的取证见 `alayanew-capacity-probe-2026-10-26.md`，
