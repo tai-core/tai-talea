@@ -117,8 +117,11 @@ connection refused。这是 §7.2 唯一可行的解法。
 | `/root/gongji/GLM-5.3-Flash` | 权重：62 shard、306 GB、76108 张量、FP8 block-wise |
 | `/root/gongji/tai-talea-runtime/` | 烤好的运行时：`venv-0.5.22-cu130.tar`(11.2G) + `tai-talea-bits.tar`(27.7M) + `jit-caches.tar`(122M) + `SHA256SUMS` |
 
-**overlay 会丢，NAS 不会**：容器 `STOP → START` 之后 `/etc/tai-talea`、`/opt/tai-talea`、
-`/root/tai-talea` 全部消失，只剩 `/root/gongji`。这是 N3 缺陷，不是故障（见 §8）。
+**overlay 保留，丢的是进程与内网 IP**（2026-11-03 实测修正）：容器 `STOP → START` 之后
+`/etc/tai-talea`、`/opt/tai-talea`、`/root/tai-talea`、DB、secrets、NAS `/root/gongji`
+**全部原样保留**；丢的只是**进程状态**（全部死亡，需重启）与**内网 IP**（会变，
+advertise_hosts 与 DB endpoint 必须修正，见 §8）。此前「overlay 全丢、只剩 NAS」的
+记录是实例**重建**（release 后重新 create）的行为，不是 STOP/START 的行为。
 
 ---
 
@@ -378,7 +381,9 @@ sglang 自杀 → bootstrap 记 `exit -9` → 控制面判 `sglang process faile
 
 ### 7.4 其它
 
-- 控制面 / Router **无守护**：进程挂了不会自拉；容器重启清 overlay 后要手工重铺。
+- 控制面 / Router 无守护 ~~进程挂了不会自拉~~ → **已修（2026-11-03，G4）**：watchdog
+  （cron @reboot + loop 30）监管 router→plane→edge→bootstrap；STOP/START **不丢
+  overlay**，只需重启进程并修正内网 IP（详见 §4 修正与 G4 记录）。
 - `bootstrap.log` 无轮转：一天 100 MB+，`2026-11-02` 已 111 MB。
 - `/health_generate` 恒 1.0s，是 sglang 代码里的 `sleep(1)`，不是性能问题。
 - 弹性 GPU 池取不到卡（CPU 22 秒能落，GPU 1 卡/8 卡都 300 秒不动），已取证。

@@ -36,6 +36,10 @@ START_PLANE_SH=${TALEA_START_PLANE:-/root/cci-start-plane.sh}
 START_WORKER_SH=${TALEA_START_WORKER:-/root/cci-start-worker.sh}
 ROUTER_PORT=${TALEA_ROUTER_PORT:-8001}
 PLANE_API=${TALEA_CONTROL_API:-http://127.0.0.1:8787}
+EDGE_PORT=${TALEA_EDGE_PORT:-8000}
+EDGE_SH=${TALEA_EDGE_SH:-/root/cci-edge.sh}
+SECRETS_FILE=${TALEA_SECRETS:-/root/.tai-talea-secrets}
+BOOTSTRAP_TOKEN_FILE=${TALEA_BOOTSTRAP_TOKEN_FILE:-/etc/tai-talea/bootstrap-token}
 WATCHDOG_LOG=$LOG_DIR/watchdog.log
 
 mode=${1:-loop}
@@ -133,6 +137,25 @@ router_healthy() {
 
 plane_running() { pgrep -x tai-talea >/dev/null; }
 
+# The edge is supervised only after the Router: /health is proxied through
+# nginx, so checking it first would restart nginx for a Router failure and
+# bury the real cause.
+edge_healthy() {
+  [ -n "$(ss -lntp 2>/dev/null | grep ":$EDGE_PORT ")" ] || return 1
+  [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$EDGE_PORT/health" 2>/dev/null)" = "200" ]
+}
+
+start_edge() {
+  [ -f "$EDGE_SH" ] || { say "edge start skipped: missing $EDGE_SH"; return 1; }
+  # cci-edge.sh up renders the conf from TALEA_API_KEY; the secrets file is
+  # the same source every other restart path uses.
+  say "edge is down (router healthy) - running $EDGE_SH up"
+  if [ -f "$SECRETS_FILE" ]; then
+    set -a; . "$SECRETS_FILE"; set +a
+  fi
+  bash "$EDGE_SH" up >>"$WATCHDOG_LOG" 2>&1 && say "edge restarted" || say "cci-edge.sh up failed"
+}
+
 start_plane_only() {
   # The full cci-start-plane.sh restarts the Router too; when the Router is
   # healthy that is pure damage. Replicate just the plane block of that
@@ -167,18 +190,37 @@ bootstrap_running() {
   pgrep -f 'tai_talea_bootstrap serve' >/dev/null
 }
 
+# cci-start-worker.sh demands the token as an env var, but an unattended
+# restart has no operator to type it. The token file is the worker's own
+# credential - the live bootstrap serves from it - so read it back from there.
+start_bootstrap() {
+  [ -f "$START_WORKER_SH" ] || { say "worker start skipped: missing $START_WORKER_SH"; return 1; }
+  if [ ! -f "$BOOTSTRAP_TOKEN_FILE" ]; then
+    say "worker bootstrap is down and $BOOTSTRAP_TOKEN_FILE is missing - cannot restart"
+    return 1
+  fi
+  say "worker bootstrap is down - running $START_WORKER_SH"
+  TALEA_BOOTSTRAP_TOKEN=$(cat "$BOOTSTRAP_TOKEN_FILE") \
+    bash "$START_WORKER_SH" >>"$WATCHDOG_LOG" 2>&1 && say "worker bootstrap restarted" \
+    || say "cci-start-worker.sh failed"
+}
+
 supervise_pass() {
   if [ -f /root/cci-start-plane.sh ] && [ -f "$CONFIG" ]; then
     if ! router_healthy; then
       start_everything
     elif ! plane_running; then
       start_plane_only
+    elif ! edge_healthy; then
+      start_edge
+    elif ! bootstrap_running; then
+      # The control node is also a worker: its bootstrap serves the local
+      # SGLang, and nothing else restarts it.
+      start_bootstrap
     fi
   elif [ -f "$START_WORKER_SH" ]; then
     if ! bootstrap_running; then
-      say "worker bootstrap is down - running $START_WORKER_SH"
-      bash "$START_WORKER_SH" >>"$WATCHDOG_LOG" 2>&1 && say "worker bootstrap restarted" \
-        || say "cci-start-worker.sh failed"
+      start_bootstrap
     fi
   fi
 }

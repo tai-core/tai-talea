@@ -21,6 +21,17 @@ set -u
 
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
 
+# The image's PID 1 (s6-svscan) does not manage cron, apt's policy-rc.d blocks
+# it from starting at install, and nothing else starts it either. It therefore
+# only exists because a previous boot launched it by hand - and after a
+# container STOP/START it is gone, which silently kills the @reboot watchdog.
+# Starting the worker is the one action a recovery always runs, so bring cron
+# back here, idempotently.
+if command -v cron >/dev/null 2>&1 && ! pgrep -x cron >/dev/null; then
+  echo "cron is not running - starting it (the @reboot watchdog depends on it)"
+  setsid nohup cron -f </dev/null >/dev/null 2>&1 &
+fi
+
 : "${TALEA_BOOTSTRAP_TOKEN:?set TALEA_BOOTSTRAP_TOKEN - the same value the control plane was configured with}"
 
 BOOTSTRAP_PORT=${TALEA_BOOTSTRAP_PORT:-9101}

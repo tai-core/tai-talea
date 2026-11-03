@@ -381,6 +381,63 @@ prefill ──PD bootstrap 8998 / Mooncake KV──> decode
 - SQLite 隔离恢复，记录一致，首轮 reconcile 无副作用。
 - 再次验证 worker 无法读取控制面秘密。
 
+**执行结果（2026-11-03）：除 webhook（仍挂起，等 URL）外全部通过。**
+
+**重大事实修正：**交接文档 §4「STOP→START 后 overlay 全丢」**错误**。实测 STOP/START
+**保留 overlay 文件系统**（/opt/tai-talea、/etc/tai-talea、/root/tai-talea、DB、脚本、
+secrets、NAS 挂载全部原样），丢的只是**进程状态与内网 IP**。且 STOP/START 后
+get-ssh 的**端口与密码都不变**（与实例重建不同），但**内网 IP 会变**
+（pd3b 172.19.166.175→155、pd2b 172.19.201.230→213.160）——advertise_hosts 与 DB
+endpoint 里钉死的旧 IP 会把控制面 probe/stop/load 全部打进黑洞，必须修正。
+
+**kill 五连（kill 前后服务中断时长，全部由 watchdog 自愈）：**
+
+| 目标 | 恢复 | 备注 |
+| --- | --- | --- |
+| nginx | ~17s | watchdog 新增 edge 监管路径生效；loop 与 cron once 偶发双触发但幂等无害 |
+| 控制面 | ~12s | 外科式重启，Router pid 未动 |
+| Router | ~12s | 双 worker 自动重注册 |
+| worker bootstrap | 闭环（有真缺口） | 见缺口二；代价 = 孤儿 sglang 被替换、模型重载 ~5-7 分钟 |
+| SGLang prefill | ~5min | 控制面 60s 置 STARTING 重派，回 SERVING |
+
+**STOP/START 两轮（pd3b worker 侧 + pd2b 控制面侧）：**
+
+- pd3b：STOP→START 后发现三个缺口（见下），修复后 decode LOST→STARTING→SERVING
+  自动闭环（~8 分钟），e2e 200。
+- pd2b：STOP→START 后 overlay 与 DB 完好（无需重铺），按序恢复：推新版
+  cci-start-worker.sh（cron 幂等自启生效）→ 改 config advertise_hosts →
+  改 DB endpoint（控制面未起时直接改库）→ cci-start-plane.sh（Router+plane 双
+  200）→ cci-edge.sh up（nginx :8000）→ watchdog loop。prefill 加载后回 SERVING。
+
+**发现的三个缺口与修复：**
+
+1. **pull 快照误报 CAPACITY_REVOKED（最危险）**：平台 START 返回 RUNNING ≠ list
+   短暂包含该实例 → pull 报 revoke → 控制面走 reclaim（pending_release +
+   drain_deadline）→ **BeginRelease 到期会真调平台 ReleaseInstance 删容器**。
+   实测一次误报（14:54:22），靠 SIGSTOP 冻结控制面 + SQL 撤销解除。**待代码修复**：
+   revoke 判定前查平台实例状态或加宽限期。
+2. **watchdog 拉不起 worker bootstrap**：原版要求 env TALEA_BOOTSTRAP_TOKEN，无人
+   值守必失败。已修：watchdog 从 /etc/tai-talea/bootstrap-token 读（双节点已部署）。
+3. **STOP/START 后 cron 不自启**（s6 不管 cron、@reboot 永不触发）→ watchdog 自启
+   链断裂。已修：cci-start-worker.sh 开头幂等拉起 cron（双节点已部署）。
+
+另记录：watchdog 增强版（md5 b6a7c02a）plane 分支补上 edge 监管与本地 bootstrap
+监管序 router→plane→edge→bootstrap；cci-start-worker.sh 的 verify（sleep 3 单次
+curl）会误报 failed，进程实际已起，watchdog 下一轮自愈，待改轮询。
+
+**G4-3 日志轮转**：210MB 哑文件被 copytruncate+gzip 轮转（live 归零）；
+TALEA_DISK_FORCE_PCT=1 强制路径真机验证（bootstrap.log/sglang-decode.log 也轮转）。✓
+
+**G4-4 SQLite 隔离恢复**：每日备份 integrity ok、两实例 SERVING 记录完整；隔离启动
+（18878 端口/死 router/独立 DB）recovery 完成 checked=2，live DB md5 前后一致零副作用；
+旧 schema（v4）备份被自动迁移补表。✓
+
+**G4-5 worker 秘密复验**：/etc/tai-talea 只有 bootstrap-token+profile.json（键全
+worker 口径）；控制面 yaml/onboarding/manifest/DB/二进制/secrets 全部缺席；全盘无
+AK/SK/admin_token/TALEA_API_KEY 字符串；私有归档错误口令 bad decrypt（加密确认）。✓
+
+**G4-6 webhook**：仍挂起（等用户提供建议 URL），不阻塞 G4 结论。
+
 ---
 
 ## 8. 风险与回滚
