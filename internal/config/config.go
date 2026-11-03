@@ -122,6 +122,16 @@ type ControllerConfig struct {
 	// Two rounds still removes a wedged instance within one reconcile interval,
 	// and no longer turns a burst into a whole-pool outage.
 	ReadinessFailureThreshold int `yaml:"readiness_failure_threshold" json:"readiness_failure_threshold"`
+	// LostFailureThreshold is how many consecutive reconcile rounds must find
+	// a container endpoint unreachable before it is marked LOST (plan P1-8).
+	// One failed probe used to condemn immediately: a single dropped packet, a
+	// container restarting in place, or a moment of platform-level congestion
+	// each cost the full re-preparation pipeline - and with it, the instance's
+	// service state and its outstanding load. A streak costs one probe per
+	// round and nothing else; a container that is genuinely gone reaches the
+	// threshold in seconds and is condemned just as before.
+	// Zero or negative falls back to one, restoring the historical behaviour.
+	LostFailureThreshold int `yaml:"lost_failure_threshold" json:"lost_failure_threshold"`
 	// StartTimeout bounds how long the control plane waits for a freshly
 	// started SGLang to answer its health check. Loading a model legitimately
 	// takes minutes, so this is deliberately not call_timeout: that bounds one
@@ -563,6 +573,7 @@ func Default() Config {
 			// that queues behind the batch, so a single miss is what a busy
 			// instance looks like, not what a broken one looks like.
 			ReadinessFailureThreshold: 2,
+			LostFailureThreshold:      3,
 			StartTimeout:              Duration(10 * time.Minute),
 			ProvisionTimeout:          Duration(45 * time.Minute),
 			LeaseWarning:              Duration(120 * time.Second),

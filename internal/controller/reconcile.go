@@ -178,14 +178,28 @@ func (c *Controller) reconcileInstance(ctx context.Context, instance domain.Inst
 		if !latest.UpdatedAt.Equal(instance.UpdatedAt) {
 			return nil
 		}
+		// Plan P1-8: one failed probe is not a lost container. Condemn only
+		// after LostFailureThreshold consecutive misses; a container that is
+		// genuinely gone still reaches the threshold within seconds of rounds.
+		if instance.InstanceState != domain.InstanceLost {
+			streak := c.noteUnreachableFailure(instance.ID)
+			if streak < c.LostFailureThreshold() {
+				c.log().Warn("container endpoint unreachable; waiting for the streak to confirm",
+					"instance_id", instance.ID, "streak", streak,
+					"threshold", c.LostFailureThreshold())
+				return nil
+			}
+		}
 		if err := c.markLost(ctx, instance, "container endpoint is unreachable"); err != nil {
 			return err
 		}
+		c.clearUnreachableFailures(instance.ID)
 		if instance.InstanceState != domain.InstanceLost {
 			report.Lost = append(report.Lost, instance.ID)
 		}
 		return nil
 	}
+	c.clearUnreachableFailures(instance.ID)
 	if observedHealth.Phase == launcher.PhaseFailed && instance.InstanceState == domain.InstanceIdle && instance.ServiceState != domain.ServiceFailed && instance.ServiceState != domain.ServiceDraining && instance.Role.Valid() {
 		lock := c.instanceOperation(instance.ID)
 		if !lock.TryLock() {

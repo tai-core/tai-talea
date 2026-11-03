@@ -1205,8 +1205,14 @@ func TestUnreachableContainerBecomesLost(t *testing.T) {
 	h.handle(h.addedEvent("container-1", h.bootstrap.Endpoint(), "lease-1", h.clock.Now()))
 	h.recorder.reset()
 
-	// The container stops answering.
+	// The container stops answering. The verdict waits for the streak
+	// threshold (plan P1-8) - earlier rounds only log and count.
 	h.bootstrap.SetDown(true)
+	for round := 1; round < h.ctrl.LostFailureThreshold(); round++ {
+		if report := h.reconcile(); len(report.Lost) != 0 {
+			t.Fatalf("round %d condemned below the threshold: %+v", round, report)
+		}
+	}
 
 	report := h.reconcile()
 	if len(report.Lost) != 1 || report.Lost[0] != "container-1" {

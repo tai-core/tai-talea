@@ -123,7 +123,12 @@ type Controller struct {
 	// single /health_generate call misses, and condemning on the first miss
 	// costs a full multi-GPU reload.
 	healthFailures     sync.Map
-	eventOperations    [64]sync.Mutex
+	// unreachableFailures counts consecutive reconcile rounds in which a
+	// container endpoint was unreachable, keyed by instance ID (plan P1-8).
+	// One probe miss is not evidence of a lost container: marking LOST on the
+	// first miss costs the whole re-preparation pipeline for a dropped packet.
+	unreachableFailures sync.Map
+	eventOperations     [64]sync.Mutex
 	capacityAdmissions sync.Mutex
 	pullOperations     sync.Map
 	eventRecovery      sync.Mutex
@@ -170,6 +175,27 @@ func (c *Controller) noteHealthFailure(id string) int {
 // clearHealthFailures forgets an instance's streak once a probe succeeds.
 func (c *Controller) clearHealthFailures(id string) {
 	c.healthFailures.Delete(id)
+}
+
+// noteUnreachableFailure records one unreachable probe and returns the streak.
+func (c *Controller) noteUnreachableFailure(id string) int {
+	value, _ := c.unreachableFailures.LoadOrStore(id, new(int32))
+	return int(atomic.AddInt32(value.(*int32), 1))
+}
+
+// clearUnreachableFailures forgets an instance's streak once it answers again.
+func (c *Controller) clearUnreachableFailures(id string) {
+	c.unreachableFailures.Delete(id)
+}
+
+// LostFailureThreshold is how many consecutive unreachable probes condemn a
+// container as LOST. A non-positive configuration means one, restoring the
+// historical behaviour.
+func (c *Controller) LostFailureThreshold() int {
+	if threshold := c.cfg.Controller.LostFailureThreshold; threshold > 0 {
+		return threshold
+	}
+	return 1
 }
 
 // HealthFailureThreshold is how many consecutive failed probes condemn a

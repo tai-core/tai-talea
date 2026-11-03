@@ -21,6 +21,12 @@ func TestLostServingWorkerClosesReadinessAndRecoversLegally(t *testing.T) {
 	id := "container-1"
 	workerID := h.instance(id).RouterWorkerID
 	h.bootstrap.SetDown(true)
+	for round := 1; round < h.ctrl.LostFailureThreshold(); round++ {
+		h.reconcile() // below the streak threshold: counted, not condemned
+		if h.instance(id).InstanceState == domain.InstanceLost {
+			t.Fatalf("round %d condemned below the streak threshold", round)
+		}
+	}
 	h.reconcile()
 	if h.instance(id).InstanceState != domain.InstanceLost {
 		t.Fatal("unreachable container must be LOST")
