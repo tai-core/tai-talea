@@ -9,7 +9,8 @@
 
 ## 0. 一句话总览
 
-两台 CCI 容器（8×B300 each）跑 GLM-5.3-Flash 的 P/D 分离推理服务，控制面
+两台 CCI 容器（**8×NVIDIA H100 80GB HBM3** each，驱动 580.173.02，运行时 CUDA
+12.9，sm_90）跑 GLM-5.3-Flash 的 P/D 分离推理服务，控制面
 tai-talea（Go）管容量与自愈，Router（sglang-router）管路由，nginx 做公网门面
 （限流 + API key）。**控制面版本 0.9.10，全部 P1 整改关闭，G4（故障与恢复）
 验收通过。自动扩缩容（G3）在本账号下永久搁置——见 §10。**
