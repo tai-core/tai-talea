@@ -94,11 +94,18 @@ setsid nohup env PYTHONPATH="$BOOTSTRAP_SRC" "$PYTHON" -m tai_talea_bootstrap se
 echo $! > "$PID_FILE"
 
 # ------------------------------------------------------------------ verify
-sleep 3
-ok=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \
-  -H "X-Bootstrap-Token: $TALEA_BOOTSTRAP_TOKEN" \
-  "http://127.0.0.1:$BOOTSTRAP_PORT/bootstrap/status" || echo 000)
-[ "$ok" = "200" ] || { tail -20 "$LOG_DIR/bootstrap.log"; die "the bootstrap did not answer 200 on :$BOOTSTRAP_PORT (got $ok)"; }
+# The bootstrap is a Python process, and its cold start can outrun any fixed
+# sleep - one produced a false "failed" verdict for a process that was already
+# coming up (2026-11-03, G4). Poll: up to 30 s for the first 200.
+ok=""
+for _ in $(seq 1 30); do
+  sleep 1
+  ok=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \
+    -H "X-Bootstrap-Token: $TALEA_BOOTSTRAP_TOKEN" \
+    "http://127.0.0.1:$BOOTSTRAP_PORT/bootstrap/status" || echo 000)
+  [ "$ok" = "200" ] && break
+done
+[ "$ok" = "200" ] || { tail -20 "$LOG_DIR/bootstrap.log"; die "the bootstrap did not answer 200 on :$BOOTSTRAP_PORT within 30s (last: $ok)"; }
 
 bad=$(curl -s -m 5 -o /dev/null -w '%{http_code}' \
   -H "X-Bootstrap-Token: wrong-token" \
