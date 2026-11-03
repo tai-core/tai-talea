@@ -64,6 +64,7 @@ func resetProvisions(t *testing.T) {
 	clear := func() {
 		provisionJobs.mu.Lock()
 		provisionJobs.byName = make(map[string]*ProvisionRecord)
+		provisionJobs.cancels = make(map[string]context.CancelFunc)
 		provisionJobs.mu.Unlock()
 	}
 	clear()
@@ -73,7 +74,7 @@ func resetProvisions(t *testing.T) {
 func queueJob(t *testing.T, name string) {
 	t.Helper()
 	now := time.Now().UTC()
-	provisionJobs.add(ProvisionRecord{Name: name, PartnerID: "alayanew", State: "QUEUED", CreatedAt: now, UpdatedAt: now})
+	provisionJobs.add(ProvisionRecord{Name: name, PartnerID: "alayanew", State: "QUEUED", Path: "ssh", CreatedAt: now, UpdatedAt: now})
 }
 
 // A request the platform has accepted but not scheduled holds nothing but its

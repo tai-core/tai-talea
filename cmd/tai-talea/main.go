@@ -238,6 +238,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		ready.Store(true)
 	}
 
+	// Plan P1-9: pick the provision jobs the previous process left running.
+	// Non-terminal jobs are re-armed here so a queued request keeps its place
+	// in the platform queue across a restart instead of going silent.
+	apiServer.ResumeProvisions()
+
 	go ctrl.RunPeriodic(ctx)
 	if onboards != nil {
 		go onboards.Run(ctx)

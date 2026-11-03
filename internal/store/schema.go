@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is bumped whenever the DDL below changes. Migrations are
 // applied inside a single transaction and recorded through PRAGMA user_version.
-const schemaVersion = 4
+const schemaVersion = 5
 
 // schemaDDL is the milestone 1 data model. Tables capacity_instances,
 // capacity_events, partner_snapshots and operations follow development
@@ -84,6 +84,26 @@ CREATE INDEX IF NOT EXISTS operations_open
     ON operations(status, next_retry_at);
 CREATE INDEX IF NOT EXISTS operations_by_instance
     ON operations(instance_id, created_at);
+
+-- provision_jobs is the durable form of the on-demand creation tracker
+-- (plan P1-9). The control plane keeps provision jobs in memory while they
+-- run; without this table a restart forgets a request the platform already
+-- accepted, and the job stops being outstanding while the container it asked
+-- for may still appear. creation_key is the poll key CreateInstance returned
+-- and is what lets a restart follow the same request instead of creating a
+-- second one.
+CREATE TABLE IF NOT EXISTS provision_jobs (
+    name         TEXT PRIMARY KEY,
+    partner_id   TEXT NOT NULL,
+    path         TEXT NOT NULL DEFAULT 'ssh',
+    state        TEXT NOT NULL,
+    stage        TEXT,
+    creation_key TEXT,
+    instance_id  TEXT,
+    last_error   TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     audit_id     INTEGER PRIMARY KEY AUTOINCREMENT,

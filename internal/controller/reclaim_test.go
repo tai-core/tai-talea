@@ -240,6 +240,15 @@ func TestReclaimOfAnUnreachableContainerReleasesWithoutStopping(t *testing.T) {
 	id := "container-1"
 
 	h.bootstrap.SetDown(true)
+	// Plan P1-8: a single unreachable round is not a LOST verdict any more,
+	// the reconciler waits for a streak of consecutive misses first. So the
+	// reclaim scenario drives the streak to completion before asserting.
+	for round := 1; round < h.ctrl.LostFailureThreshold(); round++ {
+		h.reconcile()
+		if got := h.instance(id); got.InstanceState == domain.InstanceLost {
+			t.Fatalf("round %d: condemned below the streak threshold: %+v", round, got)
+		}
+	}
 	h.reconcile()
 	if got := h.instance(id); got.InstanceState != domain.InstanceLost {
 		t.Fatalf("an unreachable container must be LOST first: %+v", got)

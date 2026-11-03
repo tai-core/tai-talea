@@ -16,6 +16,7 @@ import (
 	"github.com/tai-core/tai-talea/internal/domain"
 	"github.com/tai-core/tai-talea/internal/obs"
 	"github.com/tai-core/tai-talea/internal/onboarding"
+	"github.com/tai-core/tai-talea/internal/partner"
 	"github.com/tai-core/tai-talea/internal/partners"
 	"github.com/tai-core/tai-talea/internal/planner"
 	"github.com/tai-core/tai-talea/internal/store"
@@ -45,6 +46,10 @@ type Server struct {
 	opts Options
 	auth *pushAuthenticator
 	now  func() time.Time
+	// resolveAdapter, when set, replaces opts.Partners for the provisioning
+	// paths. Tests inject fake adapters through it instead of building a
+	// registry from configuration.
+	resolveAdapter func(partnerID string) (partner.PartnerAdapter, bool)
 }
 
 // New builds the HTTP server.
@@ -61,6 +66,12 @@ func New(opts Options) (*Server, error) {
 	now := opts.Now
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
+	}
+	// Plan P1-9: when the store can persist provision jobs, the tracker
+	// mirrors every mutation into it. Stores without the capability (the test
+	// fakes) keep the tracker purely in memory.
+	if persister, ok := opts.Store.(store.ProvisionJobPersister); ok {
+		provisionJobs.persist = persister
 	}
 	return &Server{opts: opts, auth: newPushAuthenticator(opts.Config), now: now}, nil
 }
