@@ -33,7 +33,11 @@ type Options struct {
 	Partners *partners.Registry
 	// Ready reports whether the process finished recovery.
 	Ready func() bool
-	Now   func() time.Time
+	// ReadyDetails enriches /readyz with component state (plan P1-7): what
+	// the caller sees should say why a process is or is not ready, not just
+	// that some flag flipped.
+	ReadyDetails func() map[string]string
+	Now          func() time.Time
 }
 
 // Server serves the Push API and the operator admin API.
@@ -450,11 +454,28 @@ func (s *Server) handleHealth(writer http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReady(writer http.ResponseWriter, _ *http.Request) {
+	body := s.readyDetails()
 	if s.opts.Ready != nil && !s.opts.Ready() {
-		writeJSON(writer, http.StatusServiceUnavailable, map[string]string{"status": "recovering"})
+		writeJSON(writer, http.StatusServiceUnavailable, body)
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]string{"status": "ready"})
+	writeJSON(writer, http.StatusOK, body)
+}
+
+// readyDetails names the components a caller can use to tell a recovering
+// process from a broken one. It never fails: an absent detail is better than
+// a 500 from the readiness probe itself.
+func (s *Server) readyDetails() map[string]string {
+	body := map[string]string{"status": "ready"}
+	if s.opts.Ready != nil && !s.opts.Ready() {
+		body["status"] = "recovering"
+	}
+	if s.opts.ReadyDetails != nil {
+		for key, value := range s.opts.ReadyDetails() {
+			body[key] = value
+		}
+	}
+	return body
 }
 
 func (s *Server) handleMetrics(writer http.ResponseWriter, _ *http.Request) {

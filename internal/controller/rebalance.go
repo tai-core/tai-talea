@@ -610,6 +610,12 @@ func (c *Controller) reconcileDriver(ctx context.Context) {
 			Message:  "reconcile round failed",
 			Details:  map[string]string{"error": err.Error()},
 		})
+		return
+	}
+	// Plan P1-7: a process whose startup recovery failed must not report
+	// ready until some reconcile round actually completes.
+	if c.OnFirstSuccessfulRound != nil {
+		c.readyOnce.Do(c.OnFirstSuccessfulRound)
 	}
 }
 

@@ -166,6 +166,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 
 	var ready atomic.Bool
 	var onboards *onboarding.Manager
+	// Plan P1-7: recovery state is set later by Recover(), but the readyz
+	// body is wired here, so the details closure reads these.
+	var recoveryFailed bool
+	var recoveryErrStr string
 	if cfg.Onboarding.Script != "" {
 		if cfg.Onboarding.Python == "" {
 			cfg.Onboarding.Python = "python3"
@@ -183,7 +187,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Metrics:    metrics,
 		Logger:     logger,
 		Partners:   registry,
-		Ready:      ready.Load,
+		Ready: ready.Load,
+		ReadyDetails: func() map[string]string {
+			healthy, reason := ctrl.TelemetryHealth()
+			details := map[string]string{
+				"recovery":  map[bool]string{true: "failed", false: "ok"}[recoveryFailed],
+				"telemetry": map[bool]string{true: "ok", false: reason}[healthy],
+			}
+			if recoveryFailed {
+				details["recovery_error"] = recoveryErrStr
+			}
+			return details
+		},
 	})
 	if err != nil {
 		return err
@@ -202,8 +217,14 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	recoveryCtx, cancelRecovery := context.WithTimeout(ctx, 90*time.Second)
 	report, resumed, err := ctrl.Recover(recoveryCtx)
 	cancelRecovery()
-	if err != nil {
+	// Plan P1-7: readyz must not say "ready" while startup recovery failed.
+	// The flag is set here on success; on failure the first reconcile round
+	// that completes without error flips it instead.
+	recoveryFailed = err != nil
+	if recoveryFailed {
+		recoveryErrStr = err.Error()
 		logger.Error("startup recovery failed", "error", err.Error())
+		ctrl.OnFirstSuccessfulRound = func() { ready.Store(true); logger.Info("readiness restored by a successful reconcile round") }
 	} else {
 		logger.Info("startup recovery complete",
 			"checked", report.Checked, "lost", len(report.Lost),
@@ -213,7 +234,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err := ctrl.PublishGauges(ctx); err != nil {
 		logger.Warn("initial gauge publication failed", "error", err.Error())
 	}
-	ready.Store(true)
+	if !recoveryFailed {
+		ready.Store(true)
+	}
 
 	go ctrl.RunPeriodic(ctx)
 	if onboards != nil {

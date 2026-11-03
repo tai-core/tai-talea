@@ -148,6 +148,14 @@ type Controller struct {
 	// never waits - that is the point of the gate - but a test that reads the
 	// state a round produced has to.
 	startsRunning sync.WaitGroup
+	// OnFirstSuccessfulRound is the readiness hook for a control plane whose
+	// startup recovery failed (plan P1-7): readyz must not say "ready" while
+	// the process never reconciled cleanly. main sets it to its ready flag's
+	// Store; the first reconcile round that completes without error fires it
+	// exactly once. A recovery that succeeded marks ready in main directly,
+	// and this hook stays unused.
+	OnFirstSuccessfulRound func()
+	readyOnce              sync.Once
 }
 
 func (c *Controller) eventOperation(id string) *sync.Mutex {
@@ -292,6 +300,10 @@ func (c *Controller) Planner() *planner.Planner { return c.planner }
 
 // Telemetry exposes a partner-filtered snapshot; collection runs independently.
 func (c *Controller) Telemetry(owner string) telemetry.Snapshot { return c.telemetry.Snapshot(owner) }
+
+// TelemetryHealth reports whether the load collector is producing usable
+// samples (plan P1-7): readyz names it so a silent collector is visible.
+func (c *Controller) TelemetryHealth() (bool, string) { return c.telemetry.LoadInputHealthy() }
 
 // CallTimeout returns the per-call timeout used for container and Router calls.
 func (c *Controller) CallTimeout() time.Duration { return c.cfg.Controller.CallTimeout.Duration() }
