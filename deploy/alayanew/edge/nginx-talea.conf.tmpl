@@ -20,13 +20,44 @@ map $http_authorization $talea_key_ok {
     "__API_KEY__"            1;
 }
 
+# Rate limiting (plan P1-6). Both zones are per caller IP: the facade has one
+# key for all callers, so the IP is the only dimension available at this layer.
+# The request rate is deliberately generous - a streaming chat completion is
+# one request regardless of how long it holds the connection - and the point
+# is flood control, not metering. Applied at server level, so a 401 brute
+# force is limited too: the `if` auth check finishes in the rewrite phase,
+# before limit_req would run, so a location-level limit would never see
+# unauthorized requests.
+limit_req_zone  $binary_remote_addr zone=talea_api_req:10m  rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=talea_api_conn:10m;
+limit_req_status  429;
+limit_conn_status 429;
+
+# Every auth failure lands in its own log: this is the brute-force signal,
+# and `if=` conditional logging keeps it from being one line in a million.
+map $status $talea_authfail {
+    401      1;
+    403      1;
+    429      1;
+    default  0;
+}
+
 server {
     listen 8000;
     server_name _;
 
     access_log /opt/tai-talea/logs/edge-access.log;
+    # `if=` needs an explicit format name or nginx parses it as the format
+    access_log /opt/tai-talea/logs/edge-authfail.log combined if=$talea_authfail;
     error_log  /opt/tai-talea/logs/edge-error.log warn;
     client_max_body_size 32m;
+
+    # Flood control for everything the door serves, /health included: a
+    # monitor polls at less than 1 r/s, so the limits below only ever bite
+    # on abuse.
+    limit_req  zone=talea_api_req  burst=40 nodelay;
+    # limit_conn takes the bare zone name - no zone= prefix (that is limit_req syntax)
+    limit_conn talea_api_conn 64;
 
     # Liveness without a key: a monitor should not need the secret, and this
     # path touches no model.
